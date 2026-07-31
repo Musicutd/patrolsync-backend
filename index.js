@@ -14,6 +14,16 @@ const pool = new Pool({
 
 const PORT = process.env.PORT || 3000;
 
+async function withTenant(tenantId, fn) {
+  const client = await pool.connect();
+  try {
+    await client.query(`SET app.current_tenant = '${tenantId}'`);
+    return await fn(client);
+  } finally {
+    client.release();
+  }
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });
@@ -27,6 +37,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// TENANTS
 app.post('/api/tenants', async (req, res) => {
   const { name, slug, plan } = req.body;
   if (!name || !slug) return res.status(400).json({ error: 'name and slug are required' });
@@ -50,16 +61,7 @@ app.get('/api/tenants', async (req, res) => {
   }
 });
 
-async function withTenant(tenantId, fn) {
-  const client = await pool.connect();
-  try {
-    await client.query(`SET app.current_tenant = '${tenantId}'`);
-    return await fn(client);
-  } finally {
-    client.release();
-  }
-}
-
+// SITES
 app.post('/api/sites', async (req, res) => {
   const { tenant_id, name, address } = req.body;
   if (!tenant_id || !name) return res.status(400).json({ error: 'tenant_id and name are required' });
@@ -89,6 +91,7 @@ app.get('/api/sites', async (req, res) => {
   }
 });
 
+// CHECKPOINTS
 app.post('/api/checkpoints', async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
@@ -115,6 +118,77 @@ app.get('/api/checkpoints', async (req, res) => {
       site_id
         ? client.query('SELECT * FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY created_at DESC', [tenant_id, site_id])
         : client.query('SELECT * FROM checkpoints WHERE tenant_id = $1 ORDER BY created_at DESC', [tenant_id])
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATROL SCHEDULES
+app.post('/api/patrol-schedules', async (req, res) => {
+  const { tenant_id, site_id, schedule_type, config } = req.body;
+  if (!tenant_id || !site_id || !schedule_type || !config) {
+    return res.status(400).json({ error: 'tenant_id, site_id, schedule_type, and config are required' });
+  }
+  if (!['fixed', 'hourly', 'custom'].includes(schedule_type)) {
+    return res.status(400).json({ error: 'schedule_type must be fixed, hourly, or custom' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'INSERT INTO patrol_schedules (tenant_id, site_id, schedule_type, config) VALUES ($1, $2, $3, $4) RETURNING *',
+        [tenant_id, site_id, schedule_type, JSON.stringify(config)]
+      )
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/patrol-schedules', async (req, res) => {
+  const { tenant_id, site_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      site_id
+        ? client.query('SELECT * FROM patrol_schedules WHERE tenant_id = $1 AND site_id = $2', [tenant_id, site_id])
+        : client.query('SELECT * FROM patrol_schedules WHERE tenant_id = $1', [tenant_id])
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATROL LOGS
+app.post('/api/patrol-logs', async (req, res) => {
+  const { tenant_id, checkpoint_id, user_id, latitude, longitude } = req.body;
+  if (!tenant_id || !checkpoint_id || !user_id) {
+    return res.status(400).json({ error: 'tenant_id, checkpoint_id, and user_id are required' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'INSERT INTO patrol_logs (tenant_id, checkpoint_id, user_id, latitude, longitude) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [tenant_id, checkpoint_id, user_id, latitude || null, longitude || null]
+      )
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/patrol-logs', async (req, res) => {
+  const { tenant_id, checkpoint_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      checkpoint_id
+        ? client.query('SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = $2 ORDER BY scanned_at DESC', [tenant_id, checkpoint_id])
+        : client.query('SELECT * FROM patrol_logs WHERE tenant_id = $1 ORDER BY scanned_at DESC', [tenant_id])
     );
     res.json(result.rows);
   } catch (err) {

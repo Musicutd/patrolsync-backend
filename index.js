@@ -125,6 +125,43 @@ app.get('/api/checkpoints', async (req, res) => {
   }
 });
 
+// USERS
+app.post('/api/users', async (req, res) => {
+  const { tenant_id, firebase_uid, email, role } = req.body;
+  if (!tenant_id || !email) {
+    return res.status(400).json({ error: 'tenant_id and email are required' });
+  }
+  if (role && !['admin', 'guard'].includes(role)) {
+    return res.status(400).json({ error: 'role must be admin or guard' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'INSERT INTO users (tenant_id, firebase_uid, email, role) VALUES ($1, $2, $3, $4) RETURNING *',
+        [tenant_id, firebase_uid || null, email, role || 'guard']
+      )
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/users', async (req, res) => {
+  const { tenant_id, role } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      role
+        ? client.query('SELECT * FROM users WHERE tenant_id = $1 AND role = $2 ORDER BY created_at DESC', [tenant_id, role])
+        : client.query('SELECT * FROM users WHERE tenant_id = $1 ORDER BY created_at DESC', [tenant_id])
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATROL SCHEDULES
 app.post('/api/patrol-schedules', async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;

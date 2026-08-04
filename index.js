@@ -24,6 +24,23 @@ async function withTenant(tenantId, fn) {
   }
 }
 
+async function ensureIncidentsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS incidents (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      checkpoint_id INTEGER,
+      user_id INTEGER NOT NULL,
+      description TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'low',
+      reported_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('Incidents table ready');
+}
+ensureIncidentsTable();
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });
@@ -226,6 +243,38 @@ app.get('/api/patrol-logs', async (req, res) => {
       checkpoint_id
         ? client.query('SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = $2 ORDER BY scanned_at DESC', [tenant_id, checkpoint_id])
         : client.query('SELECT * FROM patrol_logs WHERE tenant_id = $1 ORDER BY scanned_at DESC', [tenant_id])
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// INCIDENTS
+app.post('/api/incidents', async (req, res) => {
+  const { tenant_id, site_id, checkpoint_id, user_id, description, severity } = req.body;
+  if (!tenant_id || !site_id || !user_id || !description) {
+    return res.status(400).json({ error: 'tenant_id, site_id, user_id, and description are required' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']
+      )
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/incidents', async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query('SELECT * FROM incidents WHERE tenant_id = $1 ORDER BY reported_at DESC', [tenant_id])
     );
     res.json(result.rows);
   } catch (err) {

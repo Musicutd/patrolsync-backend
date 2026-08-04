@@ -51,6 +51,12 @@ async function ensureAuthColumn() {
 }
 ensureAuthColumn();
 
+async function ensureFirebaseUidNullable() {
+  await pool.query(`ALTER TABLE users ALTER COLUMN firebase_uid DROP NOT NULL`);
+  console.log('firebase_uid is now nullable');
+}
+ensureFirebaseUidNullable();
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });

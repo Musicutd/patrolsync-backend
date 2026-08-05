@@ -28,6 +28,20 @@ async function withTenant(tenantId, fn) {
   }
 }
 
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    req.auth = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
 async function ensureIncidentsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incidents (
@@ -170,8 +184,8 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// SITES
-app.post('/api/sites', async (req, res) => {
+// SITES (protected)
+app.post('/api/sites', requireAuth, async (req, res) => {
   const { tenant_id, name, address } = req.body;
   if (!tenant_id || !name) return res.status(400).json({ error: 'tenant_id and name are required' });
   try {
@@ -187,7 +201,7 @@ app.post('/api/sites', async (req, res) => {
   }
 });
 
-app.get('/api/sites', async (req, res) => {
+app.get('/api/sites', requireAuth, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -200,8 +214,8 @@ app.get('/api/sites', async (req, res) => {
   }
 });
 
-// CHECKPOINTS
-app.post('/api/checkpoints', async (req, res) => {
+// CHECKPOINTS (protected)
+app.post('/api/checkpoints', requireAuth, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
     return res.status(400).json({ error: 'tenant_id, site_id, name, and qr_code are required' });
@@ -219,7 +233,7 @@ app.post('/api/checkpoints', async (req, res) => {
   }
 });
 
-app.get('/api/checkpoints', async (req, res) => {
+app.get('/api/checkpoints', requireAuth, async (req, res) => {
   const { tenant_id, site_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -234,8 +248,8 @@ app.get('/api/checkpoints', async (req, res) => {
   }
 });
 
-// USERS
-app.post('/api/users', async (req, res) => {
+// USERS (protected)
+app.post('/api/users', requireAuth, async (req, res) => {
   const { tenant_id, firebase_uid, email, role } = req.body;
   if (!tenant_id || !email) {
     return res.status(400).json({ error: 'tenant_id and email are required' });
@@ -256,7 +270,7 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', requireAuth, async (req, res) => {
   const { tenant_id, role } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -271,8 +285,8 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// PATROL SCHEDULES
-app.post('/api/patrol-schedules', async (req, res) => {
+// PATROL SCHEDULES (protected)
+app.post('/api/patrol-schedules', requireAuth, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;
   if (!tenant_id || !site_id || !schedule_type || !config) {
     return res.status(400).json({ error: 'tenant_id, site_id, schedule_type, and config are required' });
@@ -293,7 +307,7 @@ app.post('/api/patrol-schedules', async (req, res) => {
   }
 });
 
-app.get('/api/patrol-schedules', async (req, res) => {
+app.get('/api/patrol-schedules', requireAuth, async (req, res) => {
   const { tenant_id, site_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -308,8 +322,8 @@ app.get('/api/patrol-schedules', async (req, res) => {
   }
 });
 
-// PATROL LOGS
-app.post('/api/patrol-logs', async (req, res) => {
+// PATROL LOGS (protected)
+app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude } = req.body;
   if (!tenant_id || !checkpoint_id || !user_id) {
     return res.status(400).json({ error: 'tenant_id, checkpoint_id, and user_id are required' });
@@ -327,7 +341,7 @@ app.post('/api/patrol-logs', async (req, res) => {
   }
 });
 
-app.get('/api/patrol-logs', async (req, res) => {
+app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -342,8 +356,8 @@ app.get('/api/patrol-logs', async (req, res) => {
   }
 });
 
-// INCIDENTS
-app.post('/api/incidents', async (req, res) => {
+// INCIDENTS (protected)
+app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, user_id, description, severity } = req.body;
   if (!tenant_id || !site_id || !user_id || !description) {
     return res.status(400).json({ error: 'tenant_id, site_id, user_id, and description are required' });
@@ -361,7 +375,7 @@ app.post('/api/incidents', async (req, res) => {
   }
 });
 
-app.get('/api/incidents', async (req, res) => {
+app.get('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {

@@ -250,7 +250,7 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
 
 // USERS (protected)
 app.post('/api/users', requireAuth, async (req, res) => {
-  const { tenant_id, firebase_uid, email, role } = req.body;
+  const { tenant_id, firebase_uid, email, role, password } = req.body;
   if (!tenant_id || !email) {
     return res.status(400).json({ error: 'tenant_id and email are required' });
   }
@@ -258,10 +258,11 @@ app.post('/api/users', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'role must be admin or guard' });
   }
   try {
+    const hash = password ? await bcrypt.hash(password, 10) : null;
     const result = await withTenant(tenant_id, (client) =>
       client.query(
-        'INSERT INTO users (tenant_id, firebase_uid, email, role) VALUES ($1, $2, $3, $4) RETURNING *',
-        [tenant_id, firebase_uid || null, email, role || 'guard']
+        'INSERT INTO users (tenant_id, firebase_uid, email, role, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, tenant_id, email, role',
+        [tenant_id, firebase_uid || null, email, role || 'guard', hash]
       )
     );
     res.status(201).json(result.rows[0]);

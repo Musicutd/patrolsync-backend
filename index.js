@@ -3,6 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { DateTime } = require('luxon');
 require('dotenv').config();
 
 const app = express();
@@ -18,6 +19,27 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const VALID_PLANS = ['starter', 'pro', 'enterprise'];
 const FIXED_WINDOW_MINUTES = 30;
+
+const FALLBACK_TIMEZONES = [
+  'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'Europe/Madrid', 'Europe/Rome',
+  'Europe/Amsterdam', 'Europe/Warsaw', 'Europe/Moscow', 'Europe/Istanbul', 'Africa/Cairo',
+  'Africa/Johannesburg', 'Africa/Lagos', 'Asia/Dubai', 'Asia/Karachi', 'Asia/Kolkata',
+  'Asia/Dhaka', 'Asia/Bangkok', 'Asia/Jakarta', 'Asia/Singapore', 'Asia/Hong_Kong',
+  'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Seoul', 'Australia/Perth', 'Australia/Sydney',
+  'Pacific/Auckland', 'America/Sao_Paulo', 'America/Argentina/Buenos_Aires', 'America/Mexico_City',
+  'America/Bogota', 'America/Lima', 'America/New_York', 'America/Chicago', 'America/Denver',
+  'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu'
+];
+
+function getAllTimezones() {
+  try {
+    if (typeof Intl.supportedValuesOf === 'function') {
+      const zones = Intl.supportedValuesOf('timeZone');
+      if (zones && zones.length) return zones;
+    }
+  } catch (err) {}
+  return FALLBACK_TIMEZONES;
+}
 
 async function withTenant(tenantId, fn) {
   const client = await pool.connect();
@@ -72,6 +94,12 @@ async function ensureFirebaseUidNullable() {
 }
 ensureFirebaseUidNullable();
 
+async function ensureTimezoneColumn() {
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'`);
+  console.log('Timezone column ready');
+}
+ensureTimezoneColumn();
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });
@@ -83,6 +111,11 @@ app.get('/health', async (req, res) => {
   } catch (err) {
     res.status(500).json({ status: 'unhealthy', error: err.message });
   }
+});
+
+// TIMEZONES (public reference list for dropdowns)
+app.get('/api/timezones', (req, res) => {
+  res.json(getAllTimezones());
 });
 
 // TENANTS
@@ -109,13 +142,38 @@ app.get('/api/tenants', async (req, res) => {
   }
 });
 
+// UPDATE tenant timezone (protected)
+app.patch('/api/tenants/:id/timezone', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { timezone } = req.body;
+  if (!timezone) return res.status(400).json({ error: 'timezone is required' });
+  if (Number(id) !== req.auth.tenant_id) {
+    return res.status(403).json({ error: 'Cannot modify a different tenant' });
+  }
+  const validZones = getAllTimezones();
+  if (!validZones.includes(timezone)) {
+    return res.status(400).json({ error: 'Unrecognized timezone' });
+  }
+  try {
+    const result = await withTenant(id, (client) =>
+      client.query('UPDATE tenants SET timezone = $1 WHERE id = $2 RETURNING *', [timezone, id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // SIGNUP (creates tenant + first admin user + returns JWT)
 app.post('/api/signup', async (req, res) => {
-  const { company_name, plan, admin_email, admin_password } = req.body;
+  const { company_name, plan, admin_email, admin_password, timezone } = req.body;
   if (!company_name || !admin_email || !admin_password) {
     return res.status(400).json({ error: 'company_name, admin_email, and admin_password are required' });
   }
   const chosenPlan = VALID_PLANS.includes(plan) ? plan : 'starter';
+  const validZones = getAllTimezones();
+  const chosenTimezone = timezone && validZones.includes(timezone) ? timezone : 'UTC';
   const slug = company_name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
   const client = await pool.connect();
@@ -123,8 +181,8 @@ app.post('/api/signup', async (req, res) => {
     await client.query('BEGIN');
 
     const tenantResult = await client.query(
-      'INSERT INTO tenants (name, slug, plan) VALUES ($1, $2, $3) RETURNING *',
-      [company_name, slug, chosenPlan]
+      'INSERT INTO tenants (name, slug, plan, timezone) VALUES ($1, $2, $3, $4) RETURNING *',
+      [company_name, slug, chosenPlan, chosenTimezone]
     );
     const tenant = tenantResult.rows[0];
 
@@ -403,22 +461,17 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
-// Helpers for fixed-schedule compliance
-function parseTimeToToday(timeStr, baseDate) {
-  const [h, m] = timeStr.split(':').map(Number);
-  const d = new Date(baseDate);
-  d.setHours(h || 0, m || 0, 0, 0);
-  return d;
-}
-
-function mostRecentFixedOccurrence(times, now) {
+// Helpers for fixed-schedule compliance (timezone-aware via luxon)
+function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
+  const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
   const candidates = [];
   [0, -1].forEach(dayOffset => {
-    const base = new Date(now);
-    base.setDate(base.getDate() + dayOffset);
+    const base = nowLocal.plus({ days: dayOffset });
     times.forEach(t => {
-      const occ = parseTimeToToday(t, base);
-      if (occ <= now) candidates.push(occ);
+      const [h, m] = t.split(':').map(Number);
+      const occLocal = base.set({ hour: h || 0, minute: m || 0, second: 0, millisecond: 0 });
+      const occUTC = occLocal.toUTC();
+      if (occUTC.toJSDate() <= nowUTC) candidates.push(occUTC.toJSDate());
     });
   });
   if (candidates.length === 0) return null;
@@ -433,6 +486,7 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   }
   try {
     const data = await withTenant(tenant_id, async (client) => {
+      const tenantRes = await client.query('SELECT timezone FROM tenants WHERE id = $1', [tenant_id]);
       const schedulesRes = await client.query(
         'SELECT * FROM patrol_schedules WHERE tenant_id = $1 AND site_id = $2',
         [tenant_id, site_id]
@@ -448,10 +502,16 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
             [tenant_id, checkpointIds]
           )
         : { rows: [] };
-      return { schedules: schedulesRes.rows, checkpoints: checkpointsRes.rows, logs: logsRes.rows };
+      return {
+        timezone: (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC',
+        schedules: schedulesRes.rows,
+        checkpoints: checkpointsRes.rows,
+        logs: logsRes.rows
+      };
     });
 
     const now = new Date();
+    const zone = data.timezone;
     const hourlySchedules = data.schedules.filter(s => s.schedule_type === 'hourly');
     const fixedSchedules = data.schedules.filter(s => s.schedule_type === 'fixed');
     const hasCustomOnly = hourlySchedules.length === 0 && fixedSchedules.length === 0 && data.schedules.some(s => s.schedule_type === 'custom');
@@ -487,7 +547,7 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
         }
       } else if (allFixedTimes.length > 0) {
         scheduleType = 'fixed';
-        const targetOcc = mostRecentFixedOccurrence(allFixedTimes, now);
+        const targetOcc = mostRecentFixedOccurrenceUTC(allFixedTimes, now, zone);
 
         if (!targetOcc) {
           status = 'ok';

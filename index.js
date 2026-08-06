@@ -357,6 +357,75 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
+// PATROL COMPLIANCE (protected) - flags overdue checkpoints based on hourly schedules
+app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
+  const { tenant_id, site_id } = req.query;
+  if (!tenant_id || !site_id) {
+    return res.status(400).json({ error: 'tenant_id and site_id are required' });
+  }
+  try {
+    const data = await withTenant(tenant_id, async (client) => {
+      const schedulesRes = await client.query(
+        'SELECT * FROM patrol_schedules WHERE tenant_id = $1 AND site_id = $2',
+        [tenant_id, site_id]
+      );
+      const checkpointsRes = await client.query(
+        'SELECT * FROM checkpoints WHERE tenant_id = $1 AND site_id = $2',
+        [tenant_id, site_id]
+      );
+      const checkpointIds = checkpointsRes.rows.map(c => c.id);
+      const logsRes = checkpointIds.length
+        ? await client.query(
+            'SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = ANY($2) ORDER BY scanned_at DESC',
+            [tenant_id, checkpointIds]
+          )
+        : { rows: [] };
+      return { schedules: schedulesRes.rows, checkpoints: checkpointsRes.rows, logs: logsRes.rows };
+    });
+
+    const now = new Date();
+    const hourlySchedule = data.schedules.find(s => s.schedule_type === 'hourly');
+    const hasOtherSchedule = data.schedules.some(s => s.schedule_type !== 'hourly');
+
+    const compliance = data.checkpoints.map(cp => {
+      const lastLog = data.logs.find(l => l.checkpoint_id === cp.id);
+      const lastScan = lastLog ? new Date(lastLog.scanned_at) : null;
+
+      let status = 'no_schedule';
+      let hoursOverdue = 0;
+
+      if (hourlySchedule) {
+        const intervalHours = Number(hourlySchedule.config.interval_hours) || 0;
+        if (!lastScan) {
+          status = 'overdue';
+        } else {
+          const hoursSince = (now - lastScan) / 3600000;
+          if (hoursSince > intervalHours) {
+            status = 'overdue';
+            hoursOverdue = Math.round((hoursSince - intervalHours) * 10) / 10;
+          } else {
+            status = 'ok';
+          }
+        }
+      } else if (hasOtherSchedule) {
+        status = 'unmonitored';
+      }
+
+      return {
+        checkpoint_id: cp.id,
+        checkpoint_name: cp.name,
+        last_scan: lastScan,
+        status,
+        hours_overdue: hoursOverdue
+      };
+    });
+
+    res.json(compliance);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // INCIDENTS (protected)
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity } = req.body;

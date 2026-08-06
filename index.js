@@ -359,9 +359,10 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
 
 // INCIDENTS (protected)
 app.post('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id, site_id, checkpoint_id, user_id, description, severity } = req.body;
-  if (!tenant_id || !site_id || !user_id || !description) {
-    return res.status(400).json({ error: 'tenant_id, site_id, user_id, and description are required' });
+  const { tenant_id, site_id, checkpoint_id, description, severity } = req.body;
+  const user_id = req.auth.user_id;
+  if (!tenant_id || !site_id || !description) {
+    return res.status(400).json({ error: 'tenant_id, site_id, and description are required' });
   }
   try {
     const result = await withTenant(tenant_id, (client) =>

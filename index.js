@@ -17,6 +17,7 @@ const pool = new Pool({
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const VALID_PLANS = ['starter', 'pro', 'enterprise'];
+const FIXED_WINDOW_MINUTES = 30;
 
 async function withTenant(tenantId, fn) {
   const client = await pool.connect();
@@ -357,7 +358,29 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
-// PATROL COMPLIANCE (protected) - flags overdue checkpoints based on hourly schedules
+// Helpers for fixed-schedule compliance
+function parseTimeToToday(timeStr, baseDate) {
+  const [h, m] = timeStr.split(':').map(Number);
+  const d = new Date(baseDate);
+  d.setHours(h || 0, m || 0, 0, 0);
+  return d;
+}
+
+function mostRecentFixedOccurrence(times, now) {
+  const candidates = [];
+  [0, -1].forEach(dayOffset => {
+    const base = new Date(now);
+    base.setDate(base.getDate() + dayOffset);
+    times.forEach(t => {
+      const occ = parseTimeToToday(t, base);
+      if (occ <= now) candidates.push(occ);
+    });
+  });
+  if (candidates.length === 0) return null;
+  return new Date(Math.max(...candidates.map(d => d.getTime())));
+}
+
+// PATROL COMPLIANCE (protected) - flags overdue checkpoints based on hourly or fixed schedules
 app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   const { tenant_id, site_id } = req.query;
   if (!tenant_id || !site_id) {
@@ -385,7 +408,8 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
 
     const now = new Date();
     const hourlySchedule = data.schedules.find(s => s.schedule_type === 'hourly');
-    const hasOtherSchedule = data.schedules.some(s => s.schedule_type !== 'hourly');
+    const fixedSchedule = data.schedules.find(s => s.schedule_type === 'fixed');
+    const hasCustomOnly = !hourlySchedule && !fixedSchedule && data.schedules.some(s => s.schedule_type === 'custom');
 
     const compliance = data.checkpoints.map(cp => {
       const lastLog = data.logs.find(l => l.checkpoint_id === cp.id);
@@ -393,8 +417,10 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
 
       let status = 'no_schedule';
       let hoursOverdue = 0;
+      let scheduleType = null;
 
       if (hourlySchedule) {
+        scheduleType = 'hourly';
         const intervalHours = Number(hourlySchedule.config.interval_hours) || 0;
         if (!lastScan) {
           status = 'overdue';
@@ -407,7 +433,31 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
             status = 'ok';
           }
         }
-      } else if (hasOtherSchedule) {
+      } else if (fixedSchedule) {
+        scheduleType = 'fixed';
+        const times = Array.isArray(fixedSchedule.config.times) ? fixedSchedule.config.times : [];
+        const targetOcc = mostRecentFixedOccurrence(times, now);
+
+        if (!targetOcc) {
+          status = 'ok';
+        } else {
+          const windowStart = new Date(targetOcc.getTime() - FIXED_WINDOW_MINUTES * 60000);
+          const windowEnd = new Date(targetOcc.getTime() + FIXED_WINDOW_MINUTES * 60000);
+          const matchedScan = data.logs.find(l => {
+            const t = new Date(l.scanned_at);
+            return l.checkpoint_id === cp.id && t >= windowStart && t <= windowEnd;
+          });
+
+          if (matchedScan) {
+            status = 'ok';
+          } else if (now < windowEnd) {
+            status = 'ok';
+          } else {
+            status = 'overdue';
+            hoursOverdue = Math.round(((now - windowEnd) / 3600000) * 10) / 10;
+          }
+        }
+      } else if (hasCustomOnly) {
         status = 'unmonitored';
       }
 
@@ -416,7 +466,8 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
         checkpoint_name: cp.name,
         last_scan: lastScan,
         status,
-        hours_overdue: hoursOverdue
+        hours_overdue: hoursOverdue,
+        schedule_type: scheduleType
       };
     });
 

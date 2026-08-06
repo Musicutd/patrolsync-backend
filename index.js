@@ -65,6 +65,13 @@ function requireAuth(req, res, next) {
   }
 }
 
+function requireAdmin(req, res, next) {
+  if (!req.auth || req.auth.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+}
+
 async function ensureIncidentsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incidents (
@@ -142,8 +149,8 @@ app.get('/api/tenants', async (req, res) => {
   }
 });
 
-// UPDATE tenant timezone (protected)
-app.patch('/api/tenants/:id/timezone', requireAuth, async (req, res) => {
+// UPDATE tenant timezone (admin only)
+app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { timezone } = req.body;
   if (!timezone) return res.status(400).json({ error: 'timezone is required' });
@@ -214,7 +221,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN
+// LOGIN (used by both admins and guards)
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!tenant_id || !email || !password) {
@@ -243,8 +250,8 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// SITES (protected)
-app.post('/api/sites', requireAuth, async (req, res) => {
+// SITES (read: any authenticated user; create: admin only)
+app.post('/api/sites', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, name, address } = req.body;
   if (!tenant_id || !name) return res.status(400).json({ error: 'tenant_id and name are required' });
   try {
@@ -273,8 +280,8 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
-// CHECKPOINTS (protected)
-app.post('/api/checkpoints', requireAuth, async (req, res) => {
+// CHECKPOINTS (read: any authenticated user; create: admin only)
+app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
     return res.status(400).json({ error: 'tenant_id, site_id, name, and qr_code are required' });
@@ -307,8 +314,8 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
   }
 });
 
-// USERS (protected)
-app.post('/api/users', requireAuth, async (req, res) => {
+// USERS (create/list/delete guards: admin only)
+app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, firebase_uid, email, role, password } = req.body;
   if (!tenant_id || !email) {
     return res.status(400).json({ error: 'tenant_id and email are required' });
@@ -330,7 +337,7 @@ app.post('/api/users', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/users', requireAuth, async (req, res) => {
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, role } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
@@ -345,8 +352,8 @@ app.get('/api/users', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE a guard (protected). Restricted to role=guard to avoid accidentally removing admins.
-app.delete('/api/users/:id', requireAuth, async (req, res) => {
+// DELETE a guard (admin only). Restricted to role=guard to avoid accidentally removing admins.
+app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -369,8 +376,8 @@ app.delete('/api/users/:id', requireAuth, async (req, res) => {
   }
 });
 
-// PATROL SCHEDULES (protected)
-app.post('/api/patrol-schedules', requireAuth, async (req, res) => {
+// PATROL SCHEDULES (read: any authenticated user; create/delete: admin only)
+app.post('/api/patrol-schedules', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;
   if (!tenant_id || !site_id || !schedule_type || !config) {
     return res.status(400).json({ error: 'tenant_id, site_id, schedule_type, and config are required' });
@@ -406,8 +413,8 @@ app.get('/api/patrol-schedules', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE a patrol schedule (protected)
-app.delete('/api/patrol-schedules/:id', requireAuth, async (req, res) => {
+// DELETE a patrol schedule (admin only)
+app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -427,7 +434,7 @@ app.delete('/api/patrol-schedules/:id', requireAuth, async (req, res) => {
   }
 });
 
-// PATROL LOGS (protected)
+// PATROL LOGS (any authenticated user can log a scan)
 app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude } = req.body;
   if (!tenant_id || !checkpoint_id || !user_id) {
@@ -478,7 +485,7 @@ function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   return new Date(Math.max(...candidates.map(d => d.getTime())));
 }
 
-// PATROL COMPLIANCE (protected) - flags overdue checkpoints based on hourly or fixed schedules
+// PATROL COMPLIANCE (any authenticated user) - flags overdue checkpoints based on hourly or fixed schedules
 app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   const { tenant_id, site_id } = req.query;
   if (!tenant_id || !site_id) {
@@ -588,7 +595,7 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   }
 });
 
-// INCIDENTS (protected)
+// INCIDENTS (any authenticated user can report; read: any authenticated user)
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity } = req.body;
   const user_id = req.auth.user_id;

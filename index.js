@@ -287,6 +287,30 @@ app.get('/api/users', requireAuth, async (req, res) => {
   }
 });
 
+// DELETE a guard (protected). Restricted to role=guard to avoid accidentally removing admins.
+app.delete('/api/users/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  if (Number(id) === req.auth.user_id) {
+    return res.status(400).json({ error: 'You cannot remove your own account' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        "DELETE FROM users WHERE id = $1 AND tenant_id = $2 AND role = 'guard' RETURNING id, email",
+        [id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Guard not found, or user is not a guard' });
+    }
+    res.json({ deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATROL SCHEDULES (protected)
 app.post('/api/patrol-schedules', requireAuth, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;
@@ -319,6 +343,27 @@ app.get('/api/patrol-schedules', requireAuth, async (req, res) => {
         : client.query('SELECT * FROM patrol_schedules WHERE tenant_id = $1', [tenant_id])
     );
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE a patrol schedule (protected)
+app.delete('/api/patrol-schedules/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'DELETE FROM patrol_schedules WHERE id = $1 AND tenant_id = $2 RETURNING *',
+        [id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Schedule not found' });
+    }
+    res.json({ deleted: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -407,9 +452,17 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
     });
 
     const now = new Date();
-    const hourlySchedule = data.schedules.find(s => s.schedule_type === 'hourly');
-    const fixedSchedule = data.schedules.find(s => s.schedule_type === 'fixed');
-    const hasCustomOnly = !hourlySchedule && !fixedSchedule && data.schedules.some(s => s.schedule_type === 'custom');
+    const hourlySchedules = data.schedules.filter(s => s.schedule_type === 'hourly');
+    const fixedSchedules = data.schedules.filter(s => s.schedule_type === 'fixed');
+    const hasCustomOnly = hourlySchedules.length === 0 && fixedSchedules.length === 0 && data.schedules.some(s => s.schedule_type === 'custom');
+
+    const shortestHourly = hourlySchedules.length
+      ? Math.min(...hourlySchedules.map(s => Number(s.config.interval_hours) || Infinity))
+      : null;
+
+    const allFixedTimes = Array.from(new Set(
+      fixedSchedules.flatMap(s => Array.isArray(s.config.times) ? s.config.times : [])
+    ));
 
     const compliance = data.checkpoints.map(cp => {
       const lastLog = data.logs.find(l => l.checkpoint_id === cp.id);
@@ -419,24 +472,22 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
       let hoursOverdue = 0;
       let scheduleType = null;
 
-      if (hourlySchedule) {
+      if (shortestHourly !== null && shortestHourly !== Infinity) {
         scheduleType = 'hourly';
-        const intervalHours = Number(hourlySchedule.config.interval_hours) || 0;
         if (!lastScan) {
           status = 'overdue';
         } else {
           const hoursSince = (now - lastScan) / 3600000;
-          if (hoursSince > intervalHours) {
+          if (hoursSince > shortestHourly) {
             status = 'overdue';
-            hoursOverdue = Math.round((hoursSince - intervalHours) * 10) / 10;
+            hoursOverdue = Math.round((hoursSince - shortestHourly) * 10) / 10;
           } else {
             status = 'ok';
           }
         }
-      } else if (fixedSchedule) {
+      } else if (allFixedTimes.length > 0) {
         scheduleType = 'fixed';
-        const times = Array.isArray(fixedSchedule.config.times) ? fixedSchedule.config.times : [];
-        const targetOcc = mostRecentFixedOccurrence(times, now);
+        const targetOcc = mostRecentFixedOccurrence(allFixedTimes, now);
 
         if (!targetOcc) {
           status = 'ok';
@@ -497,12 +548,18 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   }
 });
 
+// GET incidents, optionally filtered to a single calendar day via ?date=YYYY-MM-DD
 app.get('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id } = req.query;
+  const { tenant_id, date } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, (client) =>
-      client.query('SELECT * FROM incidents WHERE tenant_id = $1 ORDER BY reported_at DESC', [tenant_id])
+      date
+        ? client.query(
+            'SELECT * FROM incidents WHERE tenant_id = $1 AND reported_at::date = $2 ORDER BY reported_at DESC',
+            [tenant_id, date]
+          )
+        : client.query('SELECT * FROM incidents WHERE tenant_id = $1 ORDER BY reported_at DESC', [tenant_id])
     );
     res.json(result.rows);
   } catch (err) {

@@ -156,8 +156,6 @@ async function ensureNotificationsTable() {
 }
 ensureNotificationsTable();
 
-// Guard assignments: which sites a given guard is responsible for. Admin-managed.
-// The guard app uses this instead of letting guards freely pick any company site.
 async function ensureGuardAssignmentsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_assignments (
@@ -495,7 +493,7 @@ app.post('/api/signup', async (req, res) => {
     await client.query(`SET app.current_tenant = '${tenant.id}'`);
     const userResult = await client.query(
       'INSERT INTO users (tenant_id, email, role, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, tenant_id, email, role',
-      [tenant.id, admin_email, 'admin', hash]
+      [tenant.id, admin_email.toLowerCase().trim(), 'admin', hash]
     );
     const adminUser = userResult.rows[0];
 
@@ -519,24 +517,28 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// LOGIN — email matching is now case-insensitive (normalized to lowercase before
+// comparison), and tenant_id remains optional (global lookup across tenants).
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required' });
   }
+  const normalizedEmail = email.toLowerCase().trim();
+
   try {
     let user = null;
 
     if (tenant_id) {
       const result = await withTenant(tenant_id, (client) =>
-        client.query('SELECT * FROM users WHERE tenant_id = $1 AND email = $2', [tenant_id, email])
+        client.query('SELECT * FROM users WHERE tenant_id = $1 AND LOWER(email) = $2', [tenant_id, normalizedEmail])
       );
       user = result.rows[0] || null;
     } else {
       const tenantsRes = await pool.query('SELECT id FROM tenants');
       for (const t of tenantsRes.rows) {
         const result = await withTenant(t.id, (client) =>
-          client.query('SELECT * FROM users WHERE tenant_id = $1 AND email = $2', [t.id, email])
+          client.query('SELECT * FROM users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
         );
         if (result.rows[0]) {
           user = result.rows[0];
@@ -679,7 +681,7 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
       const hash = password ? await bcrypt.hash(password, 10) : null;
       return client.query(
         'INSERT INTO users (tenant_id, firebase_uid, email, role, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, tenant_id, email, role',
-        [tenant_id, firebase_uid || null, email, role || 'guard', hash]
+        [tenant_id, firebase_uid || null, email.toLowerCase().trim(), role || 'guard', hash]
       );
     });
     res.status(201).json(result.rows[0]);
@@ -726,7 +728,35 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// GUARD ASSIGNMENTS (admin manages; guards read only their own)
+// RESET a guard's password (admin only). Restricted to role=guard for the same
+// safety reason as deletion — admins can't accidentally overwrite another admin's
+// password through this route.
+app.patch('/api/users/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, new_password } = req.body;
+  if (!tenant_id || !new_password) {
+    return res.status(400).json({ error: 'tenant_id and new_password are required' });
+  }
+  if (new_password.length < 6) {
+    return res.status(400).json({ error: 'new_password must be at least 6 characters' });
+  }
+  try {
+    const hash = await bcrypt.hash(new_password, 10);
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        "UPDATE users SET password_hash = $1 WHERE id = $2 AND tenant_id = $3 AND role = 'guard' RETURNING id, email",
+        [hash, id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Guard not found, or user is not a guard' });
+    }
+    res.json({ reset: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id } = req.body;
   if (!tenant_id || !site_id || !user_id) {
@@ -749,8 +779,6 @@ app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
-// List assignments. Admins can filter by site or by guard; guards use their own
-// user_id (their JWT) to see only their assigned sites.
 app.get('/api/guard-assignments', requireAuth, async (req, res) => {
   const { tenant_id, user_id, site_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });

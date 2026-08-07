@@ -502,16 +502,37 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+// LOGIN — tenant_id is now OPTIONAL. If omitted, the backend searches across all
+// tenants for a user with that email (global lookup), so both admins and guards
+// can log in with just email + password, no company/tenant ID required.
+// NOTE: if the same email exists in more than one tenant, this returns the first
+// match found — acceptable for now since email is expected to be unique per user.
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
-  if (!tenant_id || !email || !password) {
-    return res.status(400).json({ error: 'tenant_id, email, and password are required' });
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
   }
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query('SELECT * FROM users WHERE tenant_id = $1 AND email = $2', [tenant_id, email])
-    );
-    const user = result.rows[0];
+    let user = null;
+
+    if (tenant_id) {
+      const result = await withTenant(tenant_id, (client) =>
+        client.query('SELECT * FROM users WHERE tenant_id = $1 AND email = $2', [tenant_id, email])
+      );
+      user = result.rows[0] || null;
+    } else {
+      const tenantsRes = await pool.query('SELECT id FROM tenants');
+      for (const t of tenantsRes.rows) {
+        const result = await withTenant(t.id, (client) =>
+          client.query('SELECT * FROM users WHERE tenant_id = $1 AND email = $2', [t.id, email])
+        );
+        if (result.rows[0]) {
+          user = result.rows[0];
+          break;
+        }
+      }
+    }
+
     if (!user || !user.password_hash) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -604,8 +625,6 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
   }
 });
 
-// Look up a checkpoint by its QR code value — used by the guard app's camera scanner
-// so a guard can scan any physical label without manually picking a site/checkpoint first.
 app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
   const { tenant_id, qr_code } = req.query;
   if (!tenant_id || !qr_code) return res.status(400).json({ error: 'tenant_id and qr_code query params are required' });

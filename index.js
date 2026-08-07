@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -17,8 +18,17 @@ const pool = new Pool({
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
-const VALID_PLANS = ['starter', 'pro', 'enterprise'];
 const FIXED_WINDOW_MINUTES = 30;
+
+// PLAN TIERS — limits and pricing reference. Enterprise = unlimited, billed per-unit.
+const PLAN_LIMITS = {
+  starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
+  medium:     { locations: 1,        checkpoints: 20,       guards: 6,        monthly_price: 79,  overage: null },
+  pro:        { locations: 2,        checkpoints: 50,       guards: 10,       monthly_price: 149, overage: null },
+  diamond:    { locations: 3,        checkpoints: 100,      guards: 15,       monthly_price: 299, overage: null },
+  enterprise: { locations: Infinity, checkpoints: Infinity, guards: Infinity, monthly_price: 499, overage: { location: 80, checkpoint: 10, guard: 15 } }
+};
+const VALID_PLANS = Object.keys(PLAN_LIMITS);
 
 const FALLBACK_TIMEZONES = [
   'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'Europe/Madrid', 'Europe/Rome',
@@ -70,6 +80,28 @@ function requireAdmin(req, res, next) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
+}
+
+// Enforces plan limits for a given resource type before allowing creation.
+// Enterprise has no hard limit (billed per-unit instead), everyone else is capped.
+async function checkPlanLimit(client, tenantId, resource) {
+  const tenantRes = await client.query('SELECT plan FROM tenants WHERE id = $1', [tenantId]);
+  const plan = (tenantRes.rows[0] && tenantRes.rows[0].plan) || 'starter';
+  const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.starter;
+  const max = limits[resource];
+
+  if (max === Infinity || max === undefined) return { allowed: true, plan, max, current: null };
+
+  let countQuery;
+  if (resource === 'locations') countQuery = 'SELECT COUNT(*) FROM sites WHERE tenant_id = $1';
+  else if (resource === 'checkpoints') countQuery = 'SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1';
+  else if (resource === 'guards') countQuery = "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'";
+  else return { allowed: true, plan, max, current: null };
+
+  const countRes = await client.query(countQuery, [tenantId]);
+  const current = parseInt(countRes.rows[0].count, 10);
+
+  return { allowed: current < max, plan, max, current };
 }
 
 async function ensureIncidentsTable() {
@@ -125,14 +157,50 @@ app.get('/api/timezones', (req, res) => {
   res.json(getAllTimezones());
 });
 
+// PLANS (public reference — used by pricing page and signup)
+app.get('/api/plans', (req, res) => {
+  res.json(PLAN_LIMITS);
+});
+
+// USAGE (protected) — current counts vs plan limits, for dashboard display
+app.get('/api/usage', requireAuth, async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const data = await withTenant(tenant_id, async (client) => {
+      const tenantRes = await client.query('SELECT plan FROM tenants WHERE id = $1', [tenant_id]);
+      const plan = (tenantRes.rows[0] && tenantRes.rows[0].plan) || 'starter';
+      const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.starter;
+
+      const sitesRes = await client.query('SELECT COUNT(*) FROM sites WHERE tenant_id = $1', [tenant_id]);
+      const checkpointsRes = await client.query('SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1', [tenant_id]);
+      const guardsRes = await client.query("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'", [tenant_id]);
+
+      return {
+        plan,
+        limits,
+        usage: {
+          locations: parseInt(sitesRes.rows[0].count, 10),
+          checkpoints: parseInt(checkpointsRes.rows[0].count, 10),
+          guards: parseInt(guardsRes.rows[0].count, 10)
+        }
+      };
+    });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // TENANTS
 app.post('/api/tenants', async (req, res) => {
   const { name, slug, plan } = req.body;
   if (!name || !slug) return res.status(400).json({ error: 'name and slug are required' });
+  const chosenPlan = VALID_PLANS.includes(plan) ? plan : 'starter';
   try {
     const result = await pool.query(
       'INSERT INTO tenants (name, slug, plan) VALUES ($1, $2, $3) RETURNING *',
-      [name, slug, plan || 'starter']
+      [name, slug, chosenPlan]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -144,6 +212,27 @@ app.get('/api/tenants', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM tenants ORDER BY created_at DESC');
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// UPDATE tenant plan (admin only) — e.g. upgrading from Starter to Pro
+app.patch('/api/tenants/:id/plan', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { plan } = req.body;
+  if (!plan || !VALID_PLANS.includes(plan)) {
+    return res.status(400).json({ error: 'plan must be one of: ' + VALID_PLANS.join(', ') });
+  }
+  if (Number(id) !== req.auth.tenant_id) {
+    return res.status(403).json({ error: 'Cannot modify a different tenant' });
+  }
+  try {
+    const result = await withTenant(id, (client) =>
+      client.query('UPDATE tenants SET plan = $1 WHERE id = $2 RETURNING *', [plan, id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -250,20 +339,26 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// SITES (read: any authenticated user; create: admin only)
+// SITES (read: any authenticated user; create: admin only, enforced against plan limit)
 app.post('/api/sites', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, name, address } = req.body;
   if (!tenant_id || !name) return res.status(400).json({ error: 'tenant_id and name are required' });
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
+    const result = await withTenant(tenant_id, async (client) => {
+      const limitCheck = await checkPlanLimit(client, tenant_id, 'locations');
+      if (!limitCheck.allowed) {
+        const err = new Error(`Your ${limitCheck.plan} plan allows up to ${limitCheck.max} location(s). Upgrade your plan to add more.`);
+        err.statusCode = 403;
+        throw err;
+      }
+      return client.query(
         'INSERT INTO sites (tenant_id, name, address) VALUES ($1, $2, $3) RETURNING *',
         [tenant_id, name, address || null]
-      )
-    );
+      );
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -280,22 +375,28 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
-// CHECKPOINTS (read: any authenticated user; create: admin only)
+// CHECKPOINTS (read: any authenticated user; create: admin only, enforced against plan limit)
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
     return res.status(400).json({ error: 'tenant_id, site_id, name, and qr_code are required' });
   }
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
+    const result = await withTenant(tenant_id, async (client) => {
+      const limitCheck = await checkPlanLimit(client, tenant_id, 'checkpoints');
+      if (!limitCheck.allowed) {
+        const err = new Error(`Your ${limitCheck.plan} plan allows up to ${limitCheck.max} checkpoint(s). Upgrade your plan to add more.`);
+        err.statusCode = 403;
+        throw err;
+      }
+      return client.query(
         'INSERT INTO checkpoints (tenant_id, site_id, name, qr_code, latitude, longitude) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
         [tenant_id, site_id, name, qr_code, latitude || null, longitude || null]
-      )
-    );
+      );
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -314,7 +415,7 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
   }
 });
 
-// USERS (create/list/delete guards: admin only)
+// USERS (create/list/delete guards: admin only, creation enforced against plan limit)
 app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, firebase_uid, email, role, password } = req.body;
   if (!tenant_id || !email) {
@@ -324,16 +425,24 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'role must be admin or guard' });
   }
   try {
-    const hash = password ? await bcrypt.hash(password, 10) : null;
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
+    const result = await withTenant(tenant_id, async (client) => {
+      if ((role || 'guard') === 'guard') {
+        const limitCheck = await checkPlanLimit(client, tenant_id, 'guards');
+        if (!limitCheck.allowed) {
+          const err = new Error(`Your ${limitCheck.plan} plan allows up to ${limitCheck.max} guard(s). Upgrade your plan to add more.`);
+          err.statusCode = 403;
+          throw err;
+        }
+      }
+      const hash = password ? await bcrypt.hash(password, 10) : null;
+      return client.query(
         'INSERT INTO users (tenant_id, firebase_uid, email, role, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, tenant_id, email, role',
         [tenant_id, firebase_uid || null, email, role || 'guard', hash]
-      )
-    );
+      );
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 

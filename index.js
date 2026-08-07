@@ -517,8 +517,11 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN — email matching is now case-insensitive (normalized to lowercase before
-// comparison), and tenant_id remains optional (global lookup across tenants).
+// LOGIN — case-insensitive email match. IMPORTANT: since the same email can exist
+// across multiple tenants (from repeated testing / old accounts), this now checks
+// the password against EVERY matching account across ALL tenants, rather than
+// stopping at the first email match and giving up. This fixed a real bug where an
+// old duplicate account with a stale password was shadowing the correct one.
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!email || !password) {
@@ -527,39 +530,47 @@ app.post('/api/auth/login', async (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
 
   try {
-    let user = null;
+    let candidates = [];
 
     if (tenant_id) {
       const result = await withTenant(tenant_id, (client) =>
         client.query('SELECT * FROM users WHERE tenant_id = $1 AND LOWER(email) = $2', [tenant_id, normalizedEmail])
       );
-      user = result.rows[0] || null;
+      candidates = result.rows;
     } else {
       const tenantsRes = await pool.query('SELECT id FROM tenants');
       for (const t of tenantsRes.rows) {
         const result = await withTenant(t.id, (client) =>
           client.query('SELECT * FROM users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
         );
-        if (result.rows[0]) {
-          user = result.rows[0];
-          break;
-        }
+        candidates.push(...result.rows);
       }
     }
 
-    if (!user || !user.password_hash) {
+    if (candidates.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
+
+    let matchedUser = null;
+    for (const candidate of candidates) {
+      if (!candidate.password_hash) continue;
+      const valid = await bcrypt.compare(password, candidate.password_hash);
+      if (valid) {
+        matchedUser = candidate;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
     const token = jwt.sign(
-      { user_id: user.id, tenant_id: user.tenant_id, role: user.role },
+      { user_id: matchedUser.id, tenant_id: matchedUser.tenant_id, role: matchedUser.role },
       JWT_SECRET,
       { expiresIn: '12h' }
     );
-    res.json({ token, user: { id: user.id, email: user.email, role: user.role }, tenant_id: user.tenant_id });
+    res.json({ token, user: { id: matchedUser.id, email: matchedUser.email, role: matchedUser.role }, tenant_id: matchedUser.tenant_id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -728,9 +739,6 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// RESET a guard's password (admin only). Restricted to role=guard for the same
-// safety reason as deletion — admins can't accidentally overwrite another admin's
-// password through this route.
 app.patch('/api/users/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id, new_password } = req.body;

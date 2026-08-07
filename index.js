@@ -156,6 +156,23 @@ async function ensureNotificationsTable() {
 }
 ensureNotificationsTable();
 
+// Guard assignments: which sites a given guard is responsible for. Admin-managed.
+// The guard app uses this instead of letting guards freely pick any company site.
+async function ensureGuardAssignmentsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guard_assignments (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id, site_id, user_id)
+    )
+  `);
+  console.log('Guard assignments table ready');
+}
+ensureGuardAssignmentsTable();
+
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
   const candidates = [];
@@ -502,11 +519,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN — tenant_id is now OPTIONAL. If omitted, the backend searches across all
-// tenants for a user with that email (global lookup), so both admins and guards
-// can log in with just email + password, no company/tenant ID required.
-// NOTE: if the same email exists in more than one tenant, this returns the first
-// match found — acceptable for now since email is expected to be unique per user.
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!email || !password) {
@@ -708,6 +720,73 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Guard not found, or user is not a guard' });
     }
+    res.json({ deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GUARD ASSIGNMENTS (admin manages; guards read only their own)
+app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, user_id } = req.body;
+  if (!tenant_id || !site_id || !user_id) {
+    return res.status(400).json({ error: 'tenant_id, site_id, and user_id are required' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `INSERT INTO guard_assignments (tenant_id, site_id, user_id) VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, site_id, user_id) DO NOTHING RETURNING *`,
+        [tenant_id, site_id, user_id]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(409).json({ error: 'This guard is already assigned to this site' });
+    }
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// List assignments. Admins can filter by site or by guard; guards use their own
+// user_id (their JWT) to see only their assigned sites.
+app.get('/api/guard-assignments', requireAuth, async (req, res) => {
+  const { tenant_id, user_id, site_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+
+  if (req.auth.role !== 'admin' && Number(user_id) !== req.auth.user_id) {
+    return res.status(403).json({ error: 'Guards can only view their own assignments' });
+  }
+
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      let query = `SELECT ga.*, s.name as site_name, u.email as guard_email
+                   FROM guard_assignments ga
+                   JOIN sites s ON s.id = ga.site_id
+                   JOIN users u ON u.id = ga.user_id
+                   WHERE ga.tenant_id = $1`;
+      const params = [tenant_id];
+      if (user_id) { params.push(user_id); query += ` AND ga.user_id = $${params.length}`; }
+      if (site_id) { params.push(site_id); query += ` AND ga.site_id = $${params.length}`; }
+      query += ' ORDER BY ga.created_at DESC';
+      return client.query(query, params);
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query('DELETE FROM guard_assignments WHERE id = $1 AND tenant_id = $2 RETURNING *', [id, tenant_id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
     res.json({ deleted: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });

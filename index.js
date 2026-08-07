@@ -136,8 +136,6 @@ async function ensureTimezoneColumn() {
 }
 ensureTimezoneColumn();
 
-// In-app notifications table — replaces email alerts. One open row per overdue
-// checkpoint; auto-resolves once that checkpoint is scanned back into compliance.
 async function ensureNotificationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -261,9 +259,6 @@ async function computeSiteCompliance(client, tenantId, siteId) {
   });
 }
 
-// Background sweep: keeps the notifications table in sync with live compliance state.
-// Opens one notification per overdue checkpoint (no duplicates), auto-resolves when
-// a checkpoint returns to 'ok'. Pure in-app — no external email/SMS involved.
 async function runComplianceSweep() {
   try {
     const tenantsRes = await pool.query('SELECT id FROM tenants');
@@ -357,7 +352,6 @@ app.get('/api/usage', requireAuth, async (req, res) => {
   }
 });
 
-// NOTIFICATIONS (any authenticated user) — in-app alerts feed, tenant-isolated
 app.get('/api/notifications', requireAuth, async (req, res) => {
   const { tenant_id, status } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -376,7 +370,6 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
   }
 });
 
-// Manually dismiss a notification (marks resolved without requiring a fresh scan)
 app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
@@ -606,6 +599,29 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
         : client.query('SELECT * FROM checkpoints WHERE tenant_id = $1 ORDER BY created_at DESC', [tenant_id])
     );
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Look up a checkpoint by its QR code value — used by the guard app's camera scanner
+// so a guard can scan any physical label without manually picking a site/checkpoint first.
+app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
+  const { tenant_id, qr_code } = req.query;
+  if (!tenant_id || !qr_code) return res.status(400).json({ error: 'tenant_id and qr_code query params are required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `SELECT c.*, s.name as site_name FROM checkpoints c
+         JOIN sites s ON s.id = c.site_id
+         WHERE c.tenant_id = $1 AND c.qr_code = $2`,
+        [tenant_id, qr_code]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No checkpoint matches this QR code' });
+    }
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

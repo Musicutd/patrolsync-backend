@@ -171,6 +171,14 @@ async function ensureGuardAssignmentsTable() {
 }
 ensureGuardAssignmentsTable();
 
+// Target number of checkpoint scans the admin expects a guard to complete per
+// day at that site. NULL means "use total checkpoints at the site" as the target.
+async function ensureRoundSizeColumn() {
+  await pool.query(`ALTER TABLE guard_assignments ADD COLUMN IF NOT EXISTS round_size INTEGER`);
+  console.log('Round size column ready');
+}
+ensureRoundSizeColumn();
+
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
   const candidates = [];
@@ -185,6 +193,10 @@ function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   });
   if (candidates.length === 0) return null;
   return new Date(Math.max(...candidates.map(d => d.getTime())));
+}
+
+function todayStartUTC(zone) {
+  return DateTime.now().setZone(zone).startOf('day').toUTC().toJSDate();
 }
 
 async function computeSiteCompliance(client, tenantId, siteId) {
@@ -517,11 +529,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN — case-insensitive email match. IMPORTANT: since the same email can exist
-// across multiple tenants (from repeated testing / old accounts), this now checks
-// the password against EVERY matching account across ALL tenants, rather than
-// stopping at the first email match and giving up. This fixed a real bug where an
-// old duplicate account with a stale password was shadowing the correct one.
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!email || !password) {
@@ -765,17 +772,19 @@ app.patch('/api/users/:id/reset-password', requireAuth, requireAdmin, async (req
   }
 });
 
+// GUARD ASSIGNMENTS — now optionally carry a round_size (daily scan target).
 app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, user_id } = req.body;
+  const { tenant_id, site_id, user_id, round_size } = req.body;
   if (!tenant_id || !site_id || !user_id) {
     return res.status(400).json({ error: 'tenant_id, site_id, and user_id are required' });
   }
+  const roundSizeVal = (round_size !== undefined && round_size !== null && round_size !== '') ? Number(round_size) : null;
   try {
     const result = await withTenant(tenant_id, (client) =>
       client.query(
-        `INSERT INTO guard_assignments (tenant_id, site_id, user_id) VALUES ($1, $2, $3)
+        `INSERT INTO guard_assignments (tenant_id, site_id, user_id, round_size) VALUES ($1, $2, $3, $4)
          ON CONFLICT (tenant_id, site_id, user_id) DO NOTHING RETURNING *`,
-        [tenant_id, site_id, user_id]
+        [tenant_id, site_id, user_id, roundSizeVal]
       )
     );
     if (result.rows.length === 0) {
@@ -814,6 +823,27 @@ app.get('/api/guard-assignments', requireAuth, async (req, res) => {
   }
 });
 
+// Update an assignment's round_size (admin only) — lets an admin change a guard's
+// daily target without deleting and recreating the assignment.
+app.patch('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, round_size } = req.body;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
+  const roundSizeVal = (round_size !== undefined && round_size !== null && round_size !== '') ? Number(round_size) : null;
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'UPDATE guard_assignments SET round_size = $1 WHERE id = $2 AND tenant_id = $3 RETURNING *',
+        [roundSizeVal, id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.delete('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
@@ -826,6 +856,67 @@ app.delete('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, 
     res.json({ deleted: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GUARD PROGRESS — how many distinct checkpoints this guard has scanned at this
+// site TODAY (reset daily at midnight in the tenant's timezone) versus their
+// target (round_size if the admin set one, else total checkpoints at the site).
+// Also returns the specific list of checkpoints still outstanding.
+app.get('/api/guard-progress', requireAuth, async (req, res) => {
+  const { tenant_id, site_id, user_id } = req.query;
+  if (!tenant_id || !site_id || !user_id) {
+    return res.status(400).json({ error: 'tenant_id, site_id, and user_id are required' });
+  }
+  if (req.auth.role !== 'admin' && Number(user_id) !== req.auth.user_id) {
+    return res.status(403).json({ error: 'Guards can only view their own progress' });
+  }
+  try {
+    const data = await withTenant(tenant_id, async (client) => {
+      const tenantRes = await client.query('SELECT timezone FROM tenants WHERE id = $1', [tenant_id]);
+      const zone = (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC';
+
+      const assignmentRes = await client.query(
+        'SELECT * FROM guard_assignments WHERE tenant_id = $1 AND site_id = $2 AND user_id = $3',
+        [tenant_id, site_id, user_id]
+      );
+      if (assignmentRes.rows.length === 0) {
+        const err = new Error('Guard is not assigned to this site');
+        err.statusCode = 404;
+        throw err;
+      }
+      const assignment = assignmentRes.rows[0];
+
+      const checkpointsRes = await client.query(
+        'SELECT id, name FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY name',
+        [tenant_id, site_id]
+      );
+      const checkpoints = checkpointsRes.rows;
+      const target = assignment.round_size !== null ? assignment.round_size : checkpoints.length;
+
+      const roundStart = todayStartUTC(zone);
+      const checkpointIds = checkpoints.map(c => c.id);
+      const scannedRes = checkpointIds.length
+        ? await client.query(
+            'SELECT DISTINCT checkpoint_id FROM patrol_logs WHERE tenant_id = $1 AND user_id = $2 AND checkpoint_id = ANY($3) AND scanned_at >= $4',
+            [tenant_id, user_id, checkpointIds, roundStart]
+          )
+        : { rows: [] };
+      const scannedIds = new Set(scannedRes.rows.map(r => r.checkpoint_id));
+
+      const remaining = checkpoints.filter(c => !scannedIds.has(c.id));
+
+      return {
+        scanned_count: scannedIds.size,
+        target,
+        round_complete: scannedIds.size >= target,
+        remaining: remaining.map(c => ({ checkpoint_id: c.id, name: c.name })),
+        round_started_at: roundStart
+      };
+    });
+    res.json(data);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 

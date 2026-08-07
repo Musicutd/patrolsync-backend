@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -19,8 +18,11 @@ const pool = new Pool({
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const FIXED_WINDOW_MINUTES = 30;
+const ALERT_COOLDOWN_HOURS = 2;
+const ALERT_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const ALERT_FROM_EMAIL = process.env.ALERT_FROM_EMAIL;
 
-// PLAN TIERS — limits and pricing reference. Enterprise = unlimited, billed per-unit.
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
   medium:     { locations: 1,        checkpoints: 20,       guards: 6,        monthly_price: 79,  overage: null },
@@ -82,8 +84,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Enforces plan limits for a given resource type before allowing creation.
-// Enterprise has no hard limit (billed per-unit instead), everyone else is capped.
 async function checkPlanLimit(client, tenantId, resource) {
   const tenantRes = await client.query('SELECT plan FROM tenants WHERE id = $1', [tenantId]);
   const plan = (tenantRes.rows[0] && tenantRes.rows[0].plan) || 'starter';
@@ -139,6 +139,204 @@ async function ensureTimezoneColumn() {
 }
 ensureTimezoneColumn();
 
+async function ensureAlertLogTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS alert_log (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      checkpoint_id INTEGER NOT NULL,
+      last_alerted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id, checkpoint_id)
+    )
+  `);
+  console.log('Alert log table ready');
+}
+ensureAlertLogTable();
+
+// Sends an overdue-checkpoint alert email via SendGrid. Safely no-ops if not configured.
+async function sendOverdueAlertEmail(toEmail, tenantName, siteName, checkpointName, hoursOverdue) {
+  if (!SENDGRID_API_KEY || !ALERT_FROM_EMAIL) {
+    console.warn('SendGrid not configured — skipping alert email for', checkpointName);
+    return false;
+  }
+  const overdueText = hoursOverdue ? `${hoursOverdue}h overdue` : 'never scanned';
+  const subject = `PatrolSync Alert: ${checkpointName} is overdue at ${siteName}`;
+  const body = `Hello,\n\nCheckpoint "${checkpointName}" at site "${siteName}" (${tenantName}) is currently ${overdueText}.\n\nPlease check that patrols are being completed on schedule.\n\n— PatrolSync`;
+
+  try {
+    const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + SENDGRID_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: toEmail }] }],
+        from: { email: ALERT_FROM_EMAIL, name: 'PatrolSync Alerts' },
+        subject,
+        content: [{ type: 'text/plain', value: body }]
+      })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('SendGrid error:', res.status, errText);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Failed to send alert email:', err.message);
+    return false;
+  }
+}
+
+function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
+  const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
+  const candidates = [];
+  [0, -1].forEach(dayOffset => {
+    const base = nowLocal.plus({ days: dayOffset });
+    times.forEach(t => {
+      const [h, m] = t.split(':').map(Number);
+      const occLocal = base.set({ hour: h || 0, minute: m || 0, second: 0, millisecond: 0 });
+      const occUTC = occLocal.toUTC();
+      if (occUTC.toJSDate() <= nowUTC) candidates.push(occUTC.toJSDate());
+    });
+  });
+  if (candidates.length === 0) return null;
+  return new Date(Math.max(...candidates.map(d => d.getTime())));
+}
+
+// Computes compliance for a single site. Shared by the API route and the background alert job.
+async function computeSiteCompliance(client, tenantId, siteId) {
+  const tenantRes = await client.query('SELECT timezone FROM tenants WHERE id = $1', [tenantId]);
+  const schedulesRes = await client.query(
+    'SELECT * FROM patrol_schedules WHERE tenant_id = $1 AND site_id = $2',
+    [tenantId, siteId]
+  );
+  const checkpointsRes = await client.query(
+    'SELECT * FROM checkpoints WHERE tenant_id = $1 AND site_id = $2',
+    [tenantId, siteId]
+  );
+  const checkpointIds = checkpointsRes.rows.map(c => c.id);
+  const logsRes = checkpointIds.length
+    ? await client.query(
+        'SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = ANY($2) ORDER BY scanned_at DESC',
+        [tenantId, checkpointIds]
+      )
+    : { rows: [] };
+
+  const zone = (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC';
+  const now = new Date();
+  const hourlySchedules = schedulesRes.rows.filter(s => s.schedule_type === 'hourly');
+  const fixedSchedules = schedulesRes.rows.filter(s => s.schedule_type === 'fixed');
+  const hasCustomOnly = hourlySchedules.length === 0 && fixedSchedules.length === 0 && schedulesRes.rows.some(s => s.schedule_type === 'custom');
+
+  const shortestHourly = hourlySchedules.length
+    ? Math.min(...hourlySchedules.map(s => Number(s.config.interval_hours) || Infinity))
+    : null;
+
+  const allFixedTimes = Array.from(new Set(
+    fixedSchedules.flatMap(s => Array.isArray(s.config.times) ? s.config.times : [])
+  ));
+
+  return checkpointsRes.rows.map(cp => {
+    const lastLog = logsRes.rows.find(l => l.checkpoint_id === cp.id);
+    const lastScan = lastLog ? new Date(lastLog.scanned_at) : null;
+
+    let status = 'no_schedule';
+    let hoursOverdue = 0;
+    let scheduleType = null;
+
+    if (shortestHourly !== null && shortestHourly !== Infinity) {
+      scheduleType = 'hourly';
+      if (!lastScan) {
+        status = 'overdue';
+      } else {
+        const hoursSince = (now - lastScan) / 3600000;
+        if (hoursSince > shortestHourly) {
+          status = 'overdue';
+          hoursOverdue = Math.round((hoursSince - shortestHourly) * 10) / 10;
+        } else {
+          status = 'ok';
+        }
+      }
+    } else if (allFixedTimes.length > 0) {
+      scheduleType = 'fixed';
+      const targetOcc = mostRecentFixedOccurrenceUTC(allFixedTimes, now, zone);
+      if (!targetOcc) {
+        status = 'ok';
+      } else {
+        const windowStart = new Date(targetOcc.getTime() - FIXED_WINDOW_MINUTES * 60000);
+        const windowEnd = new Date(targetOcc.getTime() + FIXED_WINDOW_MINUTES * 60000);
+        const matchedScan = logsRes.rows.find(l => {
+          const t = new Date(l.scanned_at);
+          return l.checkpoint_id === cp.id && t >= windowStart && t <= windowEnd;
+        });
+        if (matchedScan) status = 'ok';
+        else if (now < windowEnd) status = 'ok';
+        else {
+          status = 'overdue';
+          hoursOverdue = Math.round(((now - windowEnd) / 3600000) * 10) / 10;
+        }
+      }
+    } else if (hasCustomOnly) {
+      status = 'unmonitored';
+    }
+
+    return {
+      checkpoint_id: cp.id,
+      checkpoint_name: cp.name,
+      last_scan: lastScan,
+      status,
+      hours_overdue: hoursOverdue,
+      schedule_type: scheduleType
+    };
+  });
+}
+
+// Background job: every ALERT_CHECK_INTERVAL_MS, scans all tenants/sites for overdue
+// checkpoints and emails the tenant's admin(s), respecting a per-checkpoint cooldown.
+async function runOverdueAlertSweep() {
+  try {
+    const tenantsRes = await pool.query('SELECT id, name, timezone FROM tenants');
+    for (const tenant of tenantsRes.rows) {
+      await withTenant(tenant.id, async (client) => {
+        const sitesRes = await client.query('SELECT id, name FROM sites WHERE tenant_id = $1', [tenant.id]);
+        const adminsRes = await client.query("SELECT email FROM users WHERE tenant_id = $1 AND role = 'admin'", [tenant.id]);
+        if (adminsRes.rows.length === 0) return;
+
+        for (const site of sitesRes.rows) {
+          const compliance = await computeSiteCompliance(client, tenant.id, site.id);
+          const overdueCheckpoints = compliance.filter(c => c.status === 'overdue');
+
+          for (const cp of overdueCheckpoints) {
+            const alertRes = await client.query(
+              'SELECT last_alerted_at FROM alert_log WHERE tenant_id = $1 AND checkpoint_id = $2',
+              [tenant.id, cp.checkpoint_id]
+            );
+            const lastAlerted = alertRes.rows[0] ? new Date(alertRes.rows[0].last_alerted_at) : null;
+            const hoursSinceAlert = lastAlerted ? (Date.now() - lastAlerted.getTime()) / 3600000 : Infinity;
+
+            if (hoursSinceAlert >= ALERT_COOLDOWN_HOURS) {
+              for (const admin of adminsRes.rows) {
+                await sendOverdueAlertEmail(admin.email, tenant.name, site.name, cp.checkpoint_name, cp.hours_overdue);
+              }
+              await client.query(
+                `INSERT INTO alert_log (tenant_id, checkpoint_id, last_alerted_at) VALUES ($1, $2, NOW())
+                 ON CONFLICT (tenant_id, checkpoint_id) DO UPDATE SET last_alerted_at = NOW()`,
+                [tenant.id, cp.checkpoint_id]
+              );
+            }
+          }
+        }
+      });
+    }
+  } catch (err) {
+    console.error('Overdue alert sweep failed:', err.message);
+  }
+}
+setInterval(runOverdueAlertSweep, ALERT_CHECK_INTERVAL_MS);
+setTimeout(runOverdueAlertSweep, 30000);
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });
@@ -152,17 +350,14 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// TIMEZONES (public reference list for dropdowns)
 app.get('/api/timezones', (req, res) => {
   res.json(getAllTimezones());
 });
 
-// PLANS (public reference — used by pricing page and signup)
 app.get('/api/plans', (req, res) => {
   res.json(PLAN_LIMITS);
 });
 
-// USAGE (protected) — current counts vs plan limits, for dashboard display
 app.get('/api/usage', requireAuth, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -192,7 +387,6 @@ app.get('/api/usage', requireAuth, async (req, res) => {
   }
 });
 
-// TENANTS
 app.post('/api/tenants', async (req, res) => {
   const { name, slug, plan } = req.body;
   if (!name || !slug) return res.status(400).json({ error: 'name and slug are required' });
@@ -217,7 +411,6 @@ app.get('/api/tenants', async (req, res) => {
   }
 });
 
-// UPDATE tenant plan (admin only) — e.g. upgrading from Starter to Pro
 app.patch('/api/tenants/:id/plan', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { plan } = req.body;
@@ -238,7 +431,6 @@ app.patch('/api/tenants/:id/plan', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
-// UPDATE tenant timezone (admin only)
 app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { timezone } = req.body;
@@ -261,7 +453,6 @@ app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, re
   }
 });
 
-// SIGNUP (creates tenant + first admin user + returns JWT)
 app.post('/api/signup', async (req, res) => {
   const { company_name, plan, admin_email, admin_password, timezone } = req.body;
   if (!company_name || !admin_email || !admin_password) {
@@ -310,7 +501,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN (used by both admins and guards)
 app.post('/api/auth/login', async (req, res) => {
   const { tenant_id, email, password } = req.body;
   if (!tenant_id || !email || !password) {
@@ -339,7 +529,6 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// SITES (read: any authenticated user; create: admin only, enforced against plan limit)
 app.post('/api/sites', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, name, address } = req.body;
   if (!tenant_id || !name) return res.status(400).json({ error: 'tenant_id and name are required' });
@@ -375,7 +564,6 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
-// CHECKPOINTS (read: any authenticated user; create: admin only, enforced against plan limit)
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
@@ -415,7 +603,6 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
   }
 });
 
-// USERS (create/list/delete guards: admin only, creation enforced against plan limit)
 app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, firebase_uid, email, role, password } = req.body;
   if (!tenant_id || !email) {
@@ -461,7 +648,6 @@ app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE a guard (admin only). Restricted to role=guard to avoid accidentally removing admins.
 app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
@@ -485,7 +671,6 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// PATROL SCHEDULES (read: any authenticated user; create/delete: admin only)
 app.post('/api/patrol-schedules', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;
   if (!tenant_id || !site_id || !schedule_type || !config) {
@@ -522,7 +707,6 @@ app.get('/api/patrol-schedules', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE a patrol schedule (admin only)
 app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
@@ -543,7 +727,6 @@ app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, r
   }
 });
 
-// PATROL LOGS (any authenticated user can log a scan)
 app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude } = req.body;
   if (!tenant_id || !checkpoint_id || !user_id) {
@@ -577,134 +760,19 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
-// Helpers for fixed-schedule compliance (timezone-aware via luxon)
-function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
-  const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
-  const candidates = [];
-  [0, -1].forEach(dayOffset => {
-    const base = nowLocal.plus({ days: dayOffset });
-    times.forEach(t => {
-      const [h, m] = t.split(':').map(Number);
-      const occLocal = base.set({ hour: h || 0, minute: m || 0, second: 0, millisecond: 0 });
-      const occUTC = occLocal.toUTC();
-      if (occUTC.toJSDate() <= nowUTC) candidates.push(occUTC.toJSDate());
-    });
-  });
-  if (candidates.length === 0) return null;
-  return new Date(Math.max(...candidates.map(d => d.getTime())));
-}
-
-// PATROL COMPLIANCE (any authenticated user) - flags overdue checkpoints based on hourly or fixed schedules
 app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   const { tenant_id, site_id } = req.query;
   if (!tenant_id || !site_id) {
     return res.status(400).json({ error: 'tenant_id and site_id are required' });
   }
   try {
-    const data = await withTenant(tenant_id, async (client) => {
-      const tenantRes = await client.query('SELECT timezone FROM tenants WHERE id = $1', [tenant_id]);
-      const schedulesRes = await client.query(
-        'SELECT * FROM patrol_schedules WHERE tenant_id = $1 AND site_id = $2',
-        [tenant_id, site_id]
-      );
-      const checkpointsRes = await client.query(
-        'SELECT * FROM checkpoints WHERE tenant_id = $1 AND site_id = $2',
-        [tenant_id, site_id]
-      );
-      const checkpointIds = checkpointsRes.rows.map(c => c.id);
-      const logsRes = checkpointIds.length
-        ? await client.query(
-            'SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = ANY($2) ORDER BY scanned_at DESC',
-            [tenant_id, checkpointIds]
-          )
-        : { rows: [] };
-      return {
-        timezone: (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC',
-        schedules: schedulesRes.rows,
-        checkpoints: checkpointsRes.rows,
-        logs: logsRes.rows
-      };
-    });
-
-    const now = new Date();
-    const zone = data.timezone;
-    const hourlySchedules = data.schedules.filter(s => s.schedule_type === 'hourly');
-    const fixedSchedules = data.schedules.filter(s => s.schedule_type === 'fixed');
-    const hasCustomOnly = hourlySchedules.length === 0 && fixedSchedules.length === 0 && data.schedules.some(s => s.schedule_type === 'custom');
-
-    const shortestHourly = hourlySchedules.length
-      ? Math.min(...hourlySchedules.map(s => Number(s.config.interval_hours) || Infinity))
-      : null;
-
-    const allFixedTimes = Array.from(new Set(
-      fixedSchedules.flatMap(s => Array.isArray(s.config.times) ? s.config.times : [])
-    ));
-
-    const compliance = data.checkpoints.map(cp => {
-      const lastLog = data.logs.find(l => l.checkpoint_id === cp.id);
-      const lastScan = lastLog ? new Date(lastLog.scanned_at) : null;
-
-      let status = 'no_schedule';
-      let hoursOverdue = 0;
-      let scheduleType = null;
-
-      if (shortestHourly !== null && shortestHourly !== Infinity) {
-        scheduleType = 'hourly';
-        if (!lastScan) {
-          status = 'overdue';
-        } else {
-          const hoursSince = (now - lastScan) / 3600000;
-          if (hoursSince > shortestHourly) {
-            status = 'overdue';
-            hoursOverdue = Math.round((hoursSince - shortestHourly) * 10) / 10;
-          } else {
-            status = 'ok';
-          }
-        }
-      } else if (allFixedTimes.length > 0) {
-        scheduleType = 'fixed';
-        const targetOcc = mostRecentFixedOccurrenceUTC(allFixedTimes, now, zone);
-
-        if (!targetOcc) {
-          status = 'ok';
-        } else {
-          const windowStart = new Date(targetOcc.getTime() - FIXED_WINDOW_MINUTES * 60000);
-          const windowEnd = new Date(targetOcc.getTime() + FIXED_WINDOW_MINUTES * 60000);
-          const matchedScan = data.logs.find(l => {
-            const t = new Date(l.scanned_at);
-            return l.checkpoint_id === cp.id && t >= windowStart && t <= windowEnd;
-          });
-
-          if (matchedScan) {
-            status = 'ok';
-          } else if (now < windowEnd) {
-            status = 'ok';
-          } else {
-            status = 'overdue';
-            hoursOverdue = Math.round(((now - windowEnd) / 3600000) * 10) / 10;
-          }
-        }
-      } else if (hasCustomOnly) {
-        status = 'unmonitored';
-      }
-
-      return {
-        checkpoint_id: cp.id,
-        checkpoint_name: cp.name,
-        last_scan: lastScan,
-        status,
-        hours_overdue: hoursOverdue,
-        schedule_type: scheduleType
-      };
-    });
-
+    const compliance = await withTenant(tenant_id, (client) => computeSiteCompliance(client, tenant_id, site_id));
     res.json(compliance);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// INCIDENTS (any authenticated user can report; read: any authenticated user)
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity } = req.body;
   const user_id = req.auth.user_id;
@@ -724,7 +792,6 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   }
 });
 
-// GET incidents, optionally filtered to a single calendar day via ?date=YYYY-MM-DD
 app.get('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, date } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });

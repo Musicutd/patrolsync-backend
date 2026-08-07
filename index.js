@@ -18,10 +18,7 @@ const pool = new Pool({
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const FIXED_WINDOW_MINUTES = 30;
-const ALERT_COOLDOWN_HOURS = 2;
-const ALERT_CHECK_INTERVAL_MS = 15 * 60 * 1000;
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-const ALERT_FROM_EMAIL = process.env.ALERT_FROM_EMAIL;
+const ALERT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
@@ -139,55 +136,27 @@ async function ensureTimezoneColumn() {
 }
 ensureTimezoneColumn();
 
-async function ensureAlertLogTable() {
+// In-app notifications table — replaces email alerts. One open row per overdue
+// checkpoint; auto-resolves once that checkpoint is scanned back into compliance.
+async function ensureNotificationsTable() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS alert_log (
+    CREATE TABLE IF NOT EXISTS notifications (
       id SERIAL PRIMARY KEY,
       tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      site_name TEXT NOT NULL,
       checkpoint_id INTEGER NOT NULL,
-      last_alerted_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      UNIQUE(tenant_id, checkpoint_id)
+      checkpoint_name TEXT NOT NULL,
+      message TEXT NOT NULL,
+      hours_overdue NUMERIC DEFAULT 0,
+      resolved BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      resolved_at TIMESTAMP
     )
   `);
-  console.log('Alert log table ready');
+  console.log('Notifications table ready');
 }
-ensureAlertLogTable();
-
-// Sends an overdue-checkpoint alert email via SendGrid. Safely no-ops if not configured.
-async function sendOverdueAlertEmail(toEmail, tenantName, siteName, checkpointName, hoursOverdue) {
-  if (!SENDGRID_API_KEY || !ALERT_FROM_EMAIL) {
-    console.warn('SendGrid not configured — skipping alert email for', checkpointName);
-    return false;
-  }
-  const overdueText = hoursOverdue ? `${hoursOverdue}h overdue` : 'never scanned';
-  const subject = `PatrolSync Alert: ${checkpointName} is overdue at ${siteName}`;
-  const body = `Hello,\n\nCheckpoint "${checkpointName}" at site "${siteName}" (${tenantName}) is currently ${overdueText}.\n\nPlease check that patrols are being completed on schedule.\n\n— PatrolSync`;
-
-  try {
-    const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + SENDGRID_API_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        personalizations: [{ to: [{ email: toEmail }] }],
-        from: { email: ALERT_FROM_EMAIL, name: 'PatrolSync Alerts' },
-        subject,
-        content: [{ type: 'text/plain', value: body }]
-      })
-    });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error('SendGrid error:', res.status, errText);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error('Failed to send alert email:', err.message);
-    return false;
-  }
-}
+ensureNotificationsTable();
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
@@ -205,7 +174,6 @@ function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   return new Date(Math.max(...candidates.map(d => d.getTime())));
 }
 
-// Computes compliance for a single site. Shared by the API route and the background alert job.
 async function computeSiteCompliance(client, tenantId, siteId) {
   const tenantRes = await client.query('SELECT timezone FROM tenants WHERE id = $1', [tenantId]);
   const schedulesRes = await client.query(
@@ -293,36 +261,38 @@ async function computeSiteCompliance(client, tenantId, siteId) {
   });
 }
 
-// Background job: every ALERT_CHECK_INTERVAL_MS, scans all tenants/sites for overdue
-// checkpoints and emails the tenant's admin(s), respecting a per-checkpoint cooldown.
-async function runOverdueAlertSweep() {
+// Background sweep: keeps the notifications table in sync with live compliance state.
+// Opens one notification per overdue checkpoint (no duplicates), auto-resolves when
+// a checkpoint returns to 'ok'. Pure in-app — no external email/SMS involved.
+async function runComplianceSweep() {
   try {
-    const tenantsRes = await pool.query('SELECT id, name, timezone FROM tenants');
+    const tenantsRes = await pool.query('SELECT id FROM tenants');
     for (const tenant of tenantsRes.rows) {
       await withTenant(tenant.id, async (client) => {
         const sitesRes = await client.query('SELECT id, name FROM sites WHERE tenant_id = $1', [tenant.id]);
-        const adminsRes = await client.query("SELECT email FROM users WHERE tenant_id = $1 AND role = 'admin'", [tenant.id]);
-        if (adminsRes.rows.length === 0) return;
 
         for (const site of sitesRes.rows) {
           const compliance = await computeSiteCompliance(client, tenant.id, site.id);
-          const overdueCheckpoints = compliance.filter(c => c.status === 'overdue');
 
-          for (const cp of overdueCheckpoints) {
-            const alertRes = await client.query(
-              'SELECT last_alerted_at FROM alert_log WHERE tenant_id = $1 AND checkpoint_id = $2',
+          for (const cp of compliance) {
+            const openRes = await client.query(
+              'SELECT id FROM notifications WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE',
               [tenant.id, cp.checkpoint_id]
             );
-            const lastAlerted = alertRes.rows[0] ? new Date(alertRes.rows[0].last_alerted_at) : null;
-            const hoursSinceAlert = lastAlerted ? (Date.now() - lastAlerted.getTime()) / 3600000 : Infinity;
+            const hasOpen = openRes.rows.length > 0;
 
-            if (hoursSinceAlert >= ALERT_COOLDOWN_HOURS) {
-              for (const admin of adminsRes.rows) {
-                await sendOverdueAlertEmail(admin.email, tenant.name, site.name, cp.checkpoint_name, cp.hours_overdue);
-              }
+            if (cp.status === 'overdue' && !hasOpen) {
+              const message = cp.hours_overdue
+                ? `${cp.checkpoint_name} is ${cp.hours_overdue}h overdue`
+                : `${cp.checkpoint_name} has never been scanned`;
               await client.query(
-                `INSERT INTO alert_log (tenant_id, checkpoint_id, last_alerted_at) VALUES ($1, $2, NOW())
-                 ON CONFLICT (tenant_id, checkpoint_id) DO UPDATE SET last_alerted_at = NOW()`,
+                `INSERT INTO notifications (tenant_id, site_id, site_name, checkpoint_id, checkpoint_name, message, hours_overdue)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [tenant.id, site.id, site.name, cp.checkpoint_id, cp.checkpoint_name, message, cp.hours_overdue]
+              );
+            } else if (cp.status !== 'overdue' && hasOpen) {
+              await client.query(
+                'UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE',
                 [tenant.id, cp.checkpoint_id]
               );
             }
@@ -331,11 +301,11 @@ async function runOverdueAlertSweep() {
       });
     }
   } catch (err) {
-    console.error('Overdue alert sweep failed:', err.message);
+    console.error('Compliance sweep failed:', err.message);
   }
 }
-setInterval(runOverdueAlertSweep, ALERT_CHECK_INTERVAL_MS);
-setTimeout(runOverdueAlertSweep, 30000);
+setInterval(runComplianceSweep, ALERT_SWEEP_INTERVAL_MS);
+setTimeout(runComplianceSweep, 15000);
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
@@ -382,6 +352,44 @@ app.get('/api/usage', requireAuth, async (req, res) => {
       };
     });
     res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// NOTIFICATIONS (any authenticated user) — in-app alerts feed, tenant-isolated
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const { tenant_id, status } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      if (status === 'resolved') {
+        return client.query('SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = TRUE ORDER BY resolved_at DESC LIMIT 50', [tenant_id]);
+      } else if (status === 'all') {
+        return client.query('SELECT * FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100', [tenant_id]);
+      }
+      return client.query('SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = FALSE ORDER BY created_at DESC', [tenant_id]);
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manually dismiss a notification (marks resolved without requiring a fresh scan)
+app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE id = $1 AND tenant_id = $2 RETURNING *',
+        [id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Notification not found' });
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

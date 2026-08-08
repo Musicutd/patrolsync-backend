@@ -171,13 +171,20 @@ async function ensureGuardAssignmentsTable() {
 }
 ensureGuardAssignmentsTable();
 
-// Target number of checkpoint scans the admin expects a guard to complete per
-// day at that site. NULL means "use total checkpoints at the site" as the target.
 async function ensureRoundSizeColumn() {
   await pool.query(`ALTER TABLE guard_assignments ADD COLUMN IF NOT EXISTS round_size INTEGER`);
   console.log('Round size column ready');
 }
 ensureRoundSizeColumn();
+
+// Optional building/floor metadata per checkpoint — matches the admin's existing
+// standalone Checkpoint Manager tool, now folded into PatrolSync's tenant model.
+async function ensureCheckpointMetaColumns() {
+  await pool.query(`ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS building TEXT`);
+  await pool.query(`ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS floor TEXT`);
+  console.log('Checkpoint building/floor columns ready');
+}
+ensureCheckpointMetaColumns();
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
@@ -618,8 +625,10 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
+// CHECKPOINTS — now accepts optional building/floor metadata alongside the
+// existing name/qr_code/lat/lng, still gated by the tenant's plan limit.
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, name, qr_code, latitude, longitude } = req.body;
+  const { tenant_id, site_id, name, qr_code, latitude, longitude, building, floor } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
     return res.status(400).json({ error: 'tenant_id, site_id, name, and qr_code are required' });
   }
@@ -632,8 +641,8 @@ app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
         throw err;
       }
       return client.query(
-        'INSERT INTO checkpoints (tenant_id, site_id, name, qr_code, latitude, longitude) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-        [tenant_id, site_id, name, qr_code, latitude || null, longitude || null]
+        'INSERT INTO checkpoints (tenant_id, site_id, name, qr_code, latitude, longitude, building, floor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+        [tenant_id, site_id, name, qr_code, latitude || null, longitude || null, building || null, floor || null]
       );
     });
     res.status(201).json(result.rows[0]);
@@ -772,7 +781,6 @@ app.patch('/api/users/:id/reset-password', requireAuth, requireAdmin, async (req
   }
 });
 
-// GUARD ASSIGNMENTS — now optionally carry a round_size (daily scan target).
 app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id, round_size } = req.body;
   if (!tenant_id || !site_id || !user_id) {
@@ -823,8 +831,6 @@ app.get('/api/guard-assignments', requireAuth, async (req, res) => {
   }
 });
 
-// Update an assignment's round_size (admin only) — lets an admin change a guard's
-// daily target without deleting and recreating the assignment.
 app.patch('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id, round_size } = req.body;
@@ -859,10 +865,6 @@ app.delete('/api/guard-assignments/:id', requireAuth, requireAdmin, async (req, 
   }
 });
 
-// GUARD PROGRESS — how many distinct checkpoints this guard has scanned at this
-// site TODAY (reset daily at midnight in the tenant's timezone) versus their
-// target (round_size if the admin set one, else total checkpoints at the site).
-// Also returns the specific list of checkpoints still outstanding.
 app.get('/api/guard-progress', requireAuth, async (req, res) => {
   const { tenant_id, site_id, user_id } = req.query;
   if (!tenant_id || !site_id || !user_id) {

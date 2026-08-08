@@ -177,8 +177,6 @@ async function ensureRoundSizeColumn() {
 }
 ensureRoundSizeColumn();
 
-// Optional building/floor metadata per checkpoint — matches the admin's existing
-// standalone Checkpoint Manager tool, now folded into PatrolSync's tenant model.
 async function ensureCheckpointMetaColumns() {
   await pool.query(`ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS building TEXT`);
   await pool.query(`ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS floor TEXT`);
@@ -625,8 +623,6 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
-// CHECKPOINTS — now accepts optional building/floor metadata alongside the
-// existing name/qr_code/lat/lng, still gated by the tenant's plan limit.
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude, building, floor } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
@@ -647,6 +643,9 @@ app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
     });
     res.status(201).json(result.rows[0]);
   } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A checkpoint with this QR code already exists' });
+    }
     res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
@@ -682,6 +681,25 @@ app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'No checkpoint matches this QR code' });
     }
     res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE a checkpoint (admin only). Also cleans up dependent rows (patrol logs,
+// notifications) so we don't leave orphaned references behind after deletion.
+app.delete('/api/checkpoints/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, async (client) => {
+      await client.query('DELETE FROM patrol_logs WHERE checkpoint_id = $1 AND tenant_id = $2', [id, tenant_id]);
+      await client.query('DELETE FROM notifications WHERE checkpoint_id = $1 AND tenant_id = $2', [id, tenant_id]);
+      return client.query('DELETE FROM checkpoints WHERE id = $1 AND tenant_id = $2 RETURNING *', [id, tenant_id]);
+    });
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Checkpoint not found' });
+    res.json({ deleted: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

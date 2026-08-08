@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { DateTime } = require('luxon');
+const QRCode = require('qrcode');
 require('dotenv').config();
 
 const app = express();
@@ -686,8 +687,31 @@ app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE a checkpoint (admin only). Also cleans up dependent rows (patrol logs,
-// notifications) so we don't leave orphaned references behind after deletion.
+// SERVER-SIDE QR IMAGE — renders a PNG directly on the backend using the
+// 'qrcode' npm package, so the browser never needs to fetch a QR-drawing
+// script from a third-party CDN (which can be blocked by network-level
+// filters that no client-side fallback can work around). Since <img> tags
+// can't send Authorization headers, the JWT is passed as a query param here
+// and verified manually — same trust boundary as the header-based flow.
+app.get('/api/qr-image', (req, res) => {
+  const { text, token } = req.query;
+  if (!text) return res.status(400).send('text query param is required');
+  if (!token) return res.status(401).send('token query param is required');
+
+  try {
+    jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    return res.status(401).send('Invalid or expired token');
+  }
+
+  QRCode.toBuffer(String(text), { width: 220, margin: 1 }, (err, buffer) => {
+    if (err) return res.status(500).send('Failed to generate QR image');
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(buffer);
+  });
+});
+
 app.delete('/api/checkpoints/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;

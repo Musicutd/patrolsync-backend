@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { DateTime } = require('luxon');
 const QRCode = require('qrcode');
+const PDFDocument = require('pdfkit');
 require('dotenv').config();
 
 const app = express();
@@ -377,6 +378,320 @@ async function runComplianceSweep() {
 }
 setInterval(runComplianceSweep, ALERT_SWEEP_INTERVAL_MS);
 setTimeout(runComplianceSweep, 15000);
+
+// --- Report generation helpers (shared by PDF + CSV exports) ---
+
+async function fetchReportData(client, tenantId, siteId, startDt, endDt) {
+  const tenantRes = await client.query('SELECT name, timezone FROM tenants WHERE id = $1', [tenantId]);
+  const siteRes = await client.query('SELECT name FROM sites WHERE id = $1 AND tenant_id = $2', [siteId, tenantId]);
+  if (siteRes.rows.length === 0) {
+    const err = new Error('Site not found');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const checkpointsRes = await client.query(
+    'SELECT id, name, building, floor FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY name',
+    [tenantId, siteId]
+  );
+  const checkpointIds = checkpointsRes.rows.map(c => c.id);
+
+  const logsRes = checkpointIds.length
+    ? await client.query(
+        `SELECT pl.*, u.email as guard_email FROM patrol_logs pl
+         LEFT JOIN users u ON u.id = pl.user_id
+         WHERE pl.tenant_id = $1 AND pl.checkpoint_id = ANY($2)
+           AND pl.scanned_at >= $3 AND pl.scanned_at <= $4
+         ORDER BY pl.scanned_at ASC`,
+        [tenantId, checkpointIds, startDt.toJSDate(), endDt.toJSDate()]
+      )
+    : { rows: [] };
+
+  const incidentsRes = await client.query(
+    `SELECT i.*, u.email as guard_email, COALESCE(p.photo_count, 0) as photo_count
+     FROM incidents i
+     LEFT JOIN users u ON u.id = i.user_id
+     LEFT JOIN (
+       SELECT incident_id, COUNT(*) AS photo_count FROM incident_photos WHERE tenant_id = $1 GROUP BY incident_id
+     ) p ON p.incident_id = i.id
+     WHERE i.tenant_id = $1 AND i.site_id = $2
+       AND i.reported_at >= $3 AND i.reported_at <= $4
+     ORDER BY i.reported_at ASC`,
+    [tenantId, siteId, startDt.toJSDate(), endDt.toJSDate()]
+  );
+
+  const checkpointLookup = {};
+  checkpointsRes.rows.forEach(cp => { checkpointLookup[cp.id] = cp; });
+
+  const perCheckpoint = checkpointsRes.rows.map(cp => {
+    const scansForCp = logsRes.rows.filter(l => l.checkpoint_id === cp.id);
+    const lastScanInRange = scansForCp.length ? scansForCp[scansForCp.length - 1].scanned_at : null;
+    return {
+      id: cp.id,
+      name: cp.name,
+      location: [cp.building, cp.floor].filter(Boolean).join(' / ') || '-',
+      scanCount: scansForCp.length,
+      lastScan: lastScanInRange
+    };
+  });
+
+  const scannedCheckpoints = perCheckpoint.filter(cp => cp.scanCount > 0).length;
+
+  return {
+    tenantName: tenantRes.rows[0] ? tenantRes.rows[0].name : 'PatrolSync Client',
+    timezone: (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC',
+    siteName: siteRes.rows[0].name,
+    checkpointLookup,
+    perCheckpoint,
+    logs: logsRes.rows,
+    incidents: incidentsRes.rows,
+    stats: {
+      totalCheckpoints: checkpointsRes.rows.length,
+      totalScans: logsRes.rows.length,
+      scannedCheckpoints,
+      totalIncidents: incidentsRes.rows.length
+    }
+  };
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  if (/[",\n]/.test(str)) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  return str;
+}
+
+function buildCsv(headers, rows) {
+  const lines = [headers.map(csvEscape).join(',')];
+  rows.forEach(row => {
+    lines.push(row.map(csvEscape).join(','));
+  });
+  return lines.join('\r\n');
+}
+
+function drawReportHeader(doc, tenantName, siteName, startLabel, endLabel) {
+  doc.fontSize(20).fillColor('#1e293b').text('Patrol Compliance Report', { align: 'left' });
+  doc.moveDown(0.3);
+  doc.fontSize(11).fillColor('#64748b').text(tenantName, { align: 'left' });
+  doc.moveDown(0.8);
+
+  doc.fontSize(13).fillColor('#111827').text('Site: ' + siteName);
+  doc.fontSize(11).fillColor('#374151').text('Period: ' + startLabel + ' to ' + endLabel);
+  doc.fontSize(9).fillColor('#9ca3af').text('Generated ' + DateTime.now().toFormat('dd LLL yyyy, HH:mm') + ' by PatrolSync');
+  doc.moveDown(1);
+  doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
+  doc.moveDown(1);
+}
+
+function drawSectionTitle(doc, title) {
+  doc.fontSize(14).fillColor('#1e293b').text(title);
+  doc.moveDown(0.4);
+}
+
+function drawSummaryStats(doc, stats) {
+  const boxWidth = 123;
+  const boxHeight = 60;
+  const startX = 50;
+  const startY = doc.y;
+  const items = [
+    { label: 'Checkpoints', value: String(stats.totalCheckpoints) },
+    { label: 'Total Scans', value: String(stats.totalScans) },
+    { label: 'Checkpoints Scanned', value: stats.scannedCheckpoints + '/' + stats.totalCheckpoints },
+    { label: 'Incidents Logged', value: String(stats.totalIncidents) }
+  ];
+  items.forEach((item, i) => {
+    const x = startX + i * (boxWidth + 6);
+    doc.roundedRect(x, startY, boxWidth, boxHeight, 6).fillAndStroke('#f8fafc', '#e5e7eb');
+    doc.fontSize(20).fillColor('#2563eb').text(item.value, x, startY + 10, { width: boxWidth, align: 'center' });
+    doc.fontSize(9).fillColor('#64748b').text(item.label, x, startY + 38, { width: boxWidth, align: 'center' });
+  });
+  doc.y = startY + boxHeight + 20;
+}
+
+function severityColor(sev) {
+  if (sev === 'critical') return '#7f1d1d';
+  if (sev === 'high') return '#dc2626';
+  if (sev === 'medium') return '#d97706';
+  return '#2563eb';
+}
+
+function parseReportDateRange(start_date, end_date) {
+  const startDt = DateTime.fromISO(start_date).startOf('day');
+  const endDt = DateTime.fromISO(end_date).endOf('day');
+  if (!startDt.isValid || !endDt.isValid || endDt < startDt) {
+    const err = new Error('Invalid or reversed date range');
+    err.statusCode = 400;
+    throw err;
+  }
+  return { startDt, endDt };
+}
+
+function safeFilenamePart(str) {
+  return String(str).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+app.get('/api/reports/compliance-pdf', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, start_date, end_date } = req.query;
+  if (!tenant_id || !site_id || !start_date || !end_date) {
+    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
+  }
+
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, (client) => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+
+    const startLabel = startDt.toFormat('dd LLL yyyy');
+    const endLabel = endDt.toFormat('dd LLL yyyy');
+    const filename = 'compliance-report-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.pdf';
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    doc.pipe(res);
+
+    drawReportHeader(doc, reportData.tenantName, reportData.siteName, startLabel, endLabel);
+    drawSectionTitle(doc, 'Summary');
+    drawSummaryStats(doc, reportData.stats);
+
+    drawSectionTitle(doc, 'Checkpoint Activity');
+    if (reportData.perCheckpoint.length === 0) {
+      doc.fontSize(10).fillColor('#6b7280').text('No checkpoints configured for this site.');
+    } else {
+      const colX = { name: 50, location: 220, scans: 370, lastScan: 430 };
+      const headerY = doc.y;
+      doc.fontSize(9).fillColor('#374151');
+      doc.text('Checkpoint', colX.name, headerY);
+      doc.text('Location', colX.location, headerY);
+      doc.text('Scans', colX.scans, headerY);
+      doc.text('Last Scan', colX.lastScan, headerY);
+      doc.moveDown(0.3);
+      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
+      doc.moveDown(0.3);
+
+      reportData.perCheckpoint.forEach(cp => {
+        if (doc.y > 720) { doc.addPage(); doc.y = 50; }
+        const rowY = doc.y;
+        doc.fontSize(9).fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827');
+        doc.text(cp.name, colX.name, rowY, { width: 165 });
+        doc.fillColor('#6b7280').text(cp.location, colX.location, rowY, { width: 140 });
+        doc.fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827').text(String(cp.scanCount), colX.scans, rowY, { width: 50 });
+        doc.fillColor('#6b7280').text(
+          cp.lastScan ? DateTime.fromJSDate(new Date(cp.lastScan)).setZone(reportData.timezone).toFormat('dd LLL, HH:mm') : 'Not scanned',
+          colX.lastScan, rowY, { width: 110 }
+        );
+        doc.moveDown(0.6);
+      });
+    }
+
+    doc.moveDown(1);
+    if (doc.y > 680) { doc.addPage(); doc.y = 50; }
+    drawSectionTitle(doc, 'Incidents Reported (' + reportData.incidents.length + ')');
+    if (reportData.incidents.length === 0) {
+      doc.fontSize(10).fillColor('#16a34a').text('No incidents reported during this period.');
+    } else {
+      reportData.incidents.forEach(inc => {
+        if (doc.y > 700) { doc.addPage(); doc.y = 50; }
+        const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone).toFormat('dd LLL yyyy, HH:mm');
+        doc.fontSize(9).fillColor(severityColor(inc.severity)).text('[' + inc.severity.toUpperCase() + ']  ' + dateLabel, { continued: false });
+        doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
+        if (inc.guard_email) {
+          doc.fontSize(8).fillColor('#9ca3af').text('Reported by: ' + inc.guard_email);
+        }
+        doc.moveDown(0.6);
+      });
+    }
+
+    doc.end();
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+// CSV export of raw scan logs — one row per checkpoint scan, suitable for
+// pivoting/filtering in Excel or Google Sheets. Separate from the PDF
+// endpoint since CSV consumers usually want raw rows, not a formatted
+// summary.
+app.get('/api/reports/compliance-csv', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, start_date, end_date } = req.query;
+  if (!tenant_id || !site_id || !start_date || !end_date) {
+    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
+  }
+
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, (client) => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+
+    const rows = reportData.logs.map(log => {
+      const cp = reportData.checkpointLookup[log.checkpoint_id] || {};
+      const scannedLocal = DateTime.fromJSDate(new Date(log.scanned_at)).setZone(reportData.timezone);
+      return [
+        reportData.siteName,
+        cp.name || ('Checkpoint #' + log.checkpoint_id),
+        [cp.building, cp.floor].filter(Boolean).join(' / ') || '',
+        log.guard_email || '',
+        scannedLocal.toFormat('yyyy-MM-dd'),
+        scannedLocal.toFormat('HH:mm:ss'),
+        log.latitude ?? '',
+        log.longitude ?? ''
+      ];
+    });
+
+    const csv = buildCsv(
+      ['Site', 'Checkpoint', 'Location', 'Guard Email', 'Date', 'Time', 'Latitude', 'Longitude'],
+      rows
+    );
+
+    const filename = 'scan-log-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.send('\uFEFF' + csv);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+// CSV export of incident reports for the same site/date range. Kept as a
+// separate file from the scan log CSV since the two datasets have entirely
+// different columns and mixing them into one CSV would be messy.
+app.get('/api/reports/incidents-csv', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, start_date, end_date } = req.query;
+  if (!tenant_id || !site_id || !start_date || !end_date) {
+    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
+  }
+
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, (client) => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+
+    const rows = reportData.incidents.map(inc => {
+      const reportedLocal = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone);
+      return [
+        reportData.siteName,
+        reportedLocal.toFormat('yyyy-MM-dd'),
+        reportedLocal.toFormat('HH:mm:ss'),
+        inc.severity,
+        inc.guard_email || '',
+        inc.description,
+        inc.photo_count
+      ];
+    });
+
+    const csv = buildCsv(
+      ['Site', 'Date', 'Time', 'Severity', 'Guard Email', 'Description', 'Photo Count'],
+      rows
+    );
+
+    const filename = 'incidents-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.send('\uFEFF' + csv);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
@@ -1181,11 +1496,6 @@ app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, r
   }
 });
 
-// Now accepts an optional scanned_at (ISO string), used by the guard app's
-// offline queue to preserve the moment a checkpoint was actually scanned —
-// not the moment it happened to sync once connectivity returned. Fully
-// backward compatible: omitting scanned_at behaves exactly as before
-// (Postgres default of NOW() applies).
 app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude, scanned_at } = req.body;
   if (!tenant_id || !checkpoint_id || !user_id) {

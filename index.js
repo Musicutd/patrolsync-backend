@@ -185,6 +185,30 @@ async function ensureCheckpointMetaColumns() {
 }
 ensureCheckpointMetaColumns();
 
+// SOS / panic button alerts. Kept as a dedicated table (not folded into
+// `notifications`) because it has a different lifecycle: guard-triggered,
+// safety-critical, needs status + resolver tracking, and is polled far more
+// aggressively by the admin UI than routine overdue-checkpoint alerts.
+async function ensureSosAlertsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sos_alerts (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      message TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      resolved_at TIMESTAMP,
+      resolved_by INTEGER
+    )
+  `);
+  console.log('SOS alerts table ready');
+}
+ensureSosAlertsTable();
+
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
   const candidates = [];
@@ -415,6 +439,83 @@ app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
       )
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Notification not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- SOS / panic button endpoints ---
+
+// Guard triggers an alert. If the guard already has an active (unresolved)
+// SOS, we return that existing one instead of creating a duplicate, so
+// accidental double-taps don't spam the admin panel with repeat entries.
+app.post('/api/sos', requireAuth, async (req, res) => {
+  const { tenant_id, site_id, latitude, longitude, message } = req.body;
+  const user_id = req.auth.user_id;
+  if (!tenant_id || !site_id) {
+    return res.status(400).json({ error: 'tenant_id and site_id are required' });
+  }
+  try {
+    const result = await withTenant(tenant_id, async (client) => {
+      const existing = await client.query(
+        "SELECT * FROM sos_alerts WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'",
+        [tenant_id, user_id]
+      );
+      if (existing.rows.length > 0) {
+        return { row: existing.rows[0], alreadyActive: true };
+      }
+      const inserted = await client.query(
+        `INSERT INTO sos_alerts (tenant_id, site_id, user_id, latitude, longitude, message)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [tenant_id, site_id, user_id, latitude ?? null, longitude ?? null, message || null]
+      );
+      return { row: inserted.rows[0], alreadyActive: false };
+    });
+    res.status(result.alreadyActive ? 200 : 201).json(result.row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/sos', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, status } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      const base = `SELECT sa.*, u.email as guard_email, s.name as site_name
+                    FROM sos_alerts sa
+                    JOIN users u ON u.id = sa.user_id
+                    JOIN sites s ON s.id = sa.site_id
+                    WHERE sa.tenant_id = $1`;
+      if (status === 'resolved') {
+        return client.query(base + " AND sa.status = 'resolved' ORDER BY sa.resolved_at DESC LIMIT 50", [tenant_id]);
+      } else if (status === 'all') {
+        return client.query(base + ' ORDER BY sa.created_at DESC LIMIT 100', [tenant_id]);
+      }
+      return client.query(base + " AND sa.status = 'active' ORDER BY sa.created_at DESC", [tenant_id]);
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/sos/:id/resolve', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.body;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `UPDATE sos_alerts SET status = 'resolved', resolved_at = NOW(), resolved_by = $1
+         WHERE id = $2 AND tenant_id = $3 AND status = 'active' RETURNING *`,
+        [req.auth.user_id, id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Active SOS alert not found' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -687,12 +788,6 @@ app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
   }
 });
 
-// SERVER-SIDE QR IMAGE — renders a PNG directly on the backend using the
-// 'qrcode' npm package, so the browser never needs to fetch a QR-drawing
-// script from a third-party CDN (which can be blocked by network-level
-// filters that no client-side fallback can work around). Since <img> tags
-// can't send Authorization headers, the JWT is passed as a query param here
-// and verified manually — same trust boundary as the header-based flow.
 app.get('/api/qr-image', (req, res) => {
   const { text, token } = req.query;
   if (!text) return res.status(400).send('text query param is required');

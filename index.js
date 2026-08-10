@@ -1181,17 +1181,40 @@ app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, r
   }
 });
 
+// Now accepts an optional scanned_at (ISO string), used by the guard app's
+// offline queue to preserve the moment a checkpoint was actually scanned —
+// not the moment it happened to sync once connectivity returned. Fully
+// backward compatible: omitting scanned_at behaves exactly as before
+// (Postgres default of NOW() applies).
 app.post('/api/patrol-logs', requireAuth, async (req, res) => {
-  const { tenant_id, checkpoint_id, user_id, latitude, longitude } = req.body;
+  const { tenant_id, checkpoint_id, user_id, latitude, longitude, scanned_at } = req.body;
   if (!tenant_id || !checkpoint_id || !user_id) {
     return res.status(400).json({ error: 'tenant_id, checkpoint_id, and user_id are required' });
   }
+
+  let scannedAtValue = null;
+  if (scanned_at) {
+    const parsed = new Date(scanned_at);
+    if (isNaN(parsed.getTime())) {
+      return res.status(400).json({ error: 'scanned_at must be a valid date' });
+    }
+    if (parsed.getTime() > Date.now() + 5 * 60000) {
+      return res.status(400).json({ error: 'scanned_at cannot be in the future' });
+    }
+    scannedAtValue = parsed.toISOString();
+  }
+
   try {
     const result = await withTenant(tenant_id, (client) =>
-      client.query(
-        'INSERT INTO patrol_logs (tenant_id, checkpoint_id, user_id, latitude, longitude) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [tenant_id, checkpoint_id, user_id, latitude || null, longitude || null]
-      )
+      scannedAtValue
+        ? client.query(
+            'INSERT INTO patrol_logs (tenant_id, checkpoint_id, user_id, latitude, longitude, scanned_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [tenant_id, checkpoint_id, user_id, latitude || null, longitude || null, scannedAtValue]
+          )
+        : client.query(
+            'INSERT INTO patrol_logs (tenant_id, checkpoint_id, user_id, latitude, longitude) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+            [tenant_id, checkpoint_id, user_id, latitude || null, longitude || null]
+          )
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -1315,11 +1338,6 @@ app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
   }
 });
 
-// Delete ALL photos for a given incident (admin-only). Used from the photo
-// viewer once an admin has downloaded copies locally and wants to reclaim
-// database storage. The incident record itself is untouched — only its
-// attached photo rows are removed; photo_count will read 0 afterwards since
-// it's computed live via the LEFT JOIN in GET /api/incidents.
 app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;

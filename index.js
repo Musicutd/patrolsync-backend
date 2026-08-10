@@ -9,9 +9,6 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors());
-// Increased from the default (~100kb) to accommodate base64-encoded incident
-// photos in the JSON body. 3 compressed photos (~150-250KB binary each,
-// ~33% larger as base64) comfortably fits well under this limit.
 app.use(express.json({ limit: '12mb' }));
 
 const pool = new Pool({
@@ -24,7 +21,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const FIXED_WINDOW_MINUTES = 30;
 const ALERT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_PHOTOS_PER_INCIDENT = 3;
-const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024; // ~3MB base64 string per photo, generous ceiling
+const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024;
 
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
@@ -124,11 +121,6 @@ async function ensureIncidentsTable() {
 }
 ensureIncidentsTable();
 
-// Incident photo evidence. Stored as base64 text directly in Postgres rather
-// than a separate object-storage service (S3, Cloudinary, etc.) — avoids
-// requiring a new paid account/API key for an MVP feature. Fine for a
-// handful of compressed photos per incident; would need migrating to real
-// object storage if photo volume grows significantly.
 async function ensureIncidentPhotosTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incident_photos (
@@ -1235,11 +1227,6 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   }
 });
 
-// Incident submission now accepts an optional `photos` array of base64 data
-// URLs (compressed client-side before upload). Capped at
-// MAX_PHOTOS_PER_INCIDENT to keep storage/request size sane. Photos are
-// inserted in the same transaction as the incident so a partial failure
-// can't leave an incident with no evidence silently orphaned.
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity, photos } = req.body;
   const user_id = req.auth.user_id;
@@ -1285,8 +1272,6 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   }
 });
 
-// Incident list now includes a photo_count so the UI can show a badge
-// without a separate round-trip per incident.
 app.get('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, date } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -1313,9 +1298,6 @@ app.get('/api/incidents', requireAuth, async (req, res) => {
   }
 });
 
-// Fetch full-size photo data for a specific incident. Returns just the id +
-// base64 data (not the whole incident row) since this is called on-demand
-// when an admin opens the photo viewer, not as part of the list view.
 app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.query;
@@ -1328,6 +1310,28 @@ app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
       )
     );
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete ALL photos for a given incident (admin-only). Used from the photo
+// viewer once an admin has downloaded copies locally and wants to reclaim
+// database storage. The incident record itself is untouched — only its
+// attached photo rows are removed; photo_count will read 0 afterwards since
+// it's computed live via the LEFT JOIN in GET /api/incidents.
+app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'DELETE FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 RETURNING id',
+        [id, tenant_id]
+      )
+    );
+    res.json({ deleted_count: result.rows.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

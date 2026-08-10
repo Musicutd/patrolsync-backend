@@ -137,6 +137,18 @@ async function ensureTimezoneColumn() {
 }
 ensureTimezoneColumn();
 
+// Two separate emergency contact numbers for the guard app's SOS buttons:
+// emergency_phone -> used by the "Call Admin" tel: link
+// emergency_whatsapp -> used by the "WhatsApp Admin" wa.me link
+// Kept distinct since a personal mobile and a dedicated WhatsApp/ops line
+// are often different numbers. Both optional/independent.
+async function ensureEmergencyContactColumns() {
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS emergency_phone TEXT`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS emergency_whatsapp TEXT`);
+  console.log('Emergency contact columns ready');
+}
+ensureEmergencyContactColumns();
+
 async function ensureNotificationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -185,10 +197,6 @@ async function ensureCheckpointMetaColumns() {
 }
 ensureCheckpointMetaColumns();
 
-// SOS / panic button alerts. Kept as a dedicated table (not folded into
-// `notifications`) because it has a different lifecycle: guard-triggered,
-// safety-critical, needs status + resolver tracking, and is polled far more
-// aggressively by the admin UI than routine overdue-checkpoint alerts.
 async function ensureSosAlertsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sos_alerts (
@@ -447,9 +455,6 @@ app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
 
 // --- SOS / panic button endpoints ---
 
-// Guard triggers an alert. If the guard already has an active (unresolved)
-// SOS, we return that existing one instead of creating a duplicate, so
-// accidental double-taps don't spam the admin panel with repeat entries.
 app.post('/api/sos', requireAuth, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude, message } = req.body;
   const user_id = req.auth.user_id;
@@ -501,10 +506,6 @@ app.get('/api/sos', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Resolve an SOS alert. FIXED: no more requireAdmin middleware here — a
-// guard must be able to cancel their OWN accidental trigger. Ownership/role
-// check now happens inside the handler, since "owner OR admin" can't be
-// expressed by a single blanket middleware.
 app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.body;
@@ -599,6 +600,46 @@ app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, re
   try {
     const result = await withTenant(id, (client) =>
       client.query('UPDATE tenants SET timezone = $1 WHERE id = $2 RETURNING *', [timezone, id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Emergency contact numbers used by the guard app's SOS buttons: a phone
+// number for "Call Admin" (tel: link) and a separate WhatsApp number for
+// "WhatsApp Admin" (wa.me link). Either can be set independently; both are
+// optional. Validated loosely (digits, spaces, +, -, () ) since formats vary
+// by country.
+function isValidPhoneFormat(value) {
+  return /^[0-9+ ()-]{6,20}$/.test(value);
+}
+
+app.patch('/api/tenants/:id/emergency-contacts', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { emergency_phone, emergency_whatsapp } = req.body;
+  if (Number(id) !== req.auth.tenant_id) {
+    return res.status(403).json({ error: 'Cannot modify a different tenant' });
+  }
+
+  const phoneTrimmed = (emergency_phone || '').trim();
+  const waTrimmed = (emergency_whatsapp || '').trim();
+
+  if (phoneTrimmed && !isValidPhoneFormat(phoneTrimmed)) {
+    return res.status(400).json({ error: 'Emergency phone: enter a valid number (digits, spaces, +, -, () only)' });
+  }
+  if (waTrimmed && !isValidPhoneFormat(waTrimmed)) {
+    return res.status(400).json({ error: 'WhatsApp number: enter a valid number (digits, spaces, +, -, () only)' });
+  }
+
+  try {
+    const result = await withTenant(id, (client) =>
+      client.query(
+        'UPDATE tenants SET emergency_phone = $1, emergency_whatsapp = $2 WHERE id = $3 RETURNING *',
+        [phoneTrimmed || null, waTrimmed || null, id]
+      )
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
     res.json(result.rows[0]);

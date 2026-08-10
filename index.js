@@ -9,7 +9,10 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Increased from the default (~100kb) to accommodate base64-encoded incident
+// photos in the JSON body. 3 compressed photos (~150-250KB binary each,
+// ~33% larger as base64) comfortably fits well under this limit.
+app.use(express.json({ limit: '12mb' }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -20,6 +23,8 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const FIXED_WINDOW_MINUTES = 30;
 const ALERT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_PHOTOS_PER_INCIDENT = 3;
+const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024; // ~3MB base64 string per photo, generous ceiling
 
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
@@ -119,6 +124,25 @@ async function ensureIncidentsTable() {
 }
 ensureIncidentsTable();
 
+// Incident photo evidence. Stored as base64 text directly in Postgres rather
+// than a separate object-storage service (S3, Cloudinary, etc.) — avoids
+// requiring a new paid account/API key for an MVP feature. Fine for a
+// handful of compressed photos per incident; would need migrating to real
+// object storage if photo volume grows significantly.
+async function ensureIncidentPhotosTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS incident_photos (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      incident_id INTEGER NOT NULL,
+      photo_data TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  console.log('Incident photos table ready');
+}
+ensureIncidentPhotosTable();
+
 async function ensureAuthColumn() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
   console.log('Auth column ready');
@@ -137,11 +161,6 @@ async function ensureTimezoneColumn() {
 }
 ensureTimezoneColumn();
 
-// Two separate emergency contact numbers for the guard app's SOS buttons:
-// emergency_phone -> used by the "Call Admin" tel: link
-// emergency_whatsapp -> used by the "WhatsApp Admin" wa.me link
-// Kept distinct since a personal mobile and a dedicated WhatsApp/ops line
-// are often different numbers. Both optional/independent.
 async function ensureEmergencyContactColumns() {
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS emergency_phone TEXT`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS emergency_whatsapp TEXT`);
@@ -608,11 +627,6 @@ app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, re
   }
 });
 
-// Emergency contact numbers used by the guard app's SOS buttons: a phone
-// number for "Call Admin" (tel: link) and a separate WhatsApp number for
-// "WhatsApp Admin" (wa.me link). Either can be set independently; both are
-// optional. Validated loosely (digits, spaces, +, -, () ) since formats vary
-// by country.
 function isValidPhoneFormat(value) {
   return /^[0-9+ ()-]{6,20}$/.test(value);
 }
@@ -1221,36 +1235,97 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   }
 });
 
+// Incident submission now accepts an optional `photos` array of base64 data
+// URLs (compressed client-side before upload). Capped at
+// MAX_PHOTOS_PER_INCIDENT to keep storage/request size sane. Photos are
+// inserted in the same transaction as the incident so a partial failure
+// can't leave an incident with no evidence silently orphaned.
 app.post('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id, site_id, checkpoint_id, description, severity } = req.body;
+  const { tenant_id, site_id, checkpoint_id, description, severity, photos } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || !site_id || !description) {
     return res.status(400).json({ error: 'tenant_id, site_id, and description are required' });
   }
+
+  const photoList = Array.isArray(photos) ? photos.slice(0, MAX_PHOTOS_PER_INCIDENT) : [];
+  for (const p of photoList) {
+    if (typeof p !== 'string' || p.length === 0) {
+      return res.status(400).json({ error: 'Each photo must be a non-empty base64 data URL string' });
+    }
+    if (p.length > MAX_PHOTO_BASE64_LENGTH) {
+      return res.status(400).json({ error: 'One or more photos are too large. Please retake at a lower quality.' });
+    }
+  }
+
+  const client = await pool.connect();
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
-        'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-        [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']
-      )
+    await client.query('BEGIN');
+    await client.query(`SET app.current_tenant = '${tenant_id}'`);
+
+    const incidentResult = await client.query(
+      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']
     );
-    res.status(201).json(result.rows[0]);
+    const incident = incidentResult.rows[0];
+
+    for (const photoData of photoList) {
+      await client.query(
+        'INSERT INTO incident_photos (tenant_id, incident_id, photo_data) VALUES ($1, $2, $3)',
+        [tenant_id, incident.id, photoData]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ ...incident, photo_count: photoList.length });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Incident list now includes a photo_count so the UI can show a badge
+// without a separate round-trip per incident.
+app.get('/api/incidents', requireAuth, async (req, res) => {
+  const { tenant_id, date } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      const baseQuery = `
+        SELECT i.*, COALESCE(p.photo_count, 0) AS photo_count
+        FROM incidents i
+        LEFT JOIN (
+          SELECT incident_id, COUNT(*) AS photo_count
+          FROM incident_photos
+          WHERE tenant_id = $1
+          GROUP BY incident_id
+        ) p ON p.incident_id = i.id
+        WHERE i.tenant_id = $1
+      `;
+      return date
+        ? client.query(baseQuery + ' AND i.reported_at::date = $2 ORDER BY i.reported_at DESC', [tenant_id, date])
+        : client.query(baseQuery + ' ORDER BY i.reported_at DESC', [tenant_id]);
+    });
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id, date } = req.query;
+// Fetch full-size photo data for a specific incident. Returns just the id +
+// base64 data (not the whole incident row) since this is called on-demand
+// when an admin opens the photo viewer, not as part of the list view.
+app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, (client) =>
-      date
-        ? client.query(
-            'SELECT * FROM incidents WHERE tenant_id = $1 AND reported_at::date = $2 ORDER BY reported_at DESC',
-            [tenant_id, date]
-          )
-        : client.query('SELECT * FROM incidents WHERE tenant_id = $1 ORDER BY reported_at DESC', [tenant_id])
+      client.query(
+        'SELECT id, photo_data, created_at FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 ORDER BY created_at ASC',
+        [id, tenant_id]
+      )
     );
     res.json(result.rows);
   } catch (err) {

@@ -501,24 +501,43 @@ app.get('/api/sos', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-app.patch('/api/sos/:id/resolve', requireAuth, requireAdmin, async (req, res) => {
+// Resolve an SOS alert. FIXED: no more requireAdmin middleware here — a
+// guard must be able to cancel their OWN accidental trigger. Ownership/role
+// check now happens inside the handler, since "owner OR admin" can't be
+// expressed by a single blanket middleware.
+app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { tenant_id } = req.body;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
+    const result = await withTenant(tenant_id, async (client) => {
+      const existing = await client.query(
+        "SELECT * FROM sos_alerts WHERE id = $1 AND tenant_id = $2 AND status = 'active'",
+        [id, tenant_id]
+      );
+      if (existing.rows.length === 0) return { rows: [] };
+
+      const alert = existing.rows[0];
+      const isOwner = alert.user_id === req.auth.user_id;
+      const isAdmin = req.auth.role === 'admin';
+      if (!isOwner && !isAdmin) {
+        const err = new Error('You can only cancel your own SOS alert');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      return client.query(
         `UPDATE sos_alerts SET status = 'resolved', resolved_at = NOW(), resolved_by = $1
          WHERE id = $2 AND tenant_id = $3 AND status = 'active' RETURNING *`,
         [req.auth.user_id, id, tenant_id]
-      )
-    );
+      );
+    });
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Active SOS alert not found' });
     }
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 

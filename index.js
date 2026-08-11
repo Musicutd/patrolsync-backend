@@ -21,6 +21,8 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const FIXED_WINDOW_MINUTES = 30;
 const ALERT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const LOCATION_HISTORY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const LOCATION_HISTORY_RETENTION_HOURS = 48;
 const MAX_PHOTOS_PER_INCIDENT = 3;
 const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024;
 
@@ -229,10 +231,8 @@ async function ensureSosAlertsTable() {
 }
 ensureSosAlertsTable();
 
-// Live guard location tracking. One row per guard (upserted), not a
-// history log — we only ever care about "where is this guard RIGHT NOW"
-// for the live map. Historical movement isn't stored here; patrol_logs
-// already captures location at each checkpoint scan for that purpose.
+// Live guard location tracking. One row per guard (upserted) — represents
+// "where is this guard RIGHT NOW" for the live map's current-position dots.
 async function ensureGuardLocationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_locations (
@@ -249,6 +249,43 @@ async function ensureGuardLocationsTable() {
   console.log('Guard locations table ready');
 }
 ensureGuardLocationsTable();
+
+// Location HISTORY — unlike guard_locations (upserted, current-only), every
+// position report is appended here as its own row, enabling a movement
+// trail/breadcrumb view over a time window (e.g. "where was this guard in
+// the last 12 hours"). Pruned automatically (see cleanup sweep below) so it
+// doesn't grow unbounded — retains LOCATION_HISTORY_RETENTION_HOURS worth
+// of data per guard, which comfortably covers a "last shift" view.
+async function ensureGuardLocationHistoryTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guard_location_history (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      site_id INTEGER,
+      latitude DOUBLE PRECISION NOT NULL,
+      longitude DOUBLE PRECISION NOT NULL,
+      recorded_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_guard_location_history_lookup ON guard_location_history (tenant_id, user_id, recorded_at)`);
+  console.log('Guard location history table ready');
+}
+ensureGuardLocationHistoryTable();
+
+async function cleanupLocationHistory() {
+  try {
+    const cutoff = new Date(Date.now() - LOCATION_HISTORY_RETENTION_HOURS * 3600000);
+    const result = await pool.query('DELETE FROM guard_location_history WHERE recorded_at < $1', [cutoff]);
+    if (result.rowCount > 0) {
+      console.log('Pruned ' + result.rowCount + ' old guard_location_history row(s)');
+    }
+  } catch (err) {
+    console.error('Location history cleanup failed:', err.message);
+  }
+}
+setInterval(cleanupLocationHistory, LOCATION_HISTORY_CLEANUP_INTERVAL_MS);
+setTimeout(cleanupLocationHistory, 20000);
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
@@ -885,9 +922,9 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
 // --- Live guard location tracking ---
 
 // Guard's own phone periodically pushes its current position here while
-// logged in. Upserted (one row per guard) — we intentionally don't keep a
-// history in this table, since the map only ever needs "where is this
-// guard right now."
+// logged in. Upserts the "current position" row (for the live map dots)
+// AND appends a permanent row to guard_location_history (for the trail
+// view), all in one request/transaction so the two stay in sync.
 app.post('/api/guard-locations', requireAuth, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude } = req.body;
   const user_id = req.auth.user_id;
@@ -895,17 +932,23 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'tenant_id, latitude, and longitude are required' });
   }
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
+    const result = await withTenant(tenant_id, async (client) => {
+      const upserted = await client.query(
         `INSERT INTO guard_locations (tenant_id, user_id, site_id, latitude, longitude, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
          ON CONFLICT (tenant_id, user_id)
          DO UPDATE SET site_id = $3, latitude = $4, longitude = $5, updated_at = NOW()
          RETURNING *`,
         [tenant_id, user_id, site_id || null, latitude, longitude]
-      )
-    );
-    res.status(200).json(result.rows[0]);
+      );
+      await client.query(
+        `INSERT INTO guard_location_history (tenant_id, user_id, site_id, latitude, longitude)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [tenant_id, user_id, site_id || null, latitude, longitude]
+      );
+      return upserted.rows[0];
+    });
+    res.status(200).json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -926,6 +969,36 @@ app.get('/api/guard-locations', requireAuth, requireAdmin, async (req, res) => {
          WHERE gl.tenant_id = $1
          ORDER BY gl.updated_at DESC`,
         [tenant_id]
+      )
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: movement trail for a specific guard over the last N hours
+// (default 12, capped at LOCATION_HISTORY_RETENTION_HOURS since anything
+// older has already been pruned). Returned in chronological order so the
+// frontend can draw a connected line/breadcrumb path on the map.
+app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, user_id, hours } = req.query;
+  if (!tenant_id || !user_id) return res.status(400).json({ error: 'tenant_id and user_id query params are required' });
+
+  let hoursNum = hours ? Number(hours) : 12;
+  if (!Number.isFinite(hoursNum) || hoursNum <= 0) hoursNum = 12;
+  if (hoursNum > LOCATION_HISTORY_RETENTION_HOURS) hoursNum = LOCATION_HISTORY_RETENTION_HOURS;
+
+  try {
+    const cutoff = new Date(Date.now() - hoursNum * 3600000);
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `SELECT glh.*, s.name as site_name
+         FROM guard_location_history glh
+         LEFT JOIN sites s ON s.id = glh.site_id
+         WHERE glh.tenant_id = $1 AND glh.user_id = $2 AND glh.recorded_at >= $3
+         ORDER BY glh.recorded_at ASC`,
+        [tenant_id, user_id, cutoff]
       )
     );
     res.json(result.rows);

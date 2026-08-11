@@ -229,6 +229,27 @@ async function ensureSosAlertsTable() {
 }
 ensureSosAlertsTable();
 
+// Live guard location tracking. One row per guard (upserted), not a
+// history log — we only ever care about "where is this guard RIGHT NOW"
+// for the live map. Historical movement isn't stored here; patrol_logs
+// already captures location at each checkpoint scan for that purpose.
+async function ensureGuardLocationsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guard_locations (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      site_id INTEGER,
+      latitude DOUBLE PRECISION NOT NULL,
+      longitude DOUBLE PRECISION NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id, user_id)
+    )
+  `);
+  console.log('Guard locations table ready');
+}
+ensureGuardLocationsTable();
+
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
   const candidates = [];
@@ -610,10 +631,6 @@ app.get('/api/reports/compliance-pdf', requireAuth, requireAdmin, async (req, re
   }
 });
 
-// CSV export of raw scan logs — one row per checkpoint scan, suitable for
-// pivoting/filtering in Excel or Google Sheets. Separate from the PDF
-// endpoint since CSV consumers usually want raw rows, not a formatted
-// summary.
 app.get('/api/reports/compliance-csv', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, start_date, end_date } = req.query;
   if (!tenant_id || !site_id || !start_date || !end_date) {
@@ -653,9 +670,6 @@ app.get('/api/reports/compliance-csv', requireAuth, requireAdmin, async (req, re
   }
 });
 
-// CSV export of incident reports for the same site/date range. Kept as a
-// separate file from the scan log CSV since the two datasets have entirely
-// different columns and mixing them into one CSV would be messy.
 app.get('/api/reports/incidents-csv', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, start_date, end_date } = req.query;
   if (!tenant_id || !site_id || !start_date || !end_date) {
@@ -865,6 +879,58 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+// --- Live guard location tracking ---
+
+// Guard's own phone periodically pushes its current position here while
+// logged in. Upserted (one row per guard) — we intentionally don't keep a
+// history in this table, since the map only ever needs "where is this
+// guard right now."
+app.post('/api/guard-locations', requireAuth, async (req, res) => {
+  const { tenant_id, site_id, latitude, longitude } = req.body;
+  const user_id = req.auth.user_id;
+  if (!tenant_id || latitude === undefined || longitude === undefined) {
+    return res.status(400).json({ error: 'tenant_id, latitude, and longitude are required' });
+  }
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `INSERT INTO guard_locations (tenant_id, user_id, site_id, latitude, longitude, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (tenant_id, user_id)
+         DO UPDATE SET site_id = $3, latitude = $4, longitude = $5, updated_at = NOW()
+         RETURNING *`,
+        [tenant_id, user_id, site_id || null, latitude, longitude]
+      )
+    );
+    res.status(200).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: current location of every guard for this tenant, joined with
+// guard email and site name for display on the live map.
+app.get('/api/guard-locations', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `SELECT gl.*, u.email as guard_email, s.name as site_name
+         FROM guard_locations gl
+         JOIN users u ON u.id = gl.user_id
+         LEFT JOIN sites s ON s.id = gl.site_id
+         WHERE gl.tenant_id = $1
+         ORDER BY gl.updated_at DESC`,
+        [tenant_id]
+      )
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

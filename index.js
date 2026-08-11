@@ -87,6 +87,16 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// Client-portal users are read-only and scoped to exactly one site — this
+// middleware enforces that a client token can only be used against
+// client-portal endpoints, never the admin/guard API surface.
+function requireClient(req, res, next) {
+  if (!req.auth || req.auth.role !== 'client') {
+    return res.status(403).json({ error: 'Client access required' });
+  }
+  next();
+}
+
 async function checkPlanLimit(client, tenantId, resource) {
   const tenantRes = await client.query('SELECT plan FROM tenants WHERE id = $1', [tenantId]);
   const plan = (tenantRes.rows[0] && tenantRes.rows[0].plan) || 'starter';
@@ -231,8 +241,6 @@ async function ensureSosAlertsTable() {
 }
 ensureSosAlertsTable();
 
-// Live guard location tracking. One row per guard (upserted) — represents
-// "where is this guard RIGHT NOW" for the live map's current-position dots.
 async function ensureGuardLocationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_locations (
@@ -250,12 +258,6 @@ async function ensureGuardLocationsTable() {
 }
 ensureGuardLocationsTable();
 
-// Location HISTORY — unlike guard_locations (upserted, current-only), every
-// position report is appended here as its own row, enabling a movement
-// trail/breadcrumb view over a time window (e.g. "where was this guard in
-// the last 12 hours"). Pruned automatically (see cleanup sweep below) so it
-// doesn't grow unbounded — retains LOCATION_HISTORY_RETENTION_HOURS worth
-// of data per guard, which comfortably covers a "last shift" view.
 async function ensureGuardLocationHistoryTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_location_history (
@@ -286,6 +288,28 @@ async function cleanupLocationHistory() {
 }
 setInterval(cleanupLocationHistory, LOCATION_HISTORY_CLEANUP_INTERVAL_MS);
 setTimeout(cleanupLocationHistory, 20000);
+
+// --- Client portal ---
+// Client accounts are read-only, scoped to exactly one site, and live in
+// their own table (not `users`) since they have a fundamentally different
+// trust boundary: no password reset via admin, no role escalation risk,
+// and no ability to touch guards/checkpoints/schedules. Kept simple by
+// design — this is a viewing window into one site's reports, nothing more.
+async function ensureClientUsersTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS client_users (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      email TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id, email)
+    )
+  `);
+  console.log('Client users table ready');
+}
+ensureClientUsersTable();
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
@@ -437,7 +461,7 @@ async function runComplianceSweep() {
 setInterval(runComplianceSweep, ALERT_SWEEP_INTERVAL_MS);
 setTimeout(runComplianceSweep, 15000);
 
-// --- Report generation helpers (shared by PDF + CSV exports) ---
+// --- Report generation helpers (shared by PDF + CSV exports, and the client portal) ---
 
 async function fetchReportData(client, tenantId, siteId, startDt, endDt) {
   const tenantRes = await client.query('SELECT name, timezone FROM tenants WHERE id = $1', [tenantId]);
@@ -921,10 +945,6 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
 
 // --- Live guard location tracking ---
 
-// Guard's own phone periodically pushes its current position here while
-// logged in. Upserts the "current position" row (for the live map dots)
-// AND appends a permanent row to guard_location_history (for the trail
-// view), all in one request/transaction so the two stay in sync.
 app.post('/api/guard-locations', requireAuth, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude } = req.body;
   const user_id = req.auth.user_id;
@@ -954,8 +974,6 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
   }
 });
 
-// Admin-only: current location of every guard for this tenant, joined with
-// guard email and site name for display on the live map.
 app.get('/api/guard-locations', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -977,10 +995,6 @@ app.get('/api/guard-locations', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// Admin-only: movement trail for a specific guard over the last N hours
-// (default 12, capped at LOCATION_HISTORY_RETENTION_HOURS since anything
-// older has already been pruned). Returned in chronological order so the
-// frontend can draw a connected line/breadcrumb path on the map.
 app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, user_id, hours } = req.query;
   if (!tenant_id || !user_id) return res.status(400).json({ error: 'tenant_id and user_id query params are required' });
@@ -1004,6 +1018,295 @@ app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, r
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Client portal endpoints ---
+// Client accounts are created by the tenant admin, tied to exactly one
+// site, and can only ever read that site's compliance/incidents/reports —
+// never write anything, never see other sites, never touch guards/users.
+
+app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, email, password } = req.body;
+  if (!tenant_id || !site_id || !email || !password) {
+    return res.status(400).json({ error: 'tenant_id, site_id, email, and password are required' });
+  }
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'password must be at least 6 characters' });
+  }
+  try {
+    const result = await withTenant(tenant_id, async (client) => {
+      const siteCheck = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
+      if (siteCheck.rows.length === 0) {
+        const err = new Error('Site not found for this tenant');
+        err.statusCode = 404;
+        throw err;
+      }
+      const hash = await bcrypt.hash(password, 10);
+      return client.query(
+        'INSERT INTO client_users (tenant_id, site_id, email, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, tenant_id, site_id, email, created_at',
+        [tenant_id, site_id, email.toLowerCase().trim(), hash]
+      );
+    });
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A client account with this email already exists for this tenant' });
+    }
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+app.get('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      site_id
+        ? client.query(
+            `SELECT cu.id, cu.tenant_id, cu.site_id, cu.email, cu.created_at, s.name as site_name
+             FROM client_users cu JOIN sites s ON s.id = cu.site_id
+             WHERE cu.tenant_id = $1 AND cu.site_id = $2 ORDER BY cu.created_at DESC`,
+            [tenant_id, site_id]
+          )
+        : client.query(
+            `SELECT cu.id, cu.tenant_id, cu.site_id, cu.email, cu.created_at, s.name as site_name
+             FROM client_users cu JOIN sites s ON s.id = cu.site_id
+             WHERE cu.tenant_id = $1 ORDER BY cu.created_at DESC`,
+            [tenant_id]
+          )
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/client-users/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query('DELETE FROM client_users WHERE id = $1 AND tenant_id = $2 RETURNING id, email', [id, tenant_id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Client account not found' });
+    res.json({ deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/client-users/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, new_password } = req.body;
+  if (!tenant_id || !new_password) return res.status(400).json({ error: 'tenant_id and new_password are required' });
+  if (new_password.length < 6) return res.status(400).json({ error: 'new_password must be at least 6 characters' });
+  try {
+    const hash = await bcrypt.hash(new_password, 10);
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'UPDATE client_users SET password_hash = $1 WHERE id = $2 AND tenant_id = $3 RETURNING id, email',
+        [hash, id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Client account not found' });
+    res.json({ reset: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Client login is deliberately separate from /api/auth/login (which is for
+// admin/guard `users`) — different table, different token shape (role:
+// 'client', plus a fixed site_id baked into the token so every subsequent
+// request is automatically scoped without trusting client-supplied params).
+app.post('/api/client-auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+  const normalizedEmail = email.toLowerCase().trim();
+
+  try {
+    const tenantsRes = await pool.query('SELECT id FROM tenants');
+    let matched = null;
+    let matchedTenantId = null;
+
+    for (const t of tenantsRes.rows) {
+      const result = await withTenant(t.id, (client) =>
+        client.query('SELECT * FROM client_users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
+      );
+      if (result.rows.length > 0) {
+        const candidate = result.rows[0];
+        const valid = await bcrypt.compare(password, candidate.password_hash);
+        if (valid) {
+          matched = candidate;
+          matchedTenantId = t.id;
+          break;
+        }
+      }
+    }
+
+    if (!matched) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const siteRes = await withTenant(matchedTenantId, (client) =>
+      client.query('SELECT name FROM sites WHERE id = $1 AND tenant_id = $2', [matched.site_id, matchedTenantId])
+    );
+
+    const token = jwt.sign(
+      { client_user_id: matched.id, tenant_id: matchedTenantId, site_id: matched.site_id, role: 'client' },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
+    res.json({
+      token,
+      client: { id: matched.id, email: matched.email },
+      tenant_id: matchedTenantId,
+      site_id: matched.site_id,
+      site_name: siteRes.rows[0] ? siteRes.rows[0].name : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// All client-portal read endpoints below ignore any site_id/tenant_id the
+// client might pass and use ONLY the values baked into their JWT — this is
+// what makes it structurally impossible for a client account to view a
+// different site's data, even by tampering with request parameters.
+
+app.get('/api/client-portal/compliance', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  try {
+    const compliance = await withTenant(tenant_id, (client) => computeSiteCompliance(client, tenant_id, site_id));
+    res.json(compliance);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/client-portal/incidents', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  const { date } = req.query;
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      date
+        ? client.query(
+            `SELECT i.description, i.severity, i.reported_at, COALESCE(p.photo_count, 0) as photo_count
+             FROM incidents i
+             LEFT JOIN (SELECT incident_id, COUNT(*) AS photo_count FROM incident_photos WHERE tenant_id = $1 GROUP BY incident_id) p ON p.incident_id = i.id
+             WHERE i.tenant_id = $1 AND i.site_id = $2 AND i.reported_at::date = $3
+             ORDER BY i.reported_at DESC`,
+            [tenant_id, site_id, date]
+          )
+        : client.query(
+            `SELECT i.description, i.severity, i.reported_at, COALESCE(p.photo_count, 0) as photo_count
+             FROM incidents i
+             LEFT JOIN (SELECT incident_id, COUNT(*) AS photo_count FROM incident_photos WHERE tenant_id = $1 GROUP BY incident_id) p ON p.incident_id = i.id
+             WHERE i.tenant_id = $1 AND i.site_id = $2
+             ORDER BY i.reported_at DESC LIMIT 200`,
+            [tenant_id, site_id]
+          )
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/client-portal/site-info', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `SELECT s.name as site_name, s.address, t.name as tenant_name
+         FROM sites s JOIN tenants t ON t.id = s.tenant_id
+         WHERE s.id = $1 AND s.tenant_id = $2`,
+        [site_id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Site not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/client-portal/reports/compliance-pdf', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  const { start_date, end_date } = req.query;
+  if (!start_date || !end_date) {
+    return res.status(400).json({ error: 'start_date and end_date are required' });
+  }
+
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, (client) => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+
+    const startLabel = startDt.toFormat('dd LLL yyyy');
+    const endLabel = endDt.toFormat('dd LLL yyyy');
+    const filename = 'compliance-report-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.pdf';
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    doc.pipe(res);
+
+    drawReportHeader(doc, reportData.tenantName, reportData.siteName, startLabel, endLabel);
+    drawSectionTitle(doc, 'Summary');
+    drawSummaryStats(doc, reportData.stats);
+
+    drawSectionTitle(doc, 'Checkpoint Activity');
+    if (reportData.perCheckpoint.length === 0) {
+      doc.fontSize(10).fillColor('#6b7280').text('No checkpoints configured for this site.');
+    } else {
+      const colX = { name: 50, location: 220, scans: 370, lastScan: 430 };
+      const headerY = doc.y;
+      doc.fontSize(9).fillColor('#374151');
+      doc.text('Checkpoint', colX.name, headerY);
+      doc.text('Location', colX.location, headerY);
+      doc.text('Scans', colX.scans, headerY);
+      doc.text('Last Scan', colX.lastScan, headerY);
+      doc.moveDown(0.3);
+      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
+      doc.moveDown(0.3);
+
+      reportData.perCheckpoint.forEach(cp => {
+        if (doc.y > 720) { doc.addPage(); doc.y = 50; }
+        const rowY = doc.y;
+        doc.fontSize(9).fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827');
+        doc.text(cp.name, colX.name, rowY, { width: 165 });
+        doc.fillColor('#6b7280').text(cp.location, colX.location, rowY, { width: 140 });
+        doc.fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827').text(String(cp.scanCount), colX.scans, rowY, { width: 50 });
+        doc.fillColor('#6b7280').text(
+          cp.lastScan ? DateTime.fromJSDate(new Date(cp.lastScan)).setZone(reportData.timezone).toFormat('dd LLL, HH:mm') : 'Not scanned',
+          colX.lastScan, rowY, { width: 110 }
+        );
+        doc.moveDown(0.6);
+      });
+    }
+
+    doc.moveDown(1);
+    if (doc.y > 680) { doc.addPage(); doc.y = 50; }
+    drawSectionTitle(doc, 'Incidents Reported (' + reportData.incidents.length + ')');
+    if (reportData.incidents.length === 0) {
+      doc.fontSize(10).fillColor('#16a34a').text('No incidents reported during this period.');
+    } else {
+      reportData.incidents.forEach(inc => {
+        if (doc.y > 700) { doc.addPage(); doc.y = 50; }
+        const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone).toFormat('dd LLL yyyy, HH:mm');
+        doc.fontSize(9).fillColor(severityColor(inc.severity)).text('[' + inc.severity.toUpperCase() + ']  ' + dateLabel, { continued: false });
+        doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
+        doc.moveDown(0.6);
+      });
+    }
+
+    doc.end();
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 

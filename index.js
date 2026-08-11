@@ -26,12 +26,15 @@ const LOCATION_HISTORY_RETENTION_HOURS = 48;
 const MAX_PHOTOS_PER_INCIDENT = 3;
 const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024;
 
+// client_accounts is capped per-plan just like locations/checkpoints/guards —
+// it mirrors the same upsell lever ("upgrade to unlock more client logins")
+// instead of being an unlimited freebie that undercuts the other tiers.
 const PLAN_LIMITS = {
-  starter:    { locations: 1,        checkpoints: 10,       guards: 3,        monthly_price: 39,  overage: null },
-  medium:     { locations: 1,        checkpoints: 20,       guards: 6,        monthly_price: 79,  overage: null },
-  pro:        { locations: 2,        checkpoints: 50,       guards: 10,       monthly_price: 149, overage: null },
-  diamond:    { locations: 3,        checkpoints: 100,      guards: 15,       monthly_price: 299, overage: null },
-  enterprise: { locations: Infinity, checkpoints: Infinity, guards: Infinity, monthly_price: 499, overage: { location: 80, checkpoint: 10, guard: 15 } }
+  starter:    { locations: 1,        checkpoints: 10,       guards: 3,        client_accounts: 1,        monthly_price: 39,  overage: null },
+  medium:     { locations: 1,        checkpoints: 20,       guards: 6,        client_accounts: 2,        monthly_price: 79,  overage: null },
+  pro:        { locations: 2,        checkpoints: 50,       guards: 10,       client_accounts: 5,        monthly_price: 149, overage: null },
+  diamond:    { locations: 3,        checkpoints: 100,      guards: 15,       client_accounts: 10,       monthly_price: 299, overage: null },
+  enterprise: { locations: Infinity, checkpoints: Infinity, guards: Infinity, client_accounts: Infinity, monthly_price: 499, overage: { location: 80, checkpoint: 10, guard: 15, client_account: 20 } }
 };
 const VALID_PLANS = Object.keys(PLAN_LIMITS);
 
@@ -109,6 +112,7 @@ async function checkPlanLimit(client, tenantId, resource) {
   if (resource === 'locations') countQuery = 'SELECT COUNT(*) FROM sites WHERE tenant_id = $1';
   else if (resource === 'checkpoints') countQuery = 'SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1';
   else if (resource === 'guards') countQuery = "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'";
+  else if (resource === 'client_accounts') countQuery = 'SELECT COUNT(*) FROM client_users WHERE tenant_id = $1';
   else return { allowed: true, plan, max, current: null };
 
   const countRes = await client.query(countQuery, [tenantId]);
@@ -801,6 +805,7 @@ app.get('/api/usage', requireAuth, async (req, res) => {
       const sitesRes = await client.query('SELECT COUNT(*) FROM sites WHERE tenant_id = $1', [tenant_id]);
       const checkpointsRes = await client.query('SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1', [tenant_id]);
       const guardsRes = await client.query("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'", [tenant_id]);
+      const clientAccountsRes = await client.query('SELECT COUNT(*) FROM client_users WHERE tenant_id = $1', [tenant_id]);
 
       return {
         plan,
@@ -808,7 +813,8 @@ app.get('/api/usage', requireAuth, async (req, res) => {
         usage: {
           locations: parseInt(sitesRes.rows[0].count, 10),
           checkpoints: parseInt(checkpointsRes.rows[0].count, 10),
-          guards: parseInt(guardsRes.rows[0].count, 10)
+          guards: parseInt(guardsRes.rows[0].count, 10),
+          client_accounts: parseInt(clientAccountsRes.rows[0].count, 10)
         }
       };
     });
@@ -1023,8 +1029,9 @@ app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, r
 
 // --- Client portal endpoints ---
 // Client accounts are created by the tenant admin, tied to exactly one
-// site, and can only ever read that site's compliance/incidents/reports —
-// never write anything, never see other sites, never touch guards/users.
+// site, capped per-plan (same model as locations/checkpoints/guards), and
+// can only ever read that site's compliance/incidents/reports — never
+// write anything, never see other sites, never touch guards/users.
 
 app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, email, password } = req.body;
@@ -1040,6 +1047,12 @@ app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
       if (siteCheck.rows.length === 0) {
         const err = new Error('Site not found for this tenant');
         err.statusCode = 404;
+        throw err;
+      }
+      const limitCheck = await checkPlanLimit(client, tenant_id, 'client_accounts');
+      if (!limitCheck.allowed) {
+        const err = new Error(`Your ${limitCheck.plan} plan allows up to ${limitCheck.max} client portal account(s). Upgrade your plan to add more.`);
+        err.statusCode = 403;
         throw err;
       }
       const hash = await bcrypt.hash(password, 10);

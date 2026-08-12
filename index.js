@@ -1354,6 +1354,9 @@ app.get('/api/client-portal/reports/compliance-pdf', requireAuth, requireClient,
         const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone).toFormat('dd LLL yyyy, HH:mm');
         doc.fontSize(9).fillColor(severityColor(inc.severity)).text('[' + inc.severity.toUpperCase() + ']  ' + dateLabel, { continued: false });
         doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
+        if (inc.guard_email) {
+          doc.fontSize(8).fillColor('#9ca3af').text('Reported by: ' + inc.guard_email);
+        }
         doc.moveDown(0.6);
       });
     }
@@ -1371,10 +1374,12 @@ app.post('/api/certifications', requireAuth, requireAdmin, async (req, res) => {
   if (!tenant_id || !user_id || !cert_name || !expiry_date) {
     return res.status(400).json({ error: 'tenant_id, user_id, cert_name, and expiry_date are required' });
   }
+
   const parsedExpiry = new Date(expiry_date);
   if (isNaN(parsedExpiry.getTime())) {
     return res.status(400).json({ error: 'expiry_date must be a valid date' });
   }
+
   try {
     const result = await withTenant(tenant_id, async (client) => {
       const guardCheck = await client.query(
@@ -1688,6 +1693,45 @@ app.post('/api/auth/login', async (req, res) => {
       { expiresIn: '12h' }
     );
     res.json({ token, user: { id: matchedUser.id, email: matchedUser.email, role: matchedUser.role }, tenant_id: matchedUser.tenant_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/clients/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+  const normalizedEmail = email.toLowerCase().trim();
+
+  try {
+    const tenantsRes = await pool.query('SELECT id FROM tenants');
+    for (const t of tenantsRes.rows) {
+      const result = await withTenant(t.id, (client) =>
+        client.query('SELECT * FROM client_users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
+      );
+      if (result.rows.length > 0) {
+        const candidate = result.rows[0];
+        const valid = await bcrypt.compare(password, candidate.password_hash);
+        if (valid) {
+          const token = jwt.sign(
+            { client_user_id: candidate.id, tenant_id: t.id, site_id: candidate.site_id, role: 'client' },
+            JWT_SECRET,
+            { expiresIn: '12h' }
+          );
+          const siteRes = await withTenant(t.id, (client) =>
+            client.query('SELECT name FROM sites WHERE id = $1 AND tenant_id = $2', [candidate.site_id, t.id])
+          );
+          return res.json({
+            token,
+            client: { id: candidate.id, email: candidate.email },
+            tenant_id: t.id,
+            site_id: candidate.site_id,
+            site_name: siteRes.rows[0] ? siteRes.rows[0].name : null
+          });
+        }
+      }
+    }
+    return res.status(401).json({ error: 'Invalid email or password' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2279,6 +2323,173 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
       client.query(
         'DELETE FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 RETURNING id',
         [id, tenant_id]
+      )
+    );
+    res.json({ deleted_count: result.rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, user_id, start_date, start_time, end_time, employment_type, recurrence, repeat_until, days_of_week, notes } = req.body;
+  if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
+    return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
+  }
+
+  const validEmploymentType = employment_type === 'part_time' ? 'part_time' : 'full_time';
+  const validRecurrence = ['none', 'weekly', 'monthly'].includes(recurrence) ? recurrence : 'none';
+  const start = DateTime.fromISO(`${start_date}T${start_time}`);
+  if (!start.isValid) return res.status(400).json({ error: 'Invalid shift start date/time' });
+
+  const nextOccurrence = (dt) => dt.toISODate();
+  const buildShiftDates = () => {
+    const dates = [];
+    if (validRecurrence === 'none') {
+      dates.push(start.toISODate());
+      return dates;
+    }
+    const until = DateTime.fromISO(repeat_until);
+    if (!until.isValid) return null;
+    if (validRecurrence === 'weekly') {
+      if (!Array.isArray(days_of_week) || days_of_week.length === 0) return null;
+      let cursor = DateTime.fromISO(start_date).startOf('day');
+      const endCursor = until.endOf('day');
+      while (cursor <= endCursor) {
+        if (days_of_week.map(Number).includes(cursor.weekday % 7)) dates.push(cursor.toISODate());
+        cursor = cursor.plus({ days: 1 });
+      }
+    } else if (validRecurrence === 'monthly') {
+      let cursor = DateTime.fromISO(start_date).startOf('day');
+      const endCursor = until.endOf('day');
+      const targetDay = DateTime.fromISO(start_date).day;
+      while (cursor <= endCursor) {
+        if (cursor.day === targetDay) dates.push(cursor.toISODate());
+        cursor = cursor.plus({ days: 1 });
+      }
+    }
+    return dates;
+  };
+
+  try {
+    const dates = buildShiftDates();
+    if (dates === null || dates.length === 0) {
+      return res.status(400).json({ error: 'No shift dates generated. Check recurrence settings.' });
+    }
+
+    const result = await withTenant(tenant_id, async (client) => {
+      const exists = await client.query('SELECT id FROM users WHERE tenant_id = $1 AND id = $2 AND role = $3', [tenant_id, user_id, 'guard']);
+      if (exists.rows.length === 0) {
+        const err = new Error('Guard not found for this tenant');
+        err.statusCode = 404;
+        throw err;
+      }
+      const siteExists = await client.query('SELECT id FROM sites WHERE tenant_id = $1 AND id = $2', [tenant_id, site_id]);
+      if (siteExists.rows.length === 0) {
+        const err = new Error('Site not found for this tenant');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const recurrenceGroupId = validRecurrence === 'none' ? null : `shiftgrp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const created = [];
+      for (const shiftDate of dates) {
+        const inserted = await client.query(
+          `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, employment_type, recurrence, recurrence_group_id, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+          [tenant_id, site_id, user_id, shiftDate, start_time, end_time, validEmploymentType, validRecurrence, recurrenceGroupId, notes || null]
+        );
+        created.push(inserted.rows[0]);
+      }
+      return created;
+    });
+
+    res.status(201).json({ created_count: result.length, shifts: result });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+app.get('/api/shifts', requireAuth, async (req, res) => {
+  const { tenant_id, user_id, site_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      let query = `
+        SELECT sh.*, u.email as guard_email, s.name as site_name,
+               CASE
+                 WHEN sh.end_time > sh.start_time THEN ROUND(EXTRACT(EPOCH FROM (TO_TIMESTAMP(sh.end_time, 'HH24:MI') - TO_TIMESTAMP(sh.start_time, 'HH24:MI'))) / 3600.0, 2)
+                 ELSE ROUND(EXTRACT(EPOCH FROM ((TO_TIMESTAMP('23:59', 'HH24:MI') - TO_TIMESTAMP(sh.start_time, 'HH24:MI')) + (TO_TIMESTAMP(sh.end_time, 'HH24:MI') - TO_TIMESTAMP('00:00', 'HH24:MI')))) / 3600.0, 2)
+               END as duration_hours
+        FROM shifts sh
+        JOIN users u ON u.id = sh.user_id
+        JOIN sites s ON s.id = sh.site_id
+        WHERE sh.tenant_id = $1
+      `;
+      const params = [tenant_id];
+      if (user_id) { params.push(user_id); query += ` AND sh.user_id = $${params.length}`; }
+      if (site_id) { params.push(site_id); query += ` AND sh.site_id = $${params.length}`; }
+      query += ' ORDER BY sh.shift_date ASC, sh.start_time ASC';
+      return client.query(query, params);
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, shift_date, start_time, end_time, employment_type, notes } = req.body;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
+
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `UPDATE shifts
+         SET shift_date = COALESCE($1, shift_date),
+             start_time = COALESCE($2, start_time),
+             end_time = COALESCE($3, end_time),
+             employment_type = COALESCE($4, employment_type),
+             notes = COALESCE($5, notes)
+         WHERE id = $6 AND tenant_id = $7
+         RETURNING *`,
+        [shift_date || null, start_time || null, end_time || null, employment_type || null, notes || null, id, tenant_id]
+      )
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query('DELETE FROM shifts WHERE id = $1 AND tenant_id = $2 RETURNING *', [id, tenant_id])
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
+    res.json({ deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/shifts/series/:groupId', requireAuth, requireAdmin, async (req, res) => {
+  const { groupId } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `DELETE FROM shifts
+         WHERE tenant_id = $1 AND recurrence_group_id = $2 AND shift_date >= CURRENT_DATE
+         RETURNING *`,
+        [tenant_id, groupId]
       )
     );
     res.json({ deleted_count: result.rows.length });

@@ -645,13 +645,56 @@ ensureShiftsTable();
 // ----------------- NEW: SIMPLE ADMIN LOGIN ROUTE -----------------
 // This gives the frontend a working /api/auth/login endpoint.
 // Change these credentials to something secure before going live.
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
+  }
 
+  const normalizedEmail = email.toLowerCase().trim();
+
+  // 1) Try real admins from the users table
+  try {
+    const userRes = await pool.query(
+      "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1 AND role = 'admin'",
+      [normalizedEmail]
+    );
+
+    if (userRes.rows.length > 0) {
+      const dbUser = userRes.rows[0];
+
+      // If this admin doesn’t have a password_hash yet, force them to use the fallback admin
+      if (!dbUser.password_hash) {
+        return res.status(401).json({ error: 'This admin has no password set yet' });
+      }
+
+      const ok = await bcrypt.compare(password, dbUser.password_hash);
+      if (ok) {
+        const user = {
+          id: dbUser.id,
+          email: dbUser.email,
+          role: dbUser.role || 'admin'
+        };
+
+        const token = jwt.sign(
+          { user_id: user.id, role: user.role, email: user.email },
+          JWT_SECRET,
+          { expiresIn: '12h' }
+        );
+
+        return res.json({ token, user });
+      }
+    }
+  } catch (err) {
+    console.error('Admin login DB error:', err.message);
+    return res.status(500).json({ error: 'Admin login failed' });
+  }
+
+  // 2) Fallback: hard-coded emergency admin
   const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@patrolsync.co';
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password123';
 
-  if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+  if (normalizedEmail === ADMIN_EMAIL.toLowerCase() && password === ADMIN_PASSWORD) {
     const user = {
       id: 1,
       email: ADMIN_EMAIL,
@@ -665,15 +708,10 @@ app.post('/api/auth/login', (req, res) => {
       { expiresIn: '12h' }
     );
 
-    return res.json({
-      token,
-      user
-    });
+    return res.json({ token, user });
   }
 
-  return res.status(401).json({
-    error: 'Invalid credentials'
-  });
+  return res.status(401).json({ error: 'Invalid email or password' });
 });
 // ---------------------------------------------------------------
 

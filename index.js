@@ -348,36 +348,20 @@ async function computeSiteCompliance(client, tenantId, siteId) {
   const checkpointsRes = await client.query('SELECT * FROM checkpoints WHERE tenant_id = $1 AND site_id = $2', [tenantId, siteId]);
   const checkpointIds = checkpointsRes.rows.map(c => c.id);
   const logsRes = checkpointIds.length
-    ? await client.query(
-        'SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = ANY($2) ORDER BY scanned_at DESC',
-        [tenantId, checkpointIds]
-      )
+    ? await client.query('SELECT * FROM patrol_logs WHERE tenant_id = $1 AND checkpoint_id = ANY($2) ORDER BY scanned_at DESC', [tenantId, checkpointIds])
     : { rows: [] };
 
   const zone = (tenantRes.rows[0] && tenantRes.rows[0].timezone) || 'UTC';
   const now = new Date();
-
   const hourlySchedules = schedulesRes.rows.filter(s => s.schedule_type === 'hourly');
   const fixedSchedules = schedulesRes.rows.filter(s => s.schedule_type === 'fixed');
-  const hasCustomOnly =
-    hourlySchedules.length === 0 &&
-    fixedSchedules.length === 0 &&
-    schedulesRes.rows.some(s => s.schedule_type === 'custom');
-
-  const shortestHourly = hourlySchedules.length
-    ? Math.min(...hourlySchedules.map(s => Number(s.config.interval_hours) || Infinity))
-    : null;
-
-  const allFixedTimes = Array.from(
-    new Set(
-      fixedSchedules.flatMap(s => (Array.isArray(s.config.times) ? s.config.times : []))
-    )
-  );
+  const hasCustomOnly = hourlySchedules.length === 0 && fixedSchedules.length === 0 && schedulesRes.rows.some(s => s.schedule_type === 'custom');
+  const shortestHourly = hourlySchedules.length ? Math.min(...hourlySchedules.map(s => Number(s.config.interval_hours) || Infinity)) : null;
+  const allFixedTimes = Array.from(new Set(fixedSchedules.flatMap(s => (Array.isArray(s.config.times) ? s.config.times : []))));
 
   return checkpointsRes.rows.map(cp => {
     const lastLog = logsRes.rows.find(l => l.checkpoint_id === cp.id);
     const lastScan = lastLog ? new Date(lastLog.scanned_at) : null;
-
     let status = 'no_schedule';
     let hoursOverdue = 0;
     let scheduleType = null;
@@ -416,14 +400,7 @@ async function computeSiteCompliance(client, tenantId, siteId) {
       status = 'unmonitored';
     }
 
-    return {
-      checkpoint_id: cp.id,
-      checkpoint_name: cp.name,
-      last_scan: lastScan,
-      status,
-      hours_overdue: hoursOverdue,
-      schedule_type: scheduleType
-    };
+    return { checkpoint_id: cp.id, checkpoint_name: cp.name, last_scan: lastScan, status, hours_overdue: hoursOverdue, schedule_type: scheduleType };
   });
 }
 
@@ -436,25 +413,17 @@ async function runComplianceSweep() {
         for (const site of sitesRes.rows) {
           const compliance = await computeSiteCompliance(client, tenant.id, site.id);
           for (const cp of compliance) {
-            const openRes = await client.query(
-              'SELECT id FROM notifications WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE',
-              [tenant.id, cp.checkpoint_id]
-            );
+            const openRes = await client.query('SELECT id FROM notifications WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE', [tenant.id, cp.checkpoint_id]);
             const hasOpen = openRes.rows.length > 0;
             if (cp.status === 'overdue' && !hasOpen) {
-              const message = cp.hours_overdue
-                ? `${cp.checkpoint_name} is ${cp.hours_overdue}h overdue`
-                : `${cp.checkpoint_name} has never been scanned`;
+              const message = cp.hours_overdue ? `${cp.checkpoint_name} is ${cp.hours_overdue}h overdue` : `${cp.checkpoint_name} has never been scanned`;
               await client.query(
                 `INSERT INTO notifications (tenant_id, site_id, site_name, checkpoint_id, checkpoint_name, message, hours_overdue)
                  VALUES ($1, $2, $3, $4, $5, $6, $7)`,
                 [tenant.id, site.id, site.name, cp.checkpoint_id, cp.checkpoint_name, message, cp.hours_overdue]
               );
             } else if (cp.status !== 'overdue' && hasOpen) {
-              await client.query(
-                'UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE',
-                [tenant.id, cp.checkpoint_id]
-              );
+              await client.query('UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE tenant_id = $1 AND checkpoint_id = $2 AND resolved = FALSE', [tenant.id, cp.checkpoint_id]);
             }
           }
         }
@@ -476,10 +445,7 @@ async function fetchReportData(client, tenantId, siteId, startDt, endDt) {
     throw err;
   }
 
-  const checkpointsRes = await client.query(
-    'SELECT id, name, building, floor FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY name',
-    [tenantId, siteId]
-  );
+  const checkpointsRes = await client.query('SELECT id, name, building, floor FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY name', [tenantId, siteId]);
   const checkpointIds = checkpointsRes.rows.map(c => c.id);
   const logsRes = checkpointIds.length
     ? await client.query(
@@ -506,22 +472,12 @@ async function fetchReportData(client, tenantId, siteId, startDt, endDt) {
   );
 
   const checkpointLookup = {};
-  checkpointsRes.rows.forEach(cp => {
-    checkpointLookup[cp.id] = cp;
-  });
-
+  checkpointsRes.rows.forEach(cp => { checkpointLookup[cp.id] = cp; });
   const perCheckpoint = checkpointsRes.rows.map(cp => {
     const scansForCp = logsRes.rows.filter(l => l.checkpoint_id === cp.id);
     const lastScanInRange = scansForCp.length ? scansForCp[scansForCp.length - 1].scanned_at : null;
-    return {
-      id: cp.id,
-      name: cp.name,
-      location: [cp.building, cp.floor].filter(Boolean).join(' / ') || '-',
-      scanCount: scansForCp.length,
-      lastScan: lastScanInRange
-    };
+    return { id: cp.id, name: cp.name, location: [cp.building, cp.floor].filter(Boolean).join(' / ') || '-', scanCount: scansForCp.length, lastScan: lastScanInRange };
   });
-
   const scannedCheckpoints = perCheckpoint.filter(cp => cp.scanCount > 0).length;
 
   return {
@@ -613,10 +569,7 @@ function parseReportDateRange(start_date, end_date) {
 }
 
 function safeFilenamePart(str) {
-  return String(str)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
+  return String(str).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 }
 
 async function ensureShiftsTable() {
@@ -642,18 +595,12 @@ async function ensureShiftsTable() {
 }
 ensureShiftsTable();
 
-// ----------------- NEW: SIMPLE ADMIN LOGIN ROUTE -----------------
-// This gives the frontend a working /api/auth/login endpoint.
-// Change these credentials to something secure before going live.
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ error: 'email and password are required' });
-  }
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // 1) Try real admins from the users table
   try {
     const userRes = await pool.query(
       "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1 AND role = 'admin'",
@@ -662,26 +609,13 @@ app.post('/api/auth/login', async (req, res) => {
 
     if (userRes.rows.length > 0) {
       const dbUser = userRes.rows[0];
-
-      // If this admin doesn’t have a password_hash yet, force them to use the fallback admin
       if (!dbUser.password_hash) {
         return res.status(401).json({ error: 'This admin has no password set yet' });
       }
-
       const ok = await bcrypt.compare(password, dbUser.password_hash);
       if (ok) {
-        const user = {
-          id: dbUser.id,
-          email: dbUser.email,
-          role: dbUser.role || 'admin'
-        };
-
-        const token = jwt.sign(
-          { user_id: user.id, role: user.role, email: user.email },
-          JWT_SECRET,
-          { expiresIn: '12h' }
-        );
-
+        const user = { id: dbUser.id, email: dbUser.email, role: dbUser.role || 'admin' };
+        const token = jwt.sign({ user_id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
         return res.json({ token, user });
       }
     }
@@ -690,222 +624,23 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(500).json({ error: 'Admin login failed' });
   }
 
-  // 2) Fallback: hard-coded emergency admin
   const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@patrolsync.co';
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password123';
-
   if (normalizedEmail === ADMIN_EMAIL.toLowerCase() && password === ADMIN_PASSWORD) {
-    const user = {
-      id: 1,
-      email: ADMIN_EMAIL,
-      role: 'admin',
-      name: 'Admin'
-    };
-
-    const token = jwt.sign(
-      { user_id: user.id, role: user.role, email: user.email },
-      JWT_SECRET,
-      { expiresIn: '12h' }
-    );
-
+    const user = { id: 1, email: ADMIN_EMAIL, role: 'admin', name: 'Admin' };
+    const token = jwt.sign({ user_id: user.id, role: user.role, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
     return res.json({ token, user });
   }
 
   return res.status(401).json({ error: 'Invalid email or password' });
 });
-// ---------------------------------------------------------------
 
-app.get('/api/reports/compliance-pdf', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, start_date, end_date } = req.query;
-  if (!tenant_id || !site_id || !start_date || !end_date) {
-    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
-  }
-
+app.get('/api/health', async (req, res) => {
   try {
-    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-    const reportData = await withTenant(tenant_id, client =>
-      fetchReportData(client, tenant_id, site_id, startDt, endDt)
-    );
-    const startLabel = startDt.toFormat('dd LLL yyyy');
-    const endLabel = endDt.toFormat('dd LLL yyyy');
-    const filename =
-      'compliance-report-' +
-      safeFilenamePart(reportData.siteName) +
-      '-' +
-      startDt.toFormat('yyyy-MM-dd') +
-      '.pdf';
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-
-    const doc = new PDFDocument({ margin: 50, size: 'A4' });
-    doc.pipe(res);
-
-    drawReportHeader(doc, reportData.tenantName, reportData.siteName, startLabel, endLabel);
-    drawSectionTitle(doc, 'Summary');
-    drawSummaryStats(doc, reportData.stats);
-
-    drawSectionTitle(doc, 'Checkpoint Activity');
-    if (reportData.perCheckpoint.length === 0) {
-      doc.fontSize(10).fillColor('#6b7280').text('No checkpoints configured for this site.');
-    } else {
-      const colX = { name: 50, location: 220, scans: 370, lastScan: 430 };
-      const headerY = doc.y;
-      doc.fontSize(9).fillColor('#374151');
-      doc.text('Checkpoint', colX.name, headerY);
-      doc.text('Location', colX.location, headerY);
-      doc.text('Scans', colX.scans, headerY);
-      doc.text('Last Scan', colX.lastScan, headerY);
-      doc.moveDown(0.3);
-      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
-      doc.moveDown(0.3);
-
-      reportData.perCheckpoint.forEach(cp => {
-        if (doc.y > 720) {
-          doc.addPage();
-          doc.y = 50;
-        }
-        const rowY = doc.y;
-        doc.fontSize(9).fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827');
-        doc.text(cp.name, colX.name, rowY, { width: 165 });
-        doc.fillColor('#6b7280').text(cp.location, colX.location, rowY, { width: 140 });
-        doc.fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827').text(String(cp.scanCount), colX.scans, rowY, { width: 50 });
-        doc.fillColor('#6b7280').text(
-          cp.lastScan
-            ? DateTime.fromJSDate(new Date(cp.lastScan))
-                .setZone(reportData.timezone)
-                .toFormat('dd LLL, HH:mm')
-            : 'Not scanned',
-          colX.lastScan,
-          rowY,
-          { width: 110 }
-        );
-        doc.moveDown(0.6);
-      });
-    }
-
-    doc.moveDown(1);
-    if (doc.y > 680) {
-      doc.addPage();
-      doc.y = 50;
-    }
-
-    drawSectionTitle(doc, 'Incidents Reported (' + reportData.incidents.length + ')');
-    if (reportData.incidents.length === 0) {
-      doc.fontSize(10).fillColor('#16a34a').text('No incidents reported during this period.');
-    } else {
-      reportData.incidents.forEach(inc => {
-        if (doc.y > 700) {
-          doc.addPage();
-          doc.y = 50;
-        }
-        const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at))
-          .setZone(reportData.timezone)
-          .toFormat('dd LLL yyyy, HH:mm');
-        doc.fontSize(9).fillColor(severityColor(inc.severity)).text('[' + inc.severity.toUpperCase() + '] ' + dateLabel);
-        doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
-        if (inc.guard_email) {
-          doc.fontSize(8).fillColor('#9ca3af').text('Reported by: ' + inc.guard_email);
-        }
-        doc.moveDown(0.6);
-      });
-    }
-
-    doc.end();
+    await pool.query('SELECT 1');
+    res.json({ status: 'healthy', database: 'connected' });
   } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
-  }
-});
-
-app.get('/api/reports/compliance-csv', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, start_date, end_date } = req.query;
-  if (!tenant_id || !site_id || !start_date || !end_date) {
-    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
-  }
-
-  try {
-    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-    const reportData = await withTenant(tenant_id, client =>
-      fetchReportData(client, tenant_id, site_id, startDt, endDt)
-    );
-
-    const rows = reportData.logs.map(log => {
-      const cp = reportData.checkpointLookup[log.checkpoint_id] || {};
-      const scannedLocal = DateTime.fromJSDate(new Date(log.scanned_at)).setZone(reportData.timezone);
-      return [
-        reportData.siteName,
-        cp.name || 'Checkpoint #' + log.checkpoint_id,
-        [cp.building, cp.floor].filter(Boolean).join(' / ') || '',
-        log.guard_email || '',
-        scannedLocal.toFormat('yyyy-MM-dd'),
-        scannedLocal.toFormat('HH:mm:ss'),
-        log.latitude ?? '',
-        log.longitude ?? ''
-      ];
-    });
-
-    const csv = buildCsv(
-      ['Site', 'Checkpoint', 'Location', 'Guard Email', 'Date', 'Time', 'Latitude', 'Longitude'],
-      rows
-    );
-    const filename =
-      'scan-log-' +
-      safeFilenamePart(reportData.siteName) +
-      '-' +
-      startDt.toFormat('yyyy-MM-dd') +
-      '.csv';
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-    res.send('\uFEFF' + csv);
-  } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
-  }
-});
-
-app.get('/api/reports/incidents-csv', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, start_date, end_date } = req.query;
-  if (!tenant_id || !site_id || !start_date || !end_date) {
-    return res.status(400).json({ error: 'tenant_id, site_id, start_date, and end_date are required' });
-  }
-
-  try {
-    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-    const reportData = await withTenant(tenant_id, client =>
-      fetchReportData(client, tenant_id, site_id, startDt, endDt)
-    );
-
-    const rows = reportData.incidents.map(inc => {
-      const reportedLocal = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(
-        reportData.timezone
-      );
-      return [
-        reportData.siteName,
-        reportedLocal.toFormat('yyyy-MM-dd'),
-        reportedLocal.toFormat('HH:mm:ss'),
-        inc.severity,
-        inc.guard_email || '',
-        inc.description,
-        inc.photo_count
-      ];
-    });
-
-    const csv = buildCsv(
-      ['Site', 'Date', 'Time', 'Severity', 'Guard Email', 'Description', 'Photo Count'],
-      rows
-    );
-    const filename =
-      'incidents-' +
-      safeFilenamePart(reportData.siteName) +
-      '-' +
-      startDt.toFormat('yyyy-MM-dd') +
-      '.csv';
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-    res.send('\uFEFF' + csv);
-  } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
+    res.status(500).json({ status: 'unhealthy', error: err.message });
   }
 });
 
@@ -922,13 +657,8 @@ app.get('/health', async (req, res) => {
   }
 });
 
-app.get('/api/timezones', (req, res) => {
-  res.json(getAllTimezones());
-});
-
-app.get('/api/plans', (req, res) => {
-  res.json(PLAN_LIMITS);
-});
+app.get('/api/timezones', (req, res) => res.json(getAllTimezones()));
+app.get('/api/plans', (req, res) => res.json(PLAN_LIMITS));
 
 app.get('/api/usage', requireAuth, async (req, res) => {
   const { tenant_id } = req.query;
@@ -940,14 +670,8 @@ app.get('/api/usage', requireAuth, async (req, res) => {
       const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.starter;
       const sitesRes = await client.query('SELECT COUNT(*) FROM sites WHERE tenant_id = $1', [tenant_id]);
       const checkpointsRes = await client.query('SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1', [tenant_id]);
-      const guardsRes = await client.query(
-        "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'",
-        [tenant_id]
-      );
-      const clientAccountsRes = await client.query(
-        'SELECT COUNT(*) FROM client_users WHERE tenant_id = $1',
-        [tenant_id]
-      );
+      const guardsRes = await client.query("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'", [tenant_id]);
+      const clientAccountsRes = await client.query('SELECT COUNT(*) FROM client_users WHERE tenant_id = $1', [tenant_id]);
       return {
         plan,
         limits,
@@ -965,26 +689,39 @@ app.get('/api/usage', requireAuth, async (req, res) => {
   }
 });
 
+app.get('/api/guard-certifications', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, async client => {
+      const certs = await client.query(
+        `SELECT gc.*, u.email AS guard_email
+         FROM guard_certifications gc
+         JOIN users u ON u.id = gc.user_id
+         WHERE gc.tenant_id = $1
+         ORDER BY gc.expiry_date ASC`,
+        [tenant_id]
+      );
+      return certs.rows.map(row => ({ ...row, ...computeCertStatus(row.expiry_date) }));
+    });
+    res.json(result);
+  } catch (err) {
+    console.error('Certifications fetch error:', err.message);
+    res.status(500).json({ error: 'Failed to load certifications' });
+  }
+});
+
 app.get('/api/notifications', requireAuth, async (req, res) => {
   const { tenant_id, status } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, client => {
       if (status === 'resolved') {
-        return client.query(
-          'SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = TRUE ORDER BY resolved_at DESC LIMIT 50',
-          [tenant_id]
-        );
+        return client.query('SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = TRUE ORDER BY resolved_at DESC LIMIT 50', [tenant_id]);
       } else if (status === 'all') {
-        return client.query(
-          'SELECT * FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100',
-          [tenant_id]
-        );
+        return client.query('SELECT * FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 100', [tenant_id]);
       }
-      return client.query(
-        'SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = FALSE ORDER BY created_at DESC',
-        [tenant_id]
-      );
+      return client.query('SELECT * FROM notifications WHERE tenant_id = $1 AND resolved = FALSE ORDER BY created_at DESC', [tenant_id]);
     });
     res.json(result.rows);
   } catch (err) {
@@ -998,10 +735,7 @@ app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, client =>
-      client.query(
-        'UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE id = $1 AND tenant_id = $2 RETURNING *',
-        [id, tenant_id]
-      )
+      client.query('UPDATE notifications SET resolved = TRUE, resolved_at = NOW() WHERE id = $1 AND tenant_id = $2 RETURNING *', [id, tenant_id])
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Notification not found' });
     res.json(result.rows[0]);
@@ -1016,10 +750,7 @@ app.post('/api/sos', requireAuth, async (req, res) => {
   if (!tenant_id || !site_id) return res.status(400).json({ error: 'tenant_id and site_id are required' });
   try {
     const result = await withTenant(tenant_id, async client => {
-      const existing = await client.query(
-        "SELECT * FROM sos_alerts WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'",
-        [tenant_id, user_id]
-      );
+      const existing = await client.query("SELECT * FROM sos_alerts WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'", [tenant_id, user_id]);
       if (existing.rows.length > 0) return { row: existing.rows[0], alreadyActive: true };
       const inserted = await client.query(
         `INSERT INTO sos_alerts (tenant_id, site_id, user_id, latitude, longitude, message)
@@ -1045,17 +776,11 @@ app.get('/api/sos', requireAuth, requireAdmin, async (req, res) => {
         JOIN sites s ON s.id = sa.site_id
         WHERE sa.tenant_id = $1`;
       if (status === 'resolved') {
-        return client.query(
-          base + " AND sa.status = 'resolved' ORDER BY sa.resolved_at DESC LIMIT 50",
-          [tenant_id]
-        );
+        return client.query(base + " AND sa.status = 'resolved' ORDER BY sa.resolved_at DESC LIMIT 50", [tenant_id]);
       } else if (status === 'all') {
         return client.query(base + ' ORDER BY sa.created_at DESC LIMIT 100', [tenant_id]);
       }
-      return client.query(
-        base + " AND sa.status = 'active' ORDER BY sa.created_at DESC",
-        [tenant_id]
-      );
+      return client.query(base + " AND sa.status = 'active' ORDER BY sa.created_at DESC", [tenant_id]);
     });
     res.json(result.rows);
   } catch (err) {
@@ -1069,10 +794,7 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
   try {
     const result = await withTenant(tenant_id, async client => {
-      const existing = await client.query(
-        "SELECT * FROM sos_alerts WHERE id = $1 AND tenant_id = $2 AND status = 'active'",
-        [id, tenant_id]
-      );
+      const existing = await client.query("SELECT * FROM sos_alerts WHERE id = $1 AND tenant_id = $2 AND status = 'active'", [id, tenant_id]);
       if (existing.rows.length === 0) return { rows: [] };
       const alert = existing.rows[0];
       const isOwner = alert.user_id === req.auth.user_id;
@@ -1147,9 +869,7 @@ app.get('/api/guard-locations', requireAuth, requireAdmin, async (req, res) => {
 
 app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, user_id, hours } = req.query;
-  if (!tenant_id || !user_id) {
-    return res.status(400).json({ error: 'tenant_id and user_id query params are required' });
-  }
+  if (!tenant_id || !user_id) return res.status(400).json({ error: 'tenant_id and user_id query params are required' });
   let hoursNum = hours ? Number(hours) : 12;
   if (!Number.isFinite(hoursNum) || hoursNum <= 0) hoursNum = 12;
   if (hoursNum > LOCATION_HISTORY_RETENTION_HOURS) hoursNum = LOCATION_HISTORY_RETENTION_HOURS;
@@ -1174,20 +894,11 @@ app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, r
 
 app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, email, password } = req.body;
-  if (!tenant_id || !site_id || !email || !password) {
-    return res
-      .status(400)
-      .json({ error: 'tenant_id, site_id, email, and password are required' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'password must be at least 6 characters' });
-  }
+  if (!tenant_id || !site_id || !email || !password) return res.status(400).json({ error: 'tenant_id, site_id, email, and password are required' });
+  if (password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
   try {
     const result = await withTenant(tenant_id, async client => {
-      const siteCheck = await client.query(
-        'SELECT id FROM sites WHERE id = $1 AND tenant_id = $2',
-        [site_id, tenant_id]
-      );
+      const siteCheck = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
       if (siteCheck.rows.length === 0) {
         const err = new Error('Site not found for this tenant');
         err.statusCode = 404;
@@ -1196,9 +907,7 @@ app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
 
       const limitCheck = await checkPlanLimit(client, tenant_id, 'client_accounts');
       if (!limitCheck.allowed) {
-        const err = new Error(
-          `Your ${limitCheck.plan} plan allows up to ${limitCheck.max} client portal account(s). Upgrade your plan to add more.`
-        );
+        const err = new Error(`Your ${limitCheck.plan} plan allows up to ${limitCheck.max} client portal account(s). Upgrade your plan to add more.`);
         err.statusCode = 403;
         throw err;
       }
@@ -1211,11 +920,7 @@ app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
     });
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    if (err.code === '23505') {
-      return res
-        .status(409)
-        .json({ error: 'A client account with this email already exists for this tenant' });
-    }
+    if (err.code === '23505') return res.status(409).json({ error: 'A client account with this email already exists for this tenant' });
     res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
@@ -1251,10 +956,7 @@ app.delete('/api/client-users/:id', requireAuth, requireAdmin, async (req, res) 
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, client =>
-      client.query(
-        'DELETE FROM client_users WHERE id = $1 AND tenant_id = $2 RETURNING id, email',
-        [id, tenant_id]
-      )
+      client.query('DELETE FROM client_users WHERE id = $1 AND tenant_id = $2 RETURNING id, email', [id, tenant_id])
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Client account not found' });
     res.json({ deleted: result.rows[0] });
@@ -1266,19 +968,12 @@ app.delete('/api/client-users/:id', requireAuth, requireAdmin, async (req, res) 
 app.patch('/api/client-users/:id/reset-password', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { tenant_id, new_password } = req.body;
-  if (!tenant_id || !new_password) {
-    return res.status(400).json({ error: 'tenant_id and new_password are required' });
-  }
-  if (new_password.length < 6) {
-    return res.status(400).json({ error: 'new_password must be at least 6 characters' });
-  }
+  if (!tenant_id || !new_password) return res.status(400).json({ error: 'tenant_id and new_password are required' });
+  if (new_password.length < 6) return res.status(400).json({ error: 'new_password must be at least 6 characters' });
   try {
     const hash = await bcrypt.hash(new_password, 10);
     const result = await withTenant(tenant_id, client =>
-      client.query(
-        'UPDATE client_users SET password_hash = $1 WHERE id = $2 AND tenant_id = $3 RETURNING id, email',
-        [hash, id, tenant_id]
-      )
+      client.query('UPDATE client_users SET password_hash = $1 WHERE id = $2 AND tenant_id = $3 RETURNING id, email', [hash, id, tenant_id])
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Client account not found' });
     res.json({ reset: result.rows[0] });
@@ -1289,46 +984,21 @@ app.patch('/api/client-users/:id/reset-password', requireAuth, requireAdmin, asy
 
 app.post('/api/clients/login', async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'email and password are required' });
-  }
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
   const normalizedEmail = email.toLowerCase().trim();
   try {
     const tenantsRes = await pool.query('SELECT id FROM tenants');
     for (const t of tenantsRes.rows) {
       const result = await withTenant(t.id, client =>
-        client.query('SELECT * FROM client_users WHERE tenant_id = $1 AND LOWER(email) = $2', [
-          t.id,
-          normalizedEmail
-        ])
+        client.query('SELECT * FROM client_users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
       );
       if (result.rows.length > 0) {
         const candidate = result.rows[0];
         const valid = await bcrypt.compare(password, candidate.password_hash);
         if (valid) {
-          const token = jwt.sign(
-            {
-              client_user_id: candidate.id,
-              tenant_id: t.id,
-              site_id: candidate.site_id,
-              role: 'client'
-            },
-            JWT_SECRET,
-            { expiresIn: '12h' }
-          );
-          const siteRes = await withTenant(t.id, client =>
-            client.query('SELECT name FROM sites WHERE id = $1 AND tenant_id = $2', [
-              candidate.site_id,
-              t.id
-            ])
-          );
-          return res.json({
-            token,
-            client: { id: candidate.id, email: candidate.email },
-            tenant_id: t.id,
-            site_id: candidate.site_id,
-            site_name: siteRes.rows[0] ? siteRes.rows[0].name : null
-          });
+          const token = jwt.sign({ client_user_id: candidate.id, tenant_id: t.id, site_id: candidate.site_id, role: 'client' }, JWT_SECRET, { expiresIn: '12h' });
+          const siteRes = await withTenant(t.id, client => client.query('SELECT name FROM sites WHERE id = $1 AND tenant_id = $2', [candidate.site_id, t.id]));
+          return res.json({ token, client: { id: candidate.id, email: candidate.email }, tenant_id: t.id, site_id: candidate.site_id, site_name: siteRes.rows[0] ? siteRes.rows[0].name : null });
         }
       }
     }
@@ -1341,9 +1011,7 @@ app.post('/api/clients/login', async (req, res) => {
 app.get('/api/client-portal/compliance', requireAuth, requireClient, async (req, res) => {
   const { tenant_id, site_id } = req.auth;
   try {
-    const compliance = await withTenant(tenant_id, client =>
-      computeSiteCompliance(client, tenant_id, site_id)
-    );
+    const compliance = await withTenant(tenant_id, client => computeSiteCompliance(client, tenant_id, site_id));
     res.json(compliance);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1401,237 +1069,123 @@ app.get('/api/client-portal/site-info', requireAuth, requireClient, async (req, 
   }
 });
 
-app.get(
-  '/api/client-portal/reports/compliance-pdf',
-  requireAuth,
-  requireClient,
-  async (req, res) => {
-    const { tenant_id, site_id } = req.auth;
-    const { start_date, end_date } = req.query;
-    if (!start_date || !end_date) {
-      return res.status(400).json({ error: 'start_date and end_date are required' });
-    }
-    try {
-      const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-      const reportData = await withTenant(tenant_id, client =>
-        fetchReportData(client, tenant_id, site_id, startDt, endDt)
-      );
-      const startLabel = startDt.toFormat('dd LLL yyyy');
-      const endLabel = endDt.toFormat('dd LLL yyyy');
-      const filename =
-        'compliance-report-' +
-        safeFilenamePart(reportData.siteName) +
-        '-' +
-        startDt.toFormat('yyyy-MM-dd') +
-        '.pdf';
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      doc.pipe(res);
-      drawReportHeader(doc, reportData.tenantName, reportData.siteName, startLabel, endLabel);
-      drawSectionTitle(doc, 'Summary');
-      drawSummaryStats(doc, reportData.stats);
-      drawSectionTitle(doc, 'Checkpoint Activity');
-      if (reportData.perCheckpoint.length === 0) {
-        doc.fontSize(10).fillColor('#6b7280').text('No checkpoints configured for this site.');
-      } else {
-        const colX = { name: 50, location: 220, scans: 370, lastScan: 430 };
-        const headerY = doc.y;
-        doc.fontSize(9).fillColor('#374151');
-        doc.text('Checkpoint', colX.name, headerY);
-        doc.text('Location', colX.location, headerY);
-        doc.text('Scans', colX.scans, headerY);
-        doc.text('Last Scan', colX.lastScan, headerY);
-        doc.moveDown(0.3);
-        doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
-        doc.moveDown(0.3);
-        reportData.perCheckpoint.forEach(cp => {
-          if (doc.y > 720) {
-            doc.addPage();
-            doc.y = 50;
-          }
-          const rowY = doc.y;
-          doc.fontSize(9).fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827');
-          doc.text(cp.name, colX.name, rowY, { width: 165 });
-          doc.fillColor('#6b7280').text(cp.location, colX.location, rowY, { width: 140 });
-          doc.fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827').text(String(cp.scanCount), colX.scans, rowY, {
-            width: 50
-          });
-          doc.fillColor('#6b7280').text(
-            cp.lastScan
-              ? DateTime.fromJSDate(new Date(cp.lastScan))
-                  .setZone(reportData.timezone)
-                  .toFormat('dd LLL, HH:mm')
-              : 'Not scanned',
-            colX.lastScan,
-            rowY,
-            { width: 110 }
-          );
-          doc.moveDown(0.6);
-        });
-      }
-      doc.moveDown(1);
-      if (doc.y > 680) {
-        doc.addPage();
-        doc.y = 50;
-      }
-      drawSectionTitle(doc, 'Incidents Reported (' + reportData.incidents.length + ')');
-      if (reportData.incidents.length === 0) {
-        doc.fontSize(10).fillColor('#16a34a').text('No incidents reported during this period.');
-      } else {
-        reportData.incidents.forEach(inc => {
-          if (doc.y > 700) {
-            doc.addPage();
-            doc.y = 50;
-          }
-          const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at))
-            .setZone(reportData.timezone)
-            .toFormat('dd LLL yyyy, HH:mm');
-          doc.fontSize(9).fillColor(severityColor(inc.severity)).text(
-            '[' + inc.severity.toUpperCase() + '] ' + dateLabel
-          );
-          doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
-          if (inc.guard_email) {
-            doc.fontSize(8).fillColor('#9ca3af').text('Reported by: ' + inc.guard_email);
-          }
-          doc.moveDown(0.6);
-        });
-      }
-      doc.end();
-    } catch (err) {
-      res.status(err.statusCode || 500).json({ error: err.message });
-    }
-  }
-);
-
-app.get(
-  '/api/client-portal/reports/compliance-csv',
-  requireAuth,
-  requireClient,
-  async (req, res) => {
-    const { tenant_id, site_id } = req.auth;
-    const { start_date, end_date } = req.query;
-    if (!start_date || !end_date) {
-      return res.status(400).json({ error: 'start_date and end_date are required' });
-    }
-    try {
-      const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-      const reportData = await withTenant(tenant_id, client =>
-        fetchReportData(client, tenant_id, site_id, startDt, endDt)
-      );
-      const rows = reportData.logs.map(log => {
-        const cp = reportData.checkpointLookup[log.checkpoint_id] || {};
-        const scannedLocal = DateTime.fromJSDate(new Date(log.scanned_at)).setZone(
-          reportData.timezone
-        );
-        return [
-          reportData.siteName,
-          cp.name || 'Checkpoint #' + log.checkpoint_id,
-          [cp.building, cp.floor].filter(Boolean).join(' / ') || '',
-          log.guard_email || '',
-          scannedLocal.toFormat('yyyy-MM-dd'),
-          scannedLocal.toFormat('HH:mm:ss'),
-          log.latitude ?? '',
-          log.longitude ?? ''
-        ];
+app.get('/api/client-portal/reports/compliance-pdf', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  const { start_date, end_date } = req.query;
+  if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date are required' });
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, client => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+    const startLabel = startDt.toFormat('dd LLL yyyy');
+    const endLabel = endDt.toFormat('dd LLL yyyy');
+    const filename = 'compliance-report-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.pdf';
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    doc.pipe(res);
+    drawReportHeader(doc, reportData.tenantName, reportData.siteName, startLabel, endLabel);
+    drawSectionTitle(doc, 'Summary');
+    drawSummaryStats(doc, reportData.stats);
+    drawSectionTitle(doc, 'Checkpoint Activity');
+    if (reportData.perCheckpoint.length === 0) {
+      doc.fontSize(10).fillColor('#6b7280').text('No checkpoints configured for this site.');
+    } else {
+      const colX = { name: 50, location: 220, scans: 370, lastScan: 430 };
+      const headerY = doc.y;
+      doc.fontSize(9).fillColor('#374151');
+      doc.text('Checkpoint', colX.name, headerY);
+      doc.text('Location', colX.location, headerY);
+      doc.text('Scans', colX.scans, headerY);
+      doc.text('Last Scan', colX.lastScan, headerY);
+      doc.moveDown(0.3);
+      doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#e5e7eb').stroke();
+      doc.moveDown(0.3);
+      reportData.perCheckpoint.forEach(cp => {
+        if (doc.y > 720) { doc.addPage(); doc.y = 50; }
+        const rowY = doc.y;
+        doc.fontSize(9).fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827');
+        doc.text(cp.name, colX.name, rowY, { width: 165 });
+        doc.fillColor('#6b7280').text(cp.location, colX.location, rowY, { width: 140 });
+        doc.fillColor(cp.scanCount === 0 ? '#dc2626' : '#111827').text(String(cp.scanCount), colX.scans, rowY, { width: 50 });
+        doc.fillColor('#6b7280').text(cp.lastScan ? DateTime.fromJSDate(new Date(cp.lastScan)).setZone(reportData.timezone).toFormat('dd LLL, HH:mm') : 'Not scanned', colX.lastScan, rowY, { width: 110 });
+        doc.moveDown(0.6);
       });
-      const csv = buildCsv(
-        ['Site', 'Checkpoint', 'Location', 'Guard Email', 'Date', 'Time', 'Latitude', 'Longitude'],
-        rows
-      );
-      const filename =
-        'scan-log-' +
-        safeFilenamePart(reportData.siteName) +
-        '-' +
-        startDt.toFormat('yyyy-MM-dd') +
-        '.csv';
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-      res.send('\uFEFF' + csv);
-    } catch (err) {
-      res.status(err.statusCode || 500).json({ error: err.message });
     }
-  }
-);
 
-app.get(
-  '/api/client-portal/reports/incidents-csv',
-  requireAuth,
-  requireClient,
-  async (req, res) => {
-    const { tenant_id, site_id } = req.auth;
-    const { start_date, end_date } = req.query;
-    if (!start_date || !end_date) {
-      return res.status(400).json({ error: 'start_date and end_date are required' });
-    }
-    try {
-      const { startDt, endDt } = parseReportDateRange(start_date, end_date);
-      const reportData = await withTenant(tenant_id, client =>
-        fetchReportData(client, tenant_id, site_id, startDt, endDt)
-      );
-      const rows = reportData.incidents.map(inc => {
-        const reportedLocal = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(
-          reportData.timezone
-        );
-        return [
-          reportData.siteName,
-          reportedLocal.toFormat('yyyy-MM-dd'),
-          reportedLocal.toFormat('HH:mm:ss'),
-          inc.severity,
-          inc.guard_email || '',
-          inc.description,
-          inc.photo_count
-        ];
+    doc.moveDown(1);
+    if (doc.y > 680) { doc.addPage(); doc.y = 50; }
+    drawSectionTitle(doc, 'Incidents Reported (' + reportData.incidents.length + ')');
+    if (reportData.incidents.length === 0) {
+      doc.fontSize(10).fillColor('#16a34a').text('No incidents reported during this period.');
+    } else {
+      reportData.incidents.forEach(inc => {
+        if (doc.y > 700) { doc.addPage(); doc.y = 50; }
+        const dateLabel = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone).toFormat('dd LLL yyyy, HH:mm');
+        doc.fontSize(9).fillColor(severityColor(inc.severity)).text('[' + inc.severity.toUpperCase() + '] ' + dateLabel, { continued: false });
+        doc.fontSize(10).fillColor('#111827').text(inc.description, { width: 495 });
+        if (inc.guard_email) doc.fontSize(8).fillColor('#9ca3af').text('Reported by: ' + inc.guard_email);
+        doc.moveDown(0.6);
       });
-      const csv = buildCsv(
-        ['Site', 'Date', 'Time', 'Severity', 'Guard Email', 'Description', 'Photo Count'],
-        rows
-      );
-      const filename =
-        'incidents-' +
-        safeFilenamePart(reportData.siteName) +
-        '-' +
-        startDt.toFormat('yyyy-MM-dd') +
-        '.csv';
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
-      res.send('\uFEFF' + csv);
-    } catch (err) {
-      res.status(err.statusCode || 500).json({ error: err.message });
     }
+    doc.end();
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
-);
+});
+
+app.get('/api/client-portal/reports/compliance-csv', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  const { start_date, end_date } = req.query;
+  if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date are required' });
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, client => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+    const rows = reportData.logs.map(log => {
+      const cp = reportData.checkpointLookup[log.checkpoint_id] || {};
+      const scannedLocal = DateTime.fromJSDate(new Date(log.scanned_at)).setZone(reportData.timezone);
+      return [reportData.siteName, cp.name || 'Checkpoint #' + log.checkpoint_id, [cp.building, cp.floor].filter(Boolean).join(' / ') || '', log.guard_email || '', scannedLocal.toFormat('yyyy-MM-dd'), scannedLocal.toFormat('HH:mm:ss'), log.latitude ?? '', log.longitude ?? ''];
+    });
+    const csv = buildCsv(['Site', 'Checkpoint', 'Location', 'Guard Email', 'Date', 'Time', 'Latitude', 'Longitude'], rows);
+    const filename = 'scan-log-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.send('\uFEFF' + csv);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+app.get('/api/client-portal/reports/incidents-csv', requireAuth, requireClient, async (req, res) => {
+  const { tenant_id, site_id } = req.auth;
+  const { start_date, end_date } = req.query;
+  if (!start_date || !end_date) return res.status(400).json({ error: 'start_date and end_date are required' });
+  try {
+    const { startDt, endDt } = parseReportDateRange(start_date, end_date);
+    const reportData = await withTenant(tenant_id, client => fetchReportData(client, tenant_id, site_id, startDt, endDt));
+    const rows = reportData.incidents.map(inc => {
+      const reportedLocal = DateTime.fromJSDate(new Date(inc.reported_at)).setZone(reportData.timezone);
+      return [reportData.siteName, reportedLocal.toFormat('yyyy-MM-dd'), reportedLocal.toFormat('HH:mm:ss'), inc.severity, inc.guard_email || '', inc.description, inc.photo_count];
+    });
+    const csv = buildCsv(['Site', 'Date', 'Time', 'Severity', 'Guard Email', 'Description', 'Photo Count'], rows);
+    const filename = 'incidents-' + safeFilenamePart(reportData.siteName) + '-' + startDt.toFormat('yyyy-MM-dd') + '.csv';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.send('\uFEFF' + csv);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
 
 app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
-  const {
-    tenant_id,
-    site_id,
-    user_id,
-    start_date,
-    start_time,
-    end_time,
-    employment_type,
-    recurrence,
-    repeat_until,
-    days_of_week,
-    notes
-  } = req.body;
-
+  const { tenant_id, site_id, user_id, start_date, start_time, end_time, employment_type, recurrence, repeat_until, days_of_week, notes } = req.body;
   if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
-    return res.status(400).json({
-      error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required'
-    });
+    return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
   }
 
   const validEmploymentType = employment_type === 'part_time' ? 'part_time' : 'full_time';
-  const validRecurrence = ['none', 'weekly', 'monthly'].includes(recurrence)
-    ? recurrence
-    : 'none';
-
+  const validRecurrence = ['none', 'weekly', 'monthly'].includes(recurrence) ? recurrence : 'none';
   const start = DateTime.fromISO(`${start_date}T${start_time}`);
-  if (!start.isValid) {
-    return res.status(400).json({ error: 'Invalid shift start date/time' });
-  }
+  if (!start.isValid) return res.status(400).json({ error: 'Invalid shift start date/time' });
 
   const buildShiftDates = () => {
     const dates = [];
@@ -1639,18 +1193,14 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       dates.push(start.toISODate());
       return dates;
     }
-
     const until = DateTime.fromISO(repeat_until);
     if (!until.isValid) return null;
-
     if (validRecurrence === 'weekly') {
       if (!Array.isArray(days_of_week) || days_of_week.length === 0) return null;
       let cursor = DateTime.fromISO(start_date).startOf('day');
       const endCursor = until.endOf('day');
       while (cursor <= endCursor) {
-        if (days_of_week.map(Number).includes(cursor.weekday % 7)) {
-          dates.push(cursor.toISODate());
-        }
+        if (days_of_week.map(Number).includes(cursor.weekday % 7)) dates.push(cursor.toISODate());
         cursor = cursor.plus({ days: 1 });
       }
     } else if (validRecurrence === 'monthly') {
@@ -1658,71 +1208,40 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       const endCursor = until.endOf('day');
       const targetDay = DateTime.fromISO(start_date).day;
       while (cursor <= endCursor) {
-        if (cursor.day === targetDay) {
-          dates.push(cursor.toISODate());
-        }
+        if (cursor.day === targetDay) dates.push(cursor.toISODate());
         cursor = cursor.plus({ days: 1 });
       }
     }
-
     return dates;
   };
 
   try {
     const dates = buildShiftDates();
-    if (dates === null || dates.length === 0) {
-      return res
-        .status(400)
-        .json({ error: 'No shift dates generated. Check recurrence settings.' });
-    }
+    if (dates === null || dates.length === 0) return res.status(400).json({ error: 'No shift dates generated. Check recurrence settings.' });
 
     const result = await withTenant(tenant_id, async client => {
-      const exists = await client.query(
-        'SELECT id FROM users WHERE tenant_id = $1 AND id = $2 AND role = $3',
-        [tenant_id, user_id, 'guard']
-      );
+      const exists = await client.query('SELECT id FROM users WHERE tenant_id = $1 AND id = $2 AND role = $3', [tenant_id, user_id, 'guard']);
       if (exists.rows.length === 0) {
         const err = new Error('Guard not found for this tenant');
         err.statusCode = 404;
         throw err;
       }
-
-      const siteExists = await client.query(
-        'SELECT id FROM sites WHERE tenant_id = $1 AND id = $2',
-        [tenant_id, site_id]
-      );
+      const siteExists = await client.query('SELECT id FROM sites WHERE tenant_id = $1 AND id = $2', [tenant_id, site_id]);
       if (siteExists.rows.length === 0) {
         const err = new Error('Site not found for this tenant');
         err.statusCode = 404;
         throw err;
       }
-
-      const recurrenceGroupId =
-        validRecurrence === 'none'
-          ? null
-          : `shiftgrp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
+      const recurrenceGroupId = validRecurrence === 'none' ? null : `shiftgrp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const created = [];
       for (const shiftDate of dates) {
         const inserted = await client.query(
           `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, employment_type, recurrence, recurrence_group_id, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-          [
-            tenant_id,
-            site_id,
-            user_id,
-            shiftDate,
-            start_time,
-            end_time,
-            validEmploymentType,
-            validRecurrence,
-            recurrenceGroupId,
-            notes || null
-          ]
+          [tenant_id, site_id, user_id, shiftDate, start_time, end_time, validEmploymentType, validRecurrence, recurrenceGroupId, notes || null]
         );
         created.push(inserted.rows[0]);
       }
-
       return created;
     });
 
@@ -1752,14 +1271,8 @@ app.get('/api/shifts', requireAuth, async (req, res) => {
         WHERE sh.tenant_id = $1
       `;
       const params = [tenant_id];
-      if (user_id) {
-        params.push(user_id);
-        query += ` AND sh.user_id = $${params.length}`;
-      }
-      if (site_id) {
-        params.push(site_id);
-        query += ` AND sh.site_id = $${params.length}`;
-      }
+      if (user_id) { params.push(user_id); query += ` AND sh.user_id = $${params.length}`; }
+      if (site_id) { params.push(site_id); query += ` AND sh.site_id = $${params.length}`; }
       query += ' ORDER BY sh.shift_date ASC, sh.start_time ASC';
       return client.query(query, params);
     });
@@ -1784,15 +1297,7 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
              notes = COALESCE($5, notes)
          WHERE id = $6 AND tenant_id = $7
          RETURNING *`,
-        [
-          shift_date || null,
-          start_time || null,
-          end_time || null,
-          employment_type || null,
-          notes || null,
-          id,
-          tenant_id
-        ]
+        [shift_date || null, start_time || null, end_time || null, employment_type || null, notes || null, id, tenant_id]
       )
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
@@ -1807,12 +1312,7 @@ app.delete('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
-    const result = await withTenant(tenant_id, client =>
-      client.query('DELETE FROM shifts WHERE id = $1 AND tenant_id = $2 RETURNING *', [
-        id,
-        tenant_id
-      ])
-    );
+    const result = await withTenant(tenant_id, client => client.query('DELETE FROM shifts WHERE id = $1 AND tenant_id = $2 RETURNING *', [id, tenant_id]));
     if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
     res.json({ deleted: result.rows[0] });
   } catch (err) {
@@ -1825,14 +1325,10 @@ app.delete('/api/shifts/series/:groupId', requireAuth, requireAdmin, async (req,
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
-    const result = await withTenant(tenant_id, client =>
-      client.query(
-        `DELETE FROM shifts
-         WHERE tenant_id = $1 AND recurrence_group_id = $2 AND shift_date >= CURRENT_DATE
-         RETURNING *`,
-        [tenant_id, groupId]
-      )
-    );
+    const result = await withTenant(tenant_id, client => client.query(
+      `DELETE FROM shifts WHERE tenant_id = $1 AND recurrence_group_id = $2 AND shift_date >= CURRENT_DATE RETURNING *`,
+      [tenant_id, groupId]
+    ));
     res.json({ deleted_count: result.rows.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1843,40 +1339,23 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity, photos } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || !site_id || !description) {
-    return res
-      .status(400)
-      .json({ error: 'tenant_id, site_id, and description are required' });
+    return res.status(400).json({ error: 'tenant_id, site_id, and description are required' });
   }
 
   const photoList = Array.isArray(photos) ? photos.slice(0, MAX_PHOTOS_PER_INCIDENT) : [];
   for (const p of photoList) {
-    if (typeof p !== 'string' || p.length === 0) {
-      return res.status(400).json({
-        error: 'Each photo must be a non-empty base64 data URL string'
-      });
-    }
-    if (p.length > MAX_PHOTO_BASE64_LENGTH) {
-      return res.status(400).json({
-        error:
-          'One or more photos are too large. Please retake at a lower quality.'
-      });
-    }
+    if (typeof p !== 'string' || p.length === 0) return res.status(400).json({ error: 'Each photo must be a non-empty base64 data URL string' });
+    if (p.length > MAX_PHOTO_BASE64_LENGTH) return res.status(400).json({ error: 'One or more photos are too large. Please retake at a lower quality.' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query(`SET app.current_tenant = '${tenant_id}'`);
-    const incidentResult = await client.query(
-      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']
-    );
+    const incidentResult = await client.query('INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *', [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']);
     const incident = incidentResult.rows[0];
     for (const photoData of photoList) {
-      await client.query(
-        'INSERT INTO incident_photos (tenant_id, incident_id, photo_data) VALUES ($1, $2, $3)',
-        [tenant_id, incident.id, photoData]
-      );
+      await client.query('INSERT INTO incident_photos (tenant_id, incident_id, photo_data) VALUES ($1, $2, $3)', [tenant_id, incident.id, photoData]);
     }
     await client.query('COMMIT');
     res.status(201).json({ ...incident, photo_count: photoList.length });
@@ -1904,12 +1383,7 @@ app.get('/api/incidents', requireAuth, async (req, res) => {
         ) p ON p.incident_id = i.id
         WHERE i.tenant_id = $1
       `;
-      return date
-        ? client.query(
-            baseQuery + ' AND i.reported_at::date = $2 ORDER BY i.reported_at DESC',
-            [tenant_id, date]
-          )
-        : client.query(baseQuery + ' ORDER BY i.reported_at DESC', [tenant_id]);
+      return date ? client.query(baseQuery + ' AND i.reported_at::date = $2 ORDER BY i.reported_at DESC', [tenant_id, date]) : client.query(baseQuery + ' ORDER BY i.reported_at DESC', [tenant_id]);
     });
     res.json(result.rows);
   } catch (err) {
@@ -1922,12 +1396,7 @@ app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
-    const result = await withTenant(tenant_id, client =>
-      client.query(
-        'SELECT id, photo_data, created_at FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 ORDER BY created_at ASC',
-        [id, tenant_id]
-      )
-    );
+    const result = await withTenant(tenant_id, client => client.query('SELECT id, photo_data, created_at FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 ORDER BY created_at ASC', [id, tenant_id]));
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1939,12 +1408,7 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
-    const result = await withTenant(tenant_id, client =>
-      client.query(
-        'DELETE FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 RETURNING id',
-        [id, tenant_id]
-      )
-    );
+    const result = await withTenant(tenant_id, client => client.query('DELETE FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 RETURNING id', [id, tenant_id]));
     res.json({ deleted_count: result.rows.length });
   } catch (err) {
     res.status(500).json({ error: err.message });

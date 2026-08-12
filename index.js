@@ -305,7 +305,7 @@ async function ensureClientUsersTable() {
 }
 ensureClientUsersTable();
 
-// Guard certifications table
+// Guard certifications table + migration
 async function ensureGuardCertificationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_certifications (
@@ -320,6 +320,15 @@ async function ensureGuardCertificationsTable() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Migration safety: ensure all expected columns exist
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS name TEXT`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS issuer TEXT`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS issue_date DATE`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS expiry_date DATE`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS notes TEXT`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_guard_certifications_user ON guard_certifications (tenant_id, user_id)`);
   console.log('Guard certifications table ready');
 }
@@ -2154,10 +2163,10 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
 // ------------------------ GUARD CERTIFICATIONS ------------------------
 
 app.get('/api/certifications', requireAuth, async (req, res) => {
-  const { tenant_id } = req.query || req.auth;
+  const { tenant_id: queryTenant } = req.query;
   const { user_id } = req.query;
 
-  const effectiveTenantId = tenant_id || req.auth.tenant_id;
+  const effectiveTenantId = queryTenant || req.auth.tenant_id;
   if (!effectiveTenantId) {
     return res.status(400).json({ error: 'tenant_id is required' });
   }
@@ -2190,8 +2199,8 @@ app.get('/api/certifications', requireAuth, async (req, res) => {
 });
 
 app.get('/api/certifications/expiring', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id } = req.query || req.auth;
-  const effectiveTenantId = tenant_id || req.auth.tenant_id;
+  const { tenant_id: queryTenant } = req.query;
+  const effectiveTenantId = queryTenant || req.auth.tenant_id;
   if (!effectiveTenantId) {
     return res.status(400).json({ error: 'tenant_id is required' });
   }

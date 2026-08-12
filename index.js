@@ -652,11 +652,28 @@ app.post('/api/auth/login', (req, res) => {
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password123';
 
   if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-    const token = jwt.sign({ role: 'admin', user_id: 1 }, JWT_SECRET, { expiresIn: '12h' });
-    return res.json({ success: true, token });
+    const user = {
+      id: 1,
+      email: ADMIN_EMAIL,
+      role: 'admin',
+      name: 'Admin'
+    };
+
+    const token = jwt.sign(
+      { user_id: user.id, role: user.role, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '12h' }
+    );
+
+    return res.json({
+      token,
+      user
+    });
   }
 
-  return res.status(401).json({ success: false, message: 'Invalid credentials' });
+  return res.status(401).json({
+    error: 'Invalid credentials'
+  });
 });
 // ---------------------------------------------------------------
 

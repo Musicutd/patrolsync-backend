@@ -26,9 +26,6 @@ const LOCATION_HISTORY_RETENTION_HOURS = 48;
 const MAX_PHOTOS_PER_INCIDENT = 3;
 const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024;
 
-// client_accounts is capped per-plan just like locations/checkpoints/guards —
-// it mirrors the same upsell lever ("upgrade to unlock more client logins")
-// instead of being an unlimited freebie that undercuts the other tiers.
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        client_accounts: 1,        monthly_price: 39,  overage: null },
   medium:     { locations: 1,        checkpoints: 20,       guards: 6,        client_accounts: 2,        monthly_price: 79,  overage: null },
@@ -90,9 +87,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Client-portal users are read-only and scoped to exactly one site — this
-// middleware enforces that a client token can only be used against
-// client-portal endpoints, never the admin/guard API surface.
 function requireClient(req, res, next) {
   if (!req.auth || req.auth.role !== 'client') {
     return res.status(403).json({ error: 'Client access required' });
@@ -120,6 +114,8 @@ async function checkPlanLimit(client, tenantId, resource) {
 
   return { allowed: current < max, plan, max, current };
 }
+
+// ------------------------ SCHEMA HELPERS ------------------------
 
 async function ensureIncidentsTable() {
   await pool.query(`
@@ -293,12 +289,6 @@ async function cleanupLocationHistory() {
 setInterval(cleanupLocationHistory, LOCATION_HISTORY_CLEANUP_INTERVAL_MS);
 setTimeout(cleanupLocationHistory, 20000);
 
-// --- Client portal ---
-// Client accounts are read-only, scoped to exactly one site, and live in
-// their own table (not `users`) since they have a fundamentally different
-// trust boundary: no password reset via admin, no role escalation risk,
-// and no ability to touch guards/checkpoints/schedules. Kept simple by
-// design — this is a viewing window into one site's reports, nothing more.
 async function ensureClientUsersTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS client_users (
@@ -314,6 +304,28 @@ async function ensureClientUsersTable() {
   console.log('Client users table ready');
 }
 ensureClientUsersTable();
+
+// Guard certifications table
+async function ensureGuardCertificationsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guard_certifications (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      issuer TEXT,
+      issue_date DATE,
+      expiry_date DATE,
+      notes TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_guard_certifications_user ON guard_certifications (tenant_id, user_id)`);
+  console.log('Guard certifications table ready');
+}
+ensureGuardCertificationsTable();
+
+// ------------------------ COMPLIANCE SWEEP ------------------------
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
   const nowLocal = DateTime.fromJSDate(nowUTC, { zone });
@@ -465,7 +477,7 @@ async function runComplianceSweep() {
 setInterval(runComplianceSweep, ALERT_SWEEP_INTERVAL_MS);
 setTimeout(runComplianceSweep, 15000);
 
-// --- Report generation helpers (shared by PDF + CSV exports, and the client portal) ---
+// ------------------------ REPORT HELPERS ------------------------
 
 async function fetchReportData(client, tenantId, siteId, startDt, endDt) {
   const tenantRes = await client.query('SELECT name, timezone FROM tenants WHERE id = $1', [tenantId]);
@@ -617,6 +629,8 @@ function parseReportDateRange(start_date, end_date) {
 function safeFilenamePart(str) {
   return String(str).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 }
+
+// ------------------------ REPORT ROUTES ------------------------
 
 app.get('/api/reports/compliance-pdf', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, start_date, end_date } = req.query;
@@ -772,6 +786,8 @@ app.get('/api/reports/incidents-csv', requireAuth, requireAdmin, async (req, res
   }
 });
 
+// ------------------------ HEALTH & BASIC ROUTES ------------------------
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'PatrolSync Backend', timestamp: new Date().toISOString() });
 });
@@ -860,7 +876,7 @@ app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
   }
 });
 
-// --- SOS / panic button endpoints ---
+// ------------------------ SOS ROUTES ------------------------
 
 app.post('/api/sos', requireAuth, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude, message } = req.body;
@@ -949,7 +965,7 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
   }
 });
 
-// --- Live guard location tracking ---
+// ------------------------ GUARD LOCATION ROUTES ------------------------
 
 app.post('/api/guard-locations', requireAuth, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude } = req.body;
@@ -1027,11 +1043,7 @@ app.get('/api/guard-locations/history', requireAuth, requireAdmin, async (req, r
   }
 });
 
-// --- Client portal endpoints ---
-// Client accounts are created by the tenant admin, tied to exactly one
-// site, capped per-plan (same model as locations/checkpoints/guards), and
-// can only ever read that site's compliance/incidents/reports — never
-// write anything, never see other sites, never touch guards/users.
+// ------------------------ CLIENT PORTAL ROUTES ------------------------
 
 app.post('/api/client-users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, email, password } = req.body;
@@ -1130,10 +1142,6 @@ app.patch('/api/client-users/:id/reset-password', requireAuth, requireAdmin, asy
   }
 });
 
-// Client login is deliberately separate from /api/auth/login (which is for
-// admin/guard `users`) — different table, different token shape (role:
-// 'client', plus a fixed site_id baked into the token so every subsequent
-// request is automatically scoped without trusting client-supplied params).
 app.post('/api/client-auth/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
@@ -1184,11 +1192,6 @@ app.post('/api/client-auth/login', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// All client-portal read endpoints below ignore any site_id/tenant_id the
-// client might pass and use ONLY the values baked into their JWT — this is
-// what makes it structurally impossible for a client account to view a
-// different site's data, even by tampering with request parameters.
 
 app.get('/api/client-portal/compliance', requireAuth, requireClient, async (req, res) => {
   const { tenant_id, site_id } = req.auth;
@@ -1323,6 +1326,8 @@ app.get('/api/client-portal/reports/compliance-pdf', requireAuth, requireClient,
   }
 });
 
+// ------------------------ TENANT ROUTES ------------------------
+
 app.post('/api/tenants', async (req, res) => {
   const { name, slug, plan } = req.body;
   if (!name || !slug) return res.status(400).json({ error: 'name and slug are required' });
@@ -1424,6 +1429,8 @@ app.patch('/api/tenants/:id/emergency-contacts', requireAuth, requireAdmin, asyn
   }
 });
 
+// ------------------------ SIGNUP & AUTH ROUTES ------------------------
+
 app.post('/api/signup', async (req, res) => {
   const { company_name, plan, admin_email, admin_password, timezone } = req.body;
   if (!company_name || !admin_email || !admin_password) {
@@ -1516,15 +1523,31 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { user_id: matchedUser.id, tenant_id: matchedUser.tenant_id, role: matchedUser.role },
+      {
+        user_id: matchedUser.id,
+        tenant_id: matchedUser.tenant_id,
+        role: matchedUser.role,
+        email: matchedUser.email
+      },
       JWT_SECRET,
       { expiresIn: '12h' }
     );
-    res.json({ token, user: { id: matchedUser.id, email: matchedUser.email, role: matchedUser.role }, tenant_id: matchedUser.tenant_id });
+
+    res.json({
+      token,
+      tenant_id: matchedUser.tenant_id,
+      user: {
+        id: matchedUser.id,
+        email: matchedUser.email,
+        role: matchedUser.role
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ------------------------ SITES & CHECKPOINTS ------------------------
 
 app.post('/api/sites', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, name, address } = req.body;
@@ -1660,6 +1683,8 @@ app.delete('/api/checkpoints/:id', requireAuth, requireAdmin, async (req, res) =
   }
 });
 
+// ------------------------ USERS & GUARDS ------------------------
+
 app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, firebase_uid, email, role, password } = req.body;
   if (!tenant_id || !email) {
@@ -1753,6 +1778,8 @@ app.patch('/api/users/:id/reset-password', requireAuth, requireAdmin, async (req
     res.status(500).json({ error: err.message });
   }
 });
+
+// ------------------------ GUARD ASSIGNMENTS & PROGRESS ------------------------
 
 app.post('/api/guard-assignments', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id, round_size } = req.body;
@@ -1895,6 +1922,8 @@ app.get('/api/guard-progress', requireAuth, async (req, res) => {
   }
 });
 
+// ------------------------ PATROL SCHEDULES & LOGS ------------------------
+
 app.post('/api/patrol-schedules', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;
   if (!tenant_id || !site_id || !schedule_type || !config) {
@@ -2015,6 +2044,8 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
   }
 });
 
+// ------------------------ INCIDENTS ------------------------
+
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity, photos } = req.body;
   const user_id = req.auth.user_id;
@@ -2119,6 +2150,158 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
     res.status(500).json({ error: err.message });
   }
 });
+
+// ------------------------ GUARD CERTIFICATIONS ------------------------
+
+app.get('/api/certifications', requireAuth, async (req, res) => {
+  const { tenant_id } = req.query || req.auth;
+  const { user_id } = req.query;
+
+  const effectiveTenantId = tenant_id || req.auth.tenant_id;
+  if (!effectiveTenantId) {
+    return res.status(400).json({ error: 'tenant_id is required' });
+  }
+
+  try {
+    const result = await withTenant(effectiveTenantId, (client) => {
+      if (user_id) {
+        return client.query(
+          `SELECT c.*, u.email as guard_email
+           FROM guard_certifications c
+           JOIN users u ON u.id = c.user_id
+           WHERE c.tenant_id = $1 AND c.user_id = $2
+           ORDER BY c.expiry_date ASC NULLS LAST, c.name ASC`,
+          [effectiveTenantId, user_id]
+        );
+      }
+      return client.query(
+        `SELECT c.*, u.email as guard_email
+         FROM guard_certifications c
+         JOIN users u ON u.id = c.user_id
+         WHERE c.tenant_id = $1
+         ORDER BY c.expiry_date ASC NULLS LAST, c.name ASC`,
+        [effectiveTenantId]
+      );
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/certifications/expiring', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id } = req.query || req.auth;
+  const effectiveTenantId = tenant_id || req.auth.tenant_id;
+  if (!effectiveTenantId) {
+    return res.status(400).json({ error: 'tenant_id is required' });
+  }
+
+  try {
+    const result = await withTenant(effectiveTenantId, async (client) => {
+      const today = new Date();
+      const thirtyDaysLater = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+      const expiringRes = await client.query(
+        `SELECT c.*, u.email as guard_email
+         FROM guard_certifications c
+         JOIN users u ON u.id = c.user_id
+         WHERE c.tenant_id = $1
+           AND c.expiry_date IS NOT NULL
+           AND c.expiry_date <= $2
+         ORDER BY c.expiry_date ASC`,
+        [effectiveTenantId, thirtyDaysLater]
+      );
+
+      const rows = expiringRes.rows.map(row => {
+        const expiryDate = new Date(row.expiry_date);
+        const daysUntilExpiry = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+        return {
+          ...row,
+          days_until_expiry: daysUntilExpiry,
+          is_expired: daysUntilExpiry < 0
+        };
+      });
+
+      return { rows };
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/certifications', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, user_id, name, issuer, issue_date, expiry_date, notes } = req.body;
+  if (!tenant_id || !user_id || !name) {
+    return res.status(400).json({ error: 'tenant_id, user_id, and name are required' });
+  }
+
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `INSERT INTO guard_certifications (tenant_id, user_id, name, issuer, issue_date, expiry_date, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [tenant_id, user_id, name, issuer || null, issue_date || null, expiry_date || null, notes || null]
+      )
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/certifications/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, name, issuer, issue_date, expiry_date, notes } = req.body;
+  if (!tenant_id) {
+    return res.status(400).json({ error: 'tenant_id is required' });
+  }
+
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        `UPDATE guard_certifications
+         SET name = COALESCE($3, name),
+             issuer = COALESCE($4, issuer),
+             issue_date = COALESCE($5, issue_date),
+             expiry_date = COALESCE($6, expiry_date),
+             notes = COALESCE($7, notes)
+         WHERE id = $1 AND tenant_id = $2
+         RETURNING *`,
+        [id, tenant_id, name, issuer, issue_date, expiry_date, notes]
+      )
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Certification not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/certifications/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id } = req.query;
+  if (!tenant_id) {
+    return res.status(400).json({ error: 'tenant_id is required' });
+  }
+
+  try {
+    const result = await withTenant(tenant_id, (client) =>
+      client.query(
+        'DELETE FROM guard_certifications WHERE id = $1 AND tenant_id = $2 RETURNING id',
+        [id, tenant_id]
+      )
+    );
+    res.json({ deleted_count: result.rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------ SERVER START ------------------------
 
 app.listen(PORT, () => {
   console.log(`PatrolSync backend running on port ${PORT}`);

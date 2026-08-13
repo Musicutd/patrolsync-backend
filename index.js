@@ -2240,7 +2240,7 @@ function computeShiftDurationHours(startTime, endTime) {
   return Math.round((difference / 60) * 100) / 100;
 }
 
-function generateShiftDates({ recurrence, start_date, repeat_until, days_of_week }) {
+function generateShiftDates({ recurrence, start_date, repeat_until, days_of_week, days_of_month }) {
   const start = DateTime.fromISO(start_date).startOf('day');
   if (!start.isValid) throw Object.assign(new Error('start_date is invalid'), { statusCode: 400 });
   if (recurrence === 'none') return [start];
@@ -2273,10 +2273,19 @@ function generateShiftDates({ recurrence, start_date, repeat_until, days_of_week
     if (span > MAX_MONTHLY_REPEAT_DAYS) {
       throw Object.assign(new Error(`Monthly recurrence cannot span more than ${MAX_MONTHLY_REPEAT_DAYS} days`), { statusCode: 400 });
     }
-    const day = start.day;
+    if (!Array.isArray(days_of_month) || days_of_month.length === 0) {
+      throw Object.assign(new Error('Select at least one day of the month'), { statusCode: 400 });
+    }
+    const monthDays = [...new Set(days_of_month.map(Number))].filter(day => Number.isInteger(day) && day >= 1 && day <= 31).sort((a, b) => a - b);
+    if (monthDays.length === 0) {
+      throw Object.assign(new Error('days_of_month must contain numbers from 1 to 31'), { statusCode: 400 });
+    }
     for (let month = start.startOf('month'); month <= until && dates.length < MAX_GENERATED_SHIFTS; month = month.plus({ months: 1 })) {
-      const occurrence = month.set({ day: Math.min(day, month.daysInMonth) });
-      if (occurrence >= start && occurrence <= until) dates.push(occurrence);
+      for (const day of monthDays) {
+        if (day > month.daysInMonth) continue;
+        const occurrence = month.set({ day });
+        if (occurrence >= start && occurrence <= until && dates.length < MAX_GENERATED_SHIFTS) dates.push(occurrence);
+      }
     }
     return dates;
   }
@@ -2366,7 +2375,7 @@ app.delete('/api/shift-templates/:id', requireAuth, requireAdmin, async (req, re
 
 app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id, start_date, start_time, end_time, break_minutes,
-    employment_type, recurrence, days_of_week, repeat_until, notes } = req.body;
+    employment_type, recurrence, days_of_week, days_of_month, repeat_until, notes } = req.body;
   if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
     return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
   }
@@ -2379,7 +2388,7 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 720) return res.status(400).json({ error: 'Break must be between 0 and 720 minutes' });
 
   try {
-    const dates = generateShiftDates({ recurrence: recurrenceType, start_date, repeat_until, days_of_week });
+    const dates = generateShiftDates({ recurrence: recurrenceType, start_date, repeat_until, days_of_week, days_of_month });
     if (dates.length === 0) return res.status(400).json({ error: 'No shift dates match the recurrence settings' });
 
     const shifts = await withTenant(tenant_id, async (client) => {

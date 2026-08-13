@@ -174,6 +174,15 @@ async function ensureEmergencyContactColumns() {
 }
 ensureEmergencyContactColumns();
 
+async function ensureSiteGeofenceColumns() {
+  await pool.query(`ALTER TABLE sites ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE sites ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE sites ADD COLUMN IF NOT EXISTS geofence_radius_m INTEGER NOT NULL DEFAULT 150`);
+  await pool.query(`ALTER TABLE sites ADD COLUMN IF NOT EXISTS geofence_enabled BOOLEAN NOT NULL DEFAULT FALSE`);
+  console.log('Site geofence columns ready');
+}
+ensureSiteGeofenceColumns();
+
 async function ensureNotificationsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS notifications (
@@ -434,6 +443,9 @@ async function ensureAttendanceTables() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_one_active_session ON attendance_sessions (tenant_id, user_id) WHERE clocked_out_at IS NULL`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_one_active_break ON attendance_breaks (attendance_session_id) WHERE ended_at IS NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_attendance_history ON attendance_sessions (tenant_id, clocked_in_at DESC)`);
+  await pool.query(`ALTER TABLE attendance_sessions ADD COLUMN IF NOT EXISTS clock_in_distance_m DOUBLE PRECISION`);
+  await pool.query(`ALTER TABLE attendance_sessions ADD COLUMN IF NOT EXISTS clock_in_geofence_radius_m INTEGER`);
+  await pool.query(`ALTER TABLE attendance_sessions ADD COLUMN IF NOT EXISTS clock_in_geofence_verified BOOLEAN`);
   console.log('Attendance tables ready');
 }
 ensureAttendanceTables();
@@ -1697,6 +1709,30 @@ app.get('/api/sites', requireAuth, async (req, res) => {
   }
 });
 
+app.patch('/api/sites/:id/geofence', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = Number(req.body.tenant_id || req.auth.tenant_id);
+  if (tenantId !== Number(req.auth.tenant_id)) return res.status(403).json({ error: 'Tenant access denied' });
+  const enabled = Boolean(req.body.geofence_enabled);
+  const latitude = req.body.latitude === null || req.body.latitude === '' ? null : Number(req.body.latitude);
+  const longitude = req.body.longitude === null || req.body.longitude === '' ? null : Number(req.body.longitude);
+  const radius = Number(req.body.geofence_radius_m);
+  if (enabled && (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180)) {
+    return res.status(400).json({ error: 'Valid latitude and longitude are required when the geofence is enabled' });
+  }
+  if (!Number.isInteger(radius) || radius < 25 || radius > 5000) {
+    return res.status(400).json({ error: 'Geofence radius must be between 25 and 5000 metres' });
+  }
+  try {
+    const result = await withTenant(tenantId, client => client.query(
+      `UPDATE sites SET latitude=$1, longitude=$2, geofence_radius_m=$3, geofence_enabled=$4
+       WHERE id=$5 AND tenant_id=$6 RETURNING *`,
+      [latitude, longitude, radius, enabled, req.params.id, tenantId]
+    ));
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Site not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude, building, floor } = req.body;
   if (!tenant_id || !site_id || !name || !qr_code) {
@@ -1927,7 +1963,7 @@ app.get('/api/guard-assignments', requireAuth, async (req, res) => {
 
   try {
     const result = await withTenant(tenant_id, (client) => {
-      let query = `SELECT ga.*, s.name as site_name, u.email as guard_email
+      let query = `SELECT ga.*, s.name as site_name, s.geofence_enabled, s.geofence_radius_m, u.email as guard_email
                    FROM guard_assignments ga
                    JOIN sites s ON s.id = ga.site_id
                    JOIN users u ON u.id = ga.user_id
@@ -2271,6 +2307,15 @@ function attendanceTenant(req, requestedTenant) {
   return tenantId === Number(req.auth.tenant_id) ? tenantId : null;
 }
 
+function distanceMetres(lat1, lon1, lat2, lon2) {
+  const toRadians = value => value * Math.PI / 180;
+  const earthRadius = 6371000;
+  const deltaLat = toRadians(lat2 - lat1);
+  const deltaLon = toRadians(lon2 - lon1);
+  const a = Math.sin(deltaLat / 2) ** 2 + Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(deltaLon / 2) ** 2;
+  return earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 async function getActiveAttendance(client, tenantId, userId) {
   const result = await client.query(
     `SELECT a.*, s.name AS site_name,
@@ -2307,12 +2352,36 @@ app.post('/api/attendance/clock-in', requireAuth, async (req, res) => {
     await client.query('BEGIN');
     await client.query(`SET LOCAL app.current_tenant = '${tenantId}'`);
     const assignment = await client.query(
-      'SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3',
+      `SELECT s.latitude, s.longitude, s.geofence_radius_m, s.geofence_enabled
+       FROM guard_assignments ga JOIN sites s ON s.id=ga.site_id
+       WHERE ga.tenant_id=$1 AND ga.user_id=$2 AND ga.site_id=$3`,
       [tenantId, req.auth.user_id, site_id]
     );
     if (assignment.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'You are not assigned to this site' });
+    }
+    const site = assignment.rows[0];
+    let clockInDistance = null;
+    let geofenceVerified = null;
+    if (site.geofence_enabled) {
+      if (!Number.isFinite(Number(latitude)) || !Number.isFinite(Number(longitude))) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Location permission is required to clock in at this site', code: 'LOCATION_REQUIRED' });
+      }
+      if (Number.isFinite(Number(accuracy)) && Number(accuracy) > 200) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Your GPS accuracy is too low. Move outdoors or wait for a stronger location signal, then try again.', code: 'LOCATION_INACCURATE', accuracy_m: Math.round(Number(accuracy)) });
+      }
+      clockInDistance = distanceMetres(Number(latitude), Number(longitude), Number(site.latitude), Number(site.longitude));
+      geofenceVerified = clockInDistance <= Number(site.geofence_radius_m);
+      if (!geofenceVerified) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({
+          error: `You are ${Math.round(clockInDistance)}m from the site. Move within the ${site.geofence_radius_m}m clock-in area.`,
+          code: 'OUTSIDE_GEOFENCE', distance_m: Math.round(clockInDistance), radius_m: site.geofence_radius_m
+        });
+      }
     }
     const active = await getActiveAttendance(client, tenantId, req.auth.user_id);
     if (active) {
@@ -2326,10 +2395,12 @@ app.post('/api/attendance/clock-in', requireAuth, async (req, res) => {
     );
     await client.query(
       `INSERT INTO attendance_sessions
-       (tenant_id,user_id,site_id,shift_id,clock_in_latitude,clock_in_longitude,clock_in_accuracy)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+       (tenant_id,user_id,site_id,shift_id,clock_in_latitude,clock_in_longitude,clock_in_accuracy,
+        clock_in_distance_m,clock_in_geofence_radius_m,clock_in_geofence_verified)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
       [tenantId, req.auth.user_id, site_id, scheduledShift.rows[0]?.id || null,
-       latitude ?? null, longitude ?? null, accuracy ?? null]
+       latitude ?? null, longitude ?? null, accuracy ?? null, clockInDistance,
+       site.geofence_enabled ? site.geofence_radius_m : null, geofenceVerified]
     );
     await client.query('COMMIT');
     const session = await withTenant(tenantId, c => getActiveAttendance(c, tenantId, req.auth.user_id));

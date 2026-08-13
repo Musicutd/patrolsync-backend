@@ -379,12 +379,30 @@ async function ensureShiftsTable() {
     )
   `);
   await pool.query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS break_minutes INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS assignment_status TEXT NOT NULL DEFAULT 'assigned'`);
+  await pool.query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS confirmation_status TEXT NOT NULL DEFAULT 'pending'`);
+  await pool.query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_guard_lookup ON shifts (tenant_id, user_id, shift_date)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_site_lookup ON shifts (tenant_id, site_id, shift_date)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_series ON shifts (tenant_id, recurrence_group_id)`);
   console.log('Shifts table ready');
 }
 ensureShiftsTable();
+
+async function ensureShiftSwapRequestsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shift_swap_requests (
+      id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, shift_id INTEGER NOT NULL,
+      requester_id INTEGER NOT NULL, target_user_id INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_recipient', reason TEXT,
+      recipient_responded_at TIMESTAMPTZ, admin_reviewed_at TIMESTAMPTZ,
+      admin_reviewed_by INTEGER, admin_notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swap_requests ON shift_swap_requests (tenant_id,status,created_at DESC)`);
+  console.log('Shift swap requests table ready');
+}
+ensureShiftSwapRequestsTable();
 
 async function ensureShiftTemplatesTable() {
   await pool.query(`
@@ -3009,6 +3027,51 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+app.patch('/api/shifts/:id/confirmation', requireAuth, async (req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can confirm shifts'});
+  const tenantId=attendanceTenant(req,req.body.tenant_id),status=req.body.status;
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!['confirmed','declined'].includes(status))return res.status(400).json({error:'Status must be confirmed or declined'});
+  try{const result=await withTenant(tenantId,client=>client.query(
+    `UPDATE shifts SET confirmation_status=$1,confirmed_at=NOW() WHERE id=$2 AND tenant_id=$3 AND user_id=$4 AND assignment_status='assigned' RETURNING *`,
+    [status,req.params.id,tenantId,req.auth.user_id]));if(!result.rows.length)return res.status(404).json({error:'Shift not found'});res.json(result.rows[0]);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.patch('/api/shifts/:id/make-open',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(
+    `UPDATE shifts SET assignment_status='open',confirmation_status='pending',confirmed_at=NULL WHERE id=$1 AND tenant_id=$2 AND shift_date>=CURRENT_DATE RETURNING *`,
+    [req.params.id,tenantId]));if(!result.rows.length)return res.status(404).json({error:'Future shift not found'});res.json(result.rows[0]);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.get('/api/open-shifts',requireAuth,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(
+    `SELECT sh.*,s.name AS site_name FROM shifts sh JOIN sites s ON s.id=sh.site_id
+     WHERE sh.tenant_id=$1 AND sh.assignment_status='open' AND sh.shift_date>=CURRENT_DATE ORDER BY sh.shift_date,sh.start_time`,[tenantId]));res.json(result.rows.map(s=>({...s,duration_hours:paidShiftHours(s.start_time,s.end_time,s.break_minutes)})));}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.post('/api/open-shifts/:id/claim',requireAuth,async(req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can claim shifts'});const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const client=await pool.connect();try{await client.query('BEGIN');await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);const locked=await client.query("SELECT * FROM shifts WHERE id=$1 AND tenant_id=$2 AND assignment_status='open' FOR UPDATE",[req.params.id,tenantId]);if(!locked.rows.length){await client.query('ROLLBACK');return res.status(409).json({error:'This open shift is no longer available'})}const shift=locked.rows[0];const assigned=await client.query('SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND site_id=$2 AND user_id=$3',[tenantId,shift.site_id,req.auth.user_id]);if(!assigned.rows.length)throw Object.assign(new Error('You must be assigned to this site to claim the shift'),{statusCode:403});const analysis=await analyseProposedShifts(client,tenantId,req.auth.user_id,[DateTime.fromISO(String(shift.shift_date).slice(0,10))],shift.start_time,shift.end_time,shift.break_minutes,shift.id);if(analysis.conflicts.length||analysis.availability_conflicts.length)throw Object.assign(new Error(analysis.availability_conflicts[0]?.message||'This shift conflicts with your schedule'),{statusCode:409});const result=await client.query("UPDATE shifts SET user_id=$1,assignment_status='assigned',confirmation_status='confirmed',confirmed_at=NOW() WHERE id=$2 RETURNING *",[req.auth.user_id,shift.id]);await client.query('COMMIT');res.json({shift:result.rows[0],warnings:analysis.warnings});}catch(err){await client.query('ROLLBACK');res.status(err.statusCode||500).json({error:err.message});}finally{client.release();}
+});
+
+app.post('/api/shift-swaps',requireAuth,async(req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can request swaps'});const tenantId=attendanceTenant(req,req.body.tenant_id);const {shift_id,target_user_id,reason}=req.body;if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(Number(target_user_id)===Number(req.auth.user_id))return res.status(400).json({error:'Choose another guard'});
+  try{const result=await withTenant(tenantId,async client=>{const shift=await client.query("SELECT * FROM shifts WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND assignment_status='assigned' AND shift_date>=CURRENT_DATE",[shift_id,tenantId,req.auth.user_id]);if(!shift.rows.length)throw Object.assign(new Error('Eligible shift not found'),{statusCode:404});const target=await client.query("SELECT 1 FROM users u JOIN guard_assignments ga ON ga.user_id=u.id AND ga.site_id=$1 AND ga.tenant_id=$2 WHERE u.id=$3 AND u.tenant_id=$2 AND u.role='guard'",[shift.rows[0].site_id,tenantId,target_user_id]);if(!target.rows.length)throw Object.assign(new Error('Target guard is not assigned to this site'),{statusCode:400});return client.query("INSERT INTO shift_swap_requests (tenant_id,shift_id,requester_id,target_user_id,reason) VALUES ($1,$2,$3,$4,$5) RETURNING *",[tenantId,shift_id,req.auth.user_id,target_user_id,reason||null])});res.status(201).json(result.rows[0]);}catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.get('/api/shifts/:id/swap-targets',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can request swaps'});const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>client.query(`SELECT DISTINCT u.id,u.email FROM shifts sh JOIN guard_assignments ga ON ga.site_id=sh.site_id AND ga.tenant_id=sh.tenant_id JOIN users u ON u.id=ga.user_id WHERE sh.id=$1 AND sh.tenant_id=$2 AND sh.user_id=$3 AND u.id<>$3 AND u.role='guard' ORDER BY u.email`,[req.params.id,tenantId,req.auth.user_id]));res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
+
+app.get('/api/shift-swaps',requireAuth,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>{let query=`SELECT sw.*,sh.shift_date,sh.start_time,sh.end_time,s.name AS site_name,r.email AS requester_email,t.email AS target_email FROM shift_swap_requests sw JOIN shifts sh ON sh.id=sw.shift_id JOIN sites s ON s.id=sh.site_id JOIN users r ON r.id=sw.requester_id JOIN users t ON t.id=sw.target_user_id WHERE sw.tenant_id=$1`;const params=[tenantId];if(req.auth.role!=='admin'){params.push(req.auth.user_id);query+=` AND (sw.requester_id=$${params.length} OR sw.target_user_id=$${params.length})`}query+=' ORDER BY sw.created_at DESC LIMIT 250';return client.query(query,params)});res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
+
+app.patch('/api/shift-swaps/:id/respond',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can respond'});const tenantId=attendanceTenant(req,req.body.tenant_id),accepted=Boolean(req.body.accepted);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>client.query("UPDATE shift_swap_requests SET status=$1,recipient_responded_at=NOW() WHERE id=$2 AND tenant_id=$3 AND target_user_id=$4 AND status='pending_recipient' RETURNING *",[accepted?'pending_admin':'declined',req.params.id,tenantId,req.auth.user_id]));if(!result.rows.length)return res.status(409).json({error:'Request not found or already answered'});res.json(result.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
+
+app.patch('/api/shift-swaps/:id/review',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),approved=Boolean(req.body.approved);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});const client=await pool.connect();try{await client.query('BEGIN');await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);const swapResult=await client.query("SELECT sw.id AS swap_request_id,sw.shift_id,sw.target_user_id,sh.shift_date,sh.start_time,sh.end_time,sh.break_minutes FROM shift_swap_requests sw JOIN shifts sh ON sh.id=sw.shift_id WHERE sw.id=$1 AND sw.tenant_id=$2 AND sw.status='pending_admin' FOR UPDATE",[req.params.id,tenantId]);if(!swapResult.rows.length)throw Object.assign(new Error('Swap not found or not ready for review'),{statusCode:409});const sw=swapResult.rows[0];if(approved){const analysis=await analyseProposedShifts(client,tenantId,sw.target_user_id,[DateTime.fromISO(String(sw.shift_date).slice(0,10))],sw.start_time,sw.end_time,sw.break_minutes,sw.shift_id);if(analysis.conflicts.length||analysis.availability_conflicts.length)throw Object.assign(new Error(analysis.availability_conflicts[0]?.message||'Target guard now has a schedule conflict'),{statusCode:409});await client.query("UPDATE shifts SET user_id=$1,confirmation_status='confirmed',confirmed_at=NOW() WHERE id=$2",[sw.target_user_id,sw.shift_id]);}await client.query("UPDATE shift_swap_requests SET status=$1,admin_reviewed_at=NOW(),admin_reviewed_by=$2,admin_notes=$3 WHERE id=$4",[approved?'approved':'rejected',req.auth.user_id,req.body.admin_notes||null,sw.swap_request_id]);await client.query('COMMIT');res.json({status:approved?'approved':'rejected'});}catch(err){await client.query('ROLLBACK');res.status(err.statusCode||500).json({error:err.message});}finally{client.release();}});
+
 app.get('/api/shifts', requireAuth, async (req, res) => {
   const { tenant_id, site_id, user_id, start_date, end_date } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
@@ -3024,6 +3087,7 @@ app.get('/api/shifts', requireAuth, async (req, res) => {
                    WHERE sh.tenant_id = $1`;
       const params = [tenant_id];
       if (effectiveUserId) { params.push(effectiveUserId); query += ` AND sh.user_id = $${params.length}`; }
+      if (req.auth.role !== 'admin') query += ` AND sh.assignment_status = 'assigned'`;
       if (site_id) { params.push(site_id); query += ` AND sh.site_id = $${params.length}`; }
       if (start_date) { params.push(start_date); query += ` AND sh.shift_date >= $${params.length}`; }
       if (end_date) { params.push(end_date); query += ` AND sh.shift_date <= $${params.length}`; }

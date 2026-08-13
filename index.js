@@ -450,6 +450,31 @@ async function ensureAttendanceTables() {
 }
 ensureAttendanceTables();
 
+async function ensureTimesheetsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS timesheets (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      period_start DATE NOT NULL,
+      period_end DATE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      session_count INTEGER NOT NULL DEFAULT 0,
+      worked_seconds BIGINT NOT NULL DEFAULT 0,
+      break_seconds BIGINT NOT NULL DEFAULT 0,
+      submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ,
+      reviewed_by INTEGER,
+      review_notes TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id, user_id, period_start, period_end)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_timesheets_review ON timesheets (tenant_id, status, period_start DESC)`);
+  console.log('Timesheets table ready');
+}
+ensureTimesheetsTable();
+
 // ------------------------ COMPLIANCE SWEEP ------------------------
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
@@ -2489,6 +2514,126 @@ app.get('/api/attendance', requireAuth, requireAdmin, async (req, res) => {
       return client.query(query, params);
     });
     res.json(result.rows.map(row => ({ ...row, worked_seconds: Math.max(0, Number(row.elapsed_seconds)-Number(row.break_seconds)) })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ------------------------ TIMESHEETS & APPROVALS ------------------------
+
+function validTimesheetPeriod(start, end) {
+  const startDate = DateTime.fromISO(start).startOf('day');
+  const endDate = DateTime.fromISO(end).startOf('day');
+  return startDate.isValid && endDate.isValid && endDate >= startDate && endDate.diff(startDate, 'days').days <= 31;
+}
+
+async function calculateTimesheet(client, tenantId, userId, periodStart, periodEnd) {
+  const result = await client.query(
+    `SELECT COUNT(*)::int AS session_count,
+       COALESCE(SUM(EXTRACT(EPOCH FROM (a.clocked_out_at-a.clocked_in_at))),0)::bigint AS elapsed_seconds,
+       COALESCE(SUM((SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (b.ended_at-b.started_at))),0)
+                     FROM attendance_breaks b WHERE b.attendance_session_id=a.id AND b.ended_at IS NOT NULL)),0)::bigint AS break_seconds
+     FROM attendance_sessions a
+     WHERE a.tenant_id=$1 AND a.user_id=$2 AND a.clocked_out_at IS NOT NULL
+       AND a.clocked_in_at::date BETWEEN $3 AND $4`,
+    [tenantId, userId, periodStart, periodEnd]
+  );
+  const row = result.rows[0];
+  return {
+    session_count: Number(row.session_count),
+    elapsed_seconds: Number(row.elapsed_seconds),
+    break_seconds: Number(row.break_seconds),
+    worked_seconds: Math.max(0, Number(row.elapsed_seconds) - Number(row.break_seconds))
+  };
+}
+
+app.get('/api/timesheets/preview', requireAuth, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const userId = req.auth.role === 'admin' && req.query.user_id ? Number(req.query.user_id) : req.auth.user_id;
+  if (!validTimesheetPeriod(req.query.period_start, req.query.period_end)) {
+    return res.status(400).json({ error: 'Choose a valid period of no more than 32 days' });
+  }
+  try {
+    const summary = await withTenant(tenantId, client => calculateTimesheet(client, tenantId, userId, req.query.period_start, req.query.period_end));
+    const sessions = await withTenant(tenantId, client => client.query(
+      `SELECT a.*, s.name AS site_name,
+       COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (b.ended_at-b.started_at))) FROM attendance_breaks b WHERE b.attendance_session_id=a.id AND b.ended_at IS NOT NULL),0) AS break_seconds
+       FROM attendance_sessions a JOIN sites s ON s.id=a.site_id
+       WHERE a.tenant_id=$1 AND a.user_id=$2 AND a.clocked_out_at IS NOT NULL
+       AND a.clocked_in_at::date BETWEEN $3 AND $4 ORDER BY a.clocked_in_at`,
+      [tenantId, userId, req.query.period_start, req.query.period_end]
+    ));
+    res.json({ ...summary, sessions: sessions.rows.map(row => ({ ...row, worked_seconds: Math.max(0, (new Date(row.clocked_out_at)-new Date(row.clocked_in_at))/1000-Number(row.break_seconds)) })) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/timesheets/submit', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can submit their timesheets' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  const { period_start, period_end } = req.body;
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!validTimesheetPeriod(period_start, period_end)) return res.status(400).json({ error: 'Choose a valid period of no more than 32 days' });
+  try {
+    const timesheet = await withTenant(tenantId, async client => {
+      const existing = await client.query(
+        'SELECT * FROM timesheets WHERE tenant_id=$1 AND user_id=$2 AND period_start=$3 AND period_end=$4',
+        [tenantId, req.auth.user_id, period_start, period_end]
+      );
+      if (existing.rows[0]?.status === 'approved') throw Object.assign(new Error('This timesheet is approved and locked'), { statusCode: 409 });
+      const open = await client.query(
+        `SELECT 1 FROM attendance_sessions WHERE tenant_id=$1 AND user_id=$2 AND clocked_out_at IS NULL
+         AND clocked_in_at::date BETWEEN $3 AND $4`, [tenantId, req.auth.user_id, period_start, period_end]
+      );
+      if (open.rows.length) throw Object.assign(new Error('Clock out before submitting this timesheet'), { statusCode: 409 });
+      const summary = await calculateTimesheet(client, tenantId, req.auth.user_id, period_start, period_end);
+      if (summary.session_count === 0) throw Object.assign(new Error('There are no completed attendance sessions in this period'), { statusCode: 400 });
+      const result = await client.query(
+        `INSERT INTO timesheets (tenant_id,user_id,period_start,period_end,status,session_count,worked_seconds,break_seconds,submitted_at,reviewed_at,reviewed_by,review_notes)
+         VALUES ($1,$2,$3,$4,'submitted',$5,$6,$7,NOW(),NULL,NULL,NULL)
+         ON CONFLICT (tenant_id,user_id,period_start,period_end) DO UPDATE SET
+           status='submitted',session_count=EXCLUDED.session_count,worked_seconds=EXCLUDED.worked_seconds,
+           break_seconds=EXCLUDED.break_seconds,submitted_at=NOW(),reviewed_at=NULL,reviewed_by=NULL,review_notes=NULL,updated_at=NOW()
+         RETURNING *`,
+        [tenantId, req.auth.user_id, period_start, period_end, summary.session_count, summary.worked_seconds, summary.break_seconds]
+      );
+      return result.rows[0];
+    });
+    res.status(201).json(timesheet);
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
+});
+
+app.get('/api/timesheets', requireAuth, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  try {
+    const result = await withTenant(tenantId, client => {
+      let query = `SELECT t.*, u.email AS guard_email, reviewer.email AS reviewer_email
+                   FROM timesheets t JOIN users u ON u.id=t.user_id LEFT JOIN users reviewer ON reviewer.id=t.reviewed_by
+                   WHERE t.tenant_id=$1`;
+      const params = [tenantId];
+      if (req.auth.role !== 'admin') { params.push(req.auth.user_id); query += ` AND t.user_id=$${params.length}`; }
+      else if (req.query.user_id) { params.push(req.query.user_id); query += ` AND t.user_id=$${params.length}`; }
+      if (req.query.status) { params.push(req.query.status); query += ` AND t.status=$${params.length}`; }
+      query += ' ORDER BY t.period_start DESC, t.submitted_at DESC LIMIT 250';
+      return client.query(query, params);
+    });
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/timesheets/:id/review', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  const { status, review_notes } = req.body;
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!['approved','rejected'].includes(status)) return res.status(400).json({ error: 'Status must be approved or rejected' });
+  if (status === 'rejected' && !String(review_notes || '').trim()) return res.status(400).json({ error: 'Add a reason when rejecting a timesheet' });
+  try {
+    const result = await withTenant(tenantId, client => client.query(
+      `UPDATE timesheets SET status=$1,review_notes=$2,reviewed_at=NOW(),reviewed_by=$3,updated_at=NOW()
+       WHERE id=$4 AND tenant_id=$5 AND status='submitted' RETURNING *`,
+      [status, String(review_notes || '').trim() || null, req.auth.user_id, req.params.id, tenantId]
+    ));
+    if (!result.rows.length) return res.status(409).json({ error: 'Timesheet not found or already reviewed' });
+    res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

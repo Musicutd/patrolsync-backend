@@ -2708,6 +2708,57 @@ function validTemplateColor(color) {
   return /^#[0-9a-f]{6}$/i.test(color || '');
 }
 
+const WEEKLY_OVERTIME_WARNING_HOURS = 40;
+
+function shiftInterval(date, startTime, endTime) {
+  const day = typeof date === 'string' ? date.slice(0, 10) : DateTime.fromJSDate(date).toISODate();
+  const start = DateTime.fromISO(day + 'T' + startTime);
+  let end = DateTime.fromISO(day + 'T' + endTime);
+  if (end <= start) end = end.plus({ days: 1 });
+  return { start, end };
+}
+
+function paidShiftHours(startTime, endTime, breakMinutes) {
+  return Math.max(0, computeShiftDurationHours(startTime, endTime) - Number(breakMinutes || 0) / 60);
+}
+
+async function analyseProposedShifts(client, tenantId, userId, dates, startTime, endTime, breakMinutes, excludeShiftId = null) {
+  const proposed = dates.map(date => ({ date: date.toISODate(), ...shiftInterval(date.toISODate(), startTime, endTime) }));
+  const firstDate = proposed[0].start.startOf('week').minus({ days: 1 }).toISODate();
+  const lastDate = proposed[proposed.length - 1].end.endOf('week').plus({ days: 1 }).toISODate();
+  const existingResult = await client.query(
+    `SELECT sh.*, s.name AS site_name FROM shifts sh JOIN sites s ON s.id=sh.site_id
+     WHERE sh.tenant_id=$1 AND sh.user_id=$2 AND sh.shift_date BETWEEN $3 AND $4
+       AND ($5::int IS NULL OR sh.id <> $5)
+     ORDER BY sh.shift_date, sh.start_time`, [tenantId, userId, firstDate, lastDate, excludeShiftId]
+  );
+  const existing = existingResult.rows.map(shift => ({ ...shift, ...shiftInterval(shift.shift_date, shift.start_time, shift.end_time) }));
+  const conflicts = [];
+  for (const candidate of proposed) {
+    for (const shift of existing) {
+      if (candidate.start < shift.end && candidate.end > shift.start) {
+        conflicts.push({ proposed_date: candidate.date, existing_shift_id: shift.id, existing_date: String(shift.shift_date).slice(0,10), existing_time: shift.start_time + '–' + shift.end_time, site_name: shift.site_name });
+      }
+    }
+  }
+
+  const weeklyHours = new Map();
+  for (const shift of existing) {
+    const week = shift.start.startOf('week').toISODate();
+    weeklyHours.set(week, (weeklyHours.get(week) || 0) + paidShiftHours(shift.start_time, shift.end_time, shift.break_minutes));
+  }
+  const candidateHours = paidShiftHours(startTime, endTime, breakMinutes);
+  for (const candidate of proposed) {
+    const week = candidate.start.startOf('week').toISODate();
+    weeklyHours.set(week, (weeklyHours.get(week) || 0) + candidateHours);
+  }
+  const warnings = [...weeklyHours.entries()]
+    .filter(([, hours]) => hours > WEEKLY_OVERTIME_WARNING_HOURS)
+    .map(([week_start, hours]) => ({ type: 'overtime', week_start, scheduled_hours: Math.round(hours * 100) / 100, threshold_hours: WEEKLY_OVERTIME_WARNING_HOURS,
+      message: `Week of ${week_start}: ${Math.round(hours * 100) / 100} scheduled hours exceeds the ${WEEKLY_OVERTIME_WARNING_HOURS}-hour threshold.` }));
+  return { conflicts, warnings, proposed_count: proposed.length };
+}
+
 app.get('/api/shift-templates', requireAuth, requireAdmin, async (req, res) => {
   const tenantId = req.query.tenant_id || req.auth.tenant_id;
   if (!tenantId) return res.status(400).json({ error: 'tenant_id is required' });
@@ -2787,7 +2838,7 @@ app.delete('/api/shift-templates/:id', requireAuth, requireAdmin, async (req, re
 
 app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id, start_date, start_time, end_time, break_minutes,
-    employment_type, recurrence, days_of_week, days_of_month, repeat_until, notes } = req.body;
+    employment_type, recurrence, days_of_week, days_of_month, repeat_until, notes, dry_run } = req.body;
   if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
     return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
   }
@@ -2809,6 +2860,16 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       const site = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
       if (site.rows.length === 0) throw Object.assign(new Error('Site not found for this tenant'), { statusCode: 404 });
 
+      const analysis = await analyseProposedShifts(client, tenant_id, user_id, dates, start_time, end_time, breakMinutes);
+      if (analysis.conflicts.length > 0) {
+        const err = new Error(`Cannot create shifts: ${analysis.conflicts.length} overlap with the guard's existing schedule.`);
+        err.statusCode = 409;
+        err.code = 'SHIFT_CONFLICT';
+        err.conflicts = analysis.conflicts;
+        throw err;
+      }
+      if (dry_run) return { dryRun: true, analysis };
+
       const seriesId = recurrenceType === 'none' ? null : crypto.randomUUID();
       const inserted = [];
       for (const date of dates) {
@@ -2819,11 +2880,12 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
         );
         inserted.push(result.rows[0]);
       }
-      return inserted;
+      return { inserted, analysis };
     });
-    res.status(201).json({ created_count: shifts.length, recurrence_group_id: shifts[0].recurrence_group_id, shifts });
+    if (shifts.dryRun) return res.json({ valid: true, ...shifts.analysis });
+    res.status(201).json({ created_count: shifts.inserted.length, recurrence_group_id: shifts.inserted[0].recurrence_group_id, shifts: shifts.inserted, warnings: shifts.analysis.warnings });
   } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts });
   }
 });
 
@@ -2863,17 +2925,31 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
   if (end_time && !TIME_FORMAT_REGEX.test(end_time)) return res.status(400).json({ error: 'end_time must use HH:MM format' });
   const employmentType = employment_type && ['full_time', 'part_time'].includes(employment_type) ? employment_type : null;
   try {
-    const result = await withTenant(tenant_id, (client) => client.query(
-      `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
-       start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
-       break_minutes = COALESCE($5, break_minutes), employment_type = COALESCE($6, employment_type), notes = $7
-       WHERE id = $8 AND tenant_id = $9 RETURNING *`,
-      [site_id || null, shift_date || null, start_time || null, end_time || null,
-       break_minutes === undefined ? null : Number(break_minutes), employmentType, notes ?? null, id, tenant_id]
-    ));
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
-    res.json(result.rows[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const result = await withTenant(tenant_id, async client => {
+      const currentResult = await client.query('SELECT * FROM shifts WHERE id=$1 AND tenant_id=$2', [id, tenant_id]);
+      if (!currentResult.rows.length) throw Object.assign(new Error('Shift not found'), { statusCode: 404 });
+      const current = currentResult.rows[0];
+      const nextDate = shift_date || String(current.shift_date).slice(0,10);
+      const nextStart = start_time || current.start_time;
+      const nextEnd = end_time || current.end_time;
+      const nextBreak = break_minutes === undefined ? current.break_minutes : Number(break_minutes);
+      const analysis = await analyseProposedShifts(client, tenant_id, current.user_id, [DateTime.fromISO(nextDate)], nextStart, nextEnd, nextBreak, Number(id));
+      if (analysis.conflicts.length) {
+        const err = new Error('Cannot save this shift because it overlaps the guard\'s existing schedule.');
+        err.statusCode = 409; err.code = 'SHIFT_CONFLICT'; err.conflicts = analysis.conflicts; throw err;
+      }
+      const updated = await client.query(
+        `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
+         start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
+         break_minutes = COALESCE($5, break_minutes), employment_type = COALESCE($6, employment_type), notes = $7
+         WHERE id = $8 AND tenant_id = $9 RETURNING *`,
+        [site_id || null, shift_date || null, start_time || null, end_time || null,
+         break_minutes === undefined ? null : Number(break_minutes), employmentType, notes ?? null, id, tenant_id]
+      );
+      return { shift: updated.rows[0], warnings: analysis.warnings };
+    });
+    res.json(result);
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts }); }
 });
 
 app.delete('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {

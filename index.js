@@ -399,6 +399,45 @@ async function ensureShiftTemplatesTable() {
 }
 ensureShiftTemplatesTable();
 
+async function ensureAttendanceTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_sessions (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      shift_id INTEGER,
+      clocked_in_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      clocked_out_at TIMESTAMPTZ,
+      clock_in_latitude DOUBLE PRECISION,
+      clock_in_longitude DOUBLE PRECISION,
+      clock_in_accuracy DOUBLE PRECISION,
+      clock_out_latitude DOUBLE PRECISION,
+      clock_out_longitude DOUBLE PRECISION,
+      clock_out_accuracy DOUBLE PRECISION,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_breaks (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      attendance_session_id INTEGER NOT NULL,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at TIMESTAMPTZ,
+      start_latitude DOUBLE PRECISION,
+      start_longitude DOUBLE PRECISION,
+      end_latitude DOUBLE PRECISION,
+      end_longitude DOUBLE PRECISION
+    )
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_one_active_session ON attendance_sessions (tenant_id, user_id) WHERE clocked_out_at IS NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_one_active_break ON attendance_breaks (attendance_session_id) WHERE ended_at IS NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_attendance_history ON attendance_sessions (tenant_id, clocked_in_at DESC)`);
+  console.log('Attendance tables ready');
+}
+ensureAttendanceTables();
+
 // ------------------------ COMPLIANCE SWEEP ------------------------
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
@@ -2223,6 +2262,163 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ------------------------ ATTENDANCE / TIME CLOCK ------------------------
+
+function attendanceTenant(req, requestedTenant) {
+  const tenantId = Number(requestedTenant || req.auth.tenant_id);
+  return tenantId === Number(req.auth.tenant_id) ? tenantId : null;
+}
+
+async function getActiveAttendance(client, tenantId, userId) {
+  const result = await client.query(
+    `SELECT a.*, s.name AS site_name,
+       b.id AS active_break_id, b.started_at AS break_started_at,
+       COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(ab.ended_at, NOW()) - ab.started_at)))
+                 FROM attendance_breaks ab WHERE ab.attendance_session_id = a.id), 0) AS break_seconds
+     FROM attendance_sessions a
+     JOIN sites s ON s.id = a.site_id
+     LEFT JOIN attendance_breaks b ON b.attendance_session_id = a.id AND b.ended_at IS NULL
+     WHERE a.tenant_id = $1 AND a.user_id = $2 AND a.clocked_out_at IS NULL`,
+    [tenantId, userId]
+  );
+  return result.rows[0] || null;
+}
+
+app.get('/api/attendance/current', requireAuth, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const userId = req.auth.role === 'admin' && req.query.user_id ? Number(req.query.user_id) : req.auth.user_id;
+  try {
+    const session = await withTenant(tenantId, client => getActiveAttendance(client, tenantId, userId));
+    res.json({ active: Boolean(session), session });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/attendance/clock-in', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can clock in' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  const { site_id, latitude, longitude, accuracy } = req.body;
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!site_id) return res.status(400).json({ error: 'Select a site before clocking in' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL app.current_tenant = '${tenantId}'`);
+    const assignment = await client.query(
+      'SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3',
+      [tenantId, req.auth.user_id, site_id]
+    );
+    if (assignment.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'You are not assigned to this site' });
+    }
+    const active = await getActiveAttendance(client, tenantId, req.auth.user_id);
+    if (active) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'You are already clocked in', session: active });
+    }
+    const scheduledShift = await client.query(
+      `SELECT id FROM shifts WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3
+       AND shift_date = CURRENT_DATE ORDER BY start_time LIMIT 1`,
+      [tenantId, req.auth.user_id, site_id]
+    );
+    await client.query(
+      `INSERT INTO attendance_sessions
+       (tenant_id,user_id,site_id,shift_id,clock_in_latitude,clock_in_longitude,clock_in_accuracy)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [tenantId, req.auth.user_id, site_id, scheduledShift.rows[0]?.id || null,
+       latitude ?? null, longitude ?? null, accuracy ?? null]
+    );
+    await client.query('COMMIT');
+    const session = await withTenant(tenantId, c => getActiveAttendance(c, tenantId, req.auth.user_id));
+    res.status(201).json({ active: true, session });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.code === '23505' ? 409 : 500).json({ error: err.code === '23505' ? 'You are already clocked in' : err.message });
+  } finally { client.release(); }
+});
+
+app.post('/api/attendance/break/start', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can manage breaks' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  try {
+    const result = await withTenant(tenantId, async client => {
+      const active = await getActiveAttendance(client, tenantId, req.auth.user_id);
+      if (!active) throw Object.assign(new Error('Clock in before starting a break'), { statusCode: 409 });
+      if (active.active_break_id) throw Object.assign(new Error('A break is already active'), { statusCode: 409 });
+      await client.query(
+        `INSERT INTO attendance_breaks (tenant_id,attendance_session_id,start_latitude,start_longitude)
+         VALUES ($1,$2,$3,$4)`,
+        [tenantId, active.id, req.body.latitude ?? null, req.body.longitude ?? null]
+      );
+      return getActiveAttendance(client, tenantId, req.auth.user_id);
+    });
+    res.status(201).json({ active: true, session: result });
+  } catch (err) { res.status(err.statusCode || (err.code === '23505' ? 409 : 500)).json({ error: err.message }); }
+});
+
+app.post('/api/attendance/break/end', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can manage breaks' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  try {
+    const session = await withTenant(tenantId, async client => {
+      const active = await getActiveAttendance(client, tenantId, req.auth.user_id);
+      if (!active || !active.active_break_id) throw Object.assign(new Error('No active break found'), { statusCode: 409 });
+      await client.query(
+        `UPDATE attendance_breaks SET ended_at=NOW(), end_latitude=$1, end_longitude=$2
+         WHERE id=$3 AND tenant_id=$4 AND ended_at IS NULL`,
+        [req.body.latitude ?? null, req.body.longitude ?? null, active.active_break_id, tenantId]
+      );
+      return getActiveAttendance(client, tenantId, req.auth.user_id);
+    });
+    res.json({ active: true, session });
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
+});
+
+app.post('/api/attendance/clock-out', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can clock out' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  try {
+    const completed = await withTenant(tenantId, async client => {
+      const active = await getActiveAttendance(client, tenantId, req.auth.user_id);
+      if (!active) throw Object.assign(new Error('No active attendance session found'), { statusCode: 409 });
+      if (active.active_break_id) await client.query('UPDATE attendance_breaks SET ended_at=NOW() WHERE id=$1', [active.active_break_id]);
+      const result = await client.query(
+        `UPDATE attendance_sessions SET clocked_out_at=NOW(), clock_out_latitude=$1,
+         clock_out_longitude=$2, clock_out_accuracy=$3 WHERE id=$4 AND tenant_id=$5 RETURNING *`,
+        [req.body.latitude ?? null, req.body.longitude ?? null, req.body.accuracy ?? null, active.id, tenantId]
+      );
+      return result.rows[0];
+    });
+    res.json({ active: false, session: completed });
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
+});
+
+app.get('/api/attendance', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  try {
+    const result = await withTenant(tenantId, client => {
+      let query = `SELECT a.*, u.email AS guard_email, s.name AS site_name,
+        COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(b.ended_at,NOW())-b.started_at))) FROM attendance_breaks b WHERE b.attendance_session_id=a.id),0) AS break_seconds,
+        EXTRACT(EPOCH FROM (COALESCE(a.clocked_out_at,NOW())-a.clocked_in_at)) AS elapsed_seconds,
+        EXISTS(SELECT 1 FROM attendance_breaks active_break WHERE active_break.attendance_session_id=a.id AND active_break.ended_at IS NULL) AS on_break
+        FROM attendance_sessions a JOIN users u ON u.id=a.user_id JOIN sites s ON s.id=a.site_id
+        WHERE a.tenant_id=$1`;
+      const params = [tenantId];
+      if (req.query.date) { params.push(req.query.date); query += ` AND a.clocked_in_at::date=$${params.length}`; }
+      if (req.query.user_id) { params.push(req.query.user_id); query += ` AND a.user_id=$${params.length}`; }
+      if (req.query.site_id) { params.push(req.query.site_id); query += ` AND a.site_id=$${params.length}`; }
+      query += ' ORDER BY a.clocked_in_at DESC LIMIT 500';
+      return client.query(query, params);
+    });
+    res.json(result.rows.map(row => ({ ...row, worked_seconds: Math.max(0, Number(row.elapsed_seconds)-Number(row.break_seconds)) })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ------------------------ SHIFT SCHEDULING ------------------------

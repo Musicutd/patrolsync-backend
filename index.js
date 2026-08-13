@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const { DateTime } = require('luxon');
 const QRCode = require('qrcode');
 const PDFDocument = require('pdfkit');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -349,6 +350,30 @@ async function ensureGuardCertificationsTable() {
   console.log('Guard certifications table ready');
 }
 ensureGuardCertificationsTable();
+
+// Shift scheduling table
+async function ensureShiftsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shifts (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      shift_date DATE NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      employment_type TEXT NOT NULL DEFAULT 'full_time',
+      recurrence_group_id TEXT,
+      notes TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_guard_lookup ON shifts (tenant_id, user_id, shift_date)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_site_lookup ON shifts (tenant_id, site_id, shift_date)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_series ON shifts (tenant_id, recurrence_group_id)`);
+  console.log('Shifts table ready');
+}
+ensureShiftsTable();
 
 // ------------------------ COMPLIANCE SWEEP ------------------------
 
@@ -2174,6 +2199,176 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ------------------------ SHIFT SCHEDULING ------------------------
+
+const TIME_FORMAT_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const MAX_WEEKLY_REPEAT_DAYS = 182;
+const MAX_MONTHLY_REPEAT_DAYS = 366;
+const MAX_GENERATED_SHIFTS = 250;
+
+function computeShiftDurationHours(startTime, endTime) {
+  const [startHour, startMinute] = startTime.split(':').map(Number);
+  const [endHour, endMinute] = endTime.split(':').map(Number);
+  let difference = (endHour * 60 + endMinute) - (startHour * 60 + startMinute);
+  if (difference <= 0) difference += 24 * 60;
+  return Math.round((difference / 60) * 100) / 100;
+}
+
+function generateShiftDates({ recurrence, start_date, repeat_until, days_of_week }) {
+  const start = DateTime.fromISO(start_date).startOf('day');
+  if (!start.isValid) throw Object.assign(new Error('start_date is invalid'), { statusCode: 400 });
+  if (recurrence === 'none') return [start];
+
+  if (!repeat_until) {
+    throw Object.assign(new Error('repeat_until is required for recurring shifts'), { statusCode: 400 });
+  }
+  const until = DateTime.fromISO(repeat_until).startOf('day');
+  if (!until.isValid || until < start) {
+    throw Object.assign(new Error('repeat_until must be on or after start_date'), { statusCode: 400 });
+  }
+
+  const span = until.diff(start, 'days').days;
+  const dates = [];
+  if (recurrence === 'weekly') {
+    if (span > MAX_WEEKLY_REPEAT_DAYS) {
+      throw Object.assign(new Error(`Weekly recurrence cannot span more than ${MAX_WEEKLY_REPEAT_DAYS} days`), { statusCode: 400 });
+    }
+    if (!Array.isArray(days_of_week) || days_of_week.length === 0) {
+      throw Object.assign(new Error('Select at least one day for weekly recurrence'), { statusCode: 400 });
+    }
+    const weekdays = new Set(days_of_week.map(day => Number(day) === 0 ? 7 : Number(day)));
+    for (let date = start; date <= until && dates.length < MAX_GENERATED_SHIFTS; date = date.plus({ days: 1 })) {
+      if (weekdays.has(date.weekday)) dates.push(date);
+    }
+    return dates;
+  }
+
+  if (recurrence === 'monthly') {
+    if (span > MAX_MONTHLY_REPEAT_DAYS) {
+      throw Object.assign(new Error(`Monthly recurrence cannot span more than ${MAX_MONTHLY_REPEAT_DAYS} days`), { statusCode: 400 });
+    }
+    const day = start.day;
+    for (let month = start.startOf('month'); month <= until && dates.length < MAX_GENERATED_SHIFTS; month = month.plus({ months: 1 })) {
+      const occurrence = month.set({ day: Math.min(day, month.daysInMonth) });
+      if (occurrence >= start && occurrence <= until) dates.push(occurrence);
+    }
+    return dates;
+  }
+  throw Object.assign(new Error('recurrence must be none, weekly, or monthly'), { statusCode: 400 });
+}
+
+app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, user_id, start_date, start_time, end_time,
+    employment_type, recurrence, days_of_week, repeat_until, notes } = req.body;
+  if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
+    return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
+  }
+  if (!TIME_FORMAT_REGEX.test(start_time) || !TIME_FORMAT_REGEX.test(end_time)) {
+    return res.status(400).json({ error: 'Start and end time must use HH:MM format' });
+  }
+  const employmentType = ['full_time', 'part_time'].includes(employment_type) ? employment_type : 'full_time';
+  const recurrenceType = ['none', 'weekly', 'monthly'].includes(recurrence) ? recurrence : 'none';
+
+  try {
+    const dates = generateShiftDates({ recurrence: recurrenceType, start_date, repeat_until, days_of_week });
+    if (dates.length === 0) return res.status(400).json({ error: 'No shift dates match the recurrence settings' });
+
+    const shifts = await withTenant(tenant_id, async (client) => {
+      const guard = await client.query("SELECT id FROM users WHERE id = $1 AND tenant_id = $2 AND role = 'guard'", [user_id, tenant_id]);
+      if (guard.rows.length === 0) throw Object.assign(new Error('Guard not found for this tenant'), { statusCode: 404 });
+      const site = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
+      if (site.rows.length === 0) throw Object.assign(new Error('Site not found for this tenant'), { statusCode: 404 });
+
+      const seriesId = recurrenceType === 'none' ? null : crypto.randomUUID();
+      const inserted = [];
+      for (const date of dates) {
+        const result = await client.query(
+          `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, employment_type, recurrence_group_id, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+          [tenant_id, site_id, user_id, date.toISODate(), start_time, end_time, employmentType, seriesId, notes || null]
+        );
+        inserted.push(result.rows[0]);
+      }
+      return inserted;
+    });
+    res.status(201).json({ created_count: shifts.length, recurrence_group_id: shifts[0].recurrence_group_id, shifts });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
+app.get('/api/shifts', requireAuth, async (req, res) => {
+  const { tenant_id, site_id, user_id, start_date, end_date } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  if (req.auth.role !== 'admin' && user_id && Number(user_id) !== req.auth.user_id) {
+    return res.status(403).json({ error: 'Guards can only view their own shifts' });
+  }
+  const effectiveUserId = req.auth.role === 'admin' ? user_id : req.auth.user_id;
+
+  try {
+    const result = await withTenant(tenant_id, (client) => {
+      let query = `SELECT sh.*, u.email AS guard_email, s.name AS site_name
+                   FROM shifts sh JOIN users u ON u.id = sh.user_id JOIN sites s ON s.id = sh.site_id
+                   WHERE sh.tenant_id = $1`;
+      const params = [tenant_id];
+      if (effectiveUserId) { params.push(effectiveUserId); query += ` AND sh.user_id = $${params.length}`; }
+      if (site_id) { params.push(site_id); query += ` AND sh.site_id = $${params.length}`; }
+      if (start_date) { params.push(start_date); query += ` AND sh.shift_date >= $${params.length}`; }
+      if (end_date) { params.push(end_date); query += ` AND sh.shift_date <= $${params.length}`; }
+      if (!start_date && !end_date) query += ' AND sh.shift_date >= CURRENT_DATE';
+      query += ' ORDER BY sh.shift_date ASC, sh.start_time ASC LIMIT 500';
+      return client.query(query, params);
+    });
+    res.json(result.rows.map(shift => ({ ...shift, duration_hours: computeShiftDurationHours(shift.start_time, shift.end_time) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { tenant_id, site_id, shift_date, start_time, end_time, employment_type, notes } = req.body;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
+  if (start_time && !TIME_FORMAT_REGEX.test(start_time)) return res.status(400).json({ error: 'start_time must use HH:MM format' });
+  if (end_time && !TIME_FORMAT_REGEX.test(end_time)) return res.status(400).json({ error: 'end_time must use HH:MM format' });
+  const employmentType = employment_type && ['full_time', 'part_time'].includes(employment_type) ? employment_type : null;
+  try {
+    const result = await withTenant(tenant_id, (client) => client.query(
+      `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
+       start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
+       employment_type = COALESCE($5, employment_type), notes = $6
+       WHERE id = $7 AND tenant_id = $8 RETURNING *`,
+      [site_id || null, shift_date || null, start_time || null, end_time || null, employmentType, notes ?? null, id, tenant_id]
+    ));
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => client.query(
+      'DELETE FROM shifts WHERE id = $1 AND tenant_id = $2 RETURNING *', [req.params.id, tenant_id]
+    ));
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
+    res.json({ deleted: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/shifts/series/:recurrenceGroupId', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id } = req.query;
+  if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
+  try {
+    const result = await withTenant(tenant_id, (client) => client.query(
+      'DELETE FROM shifts WHERE tenant_id = $1 AND recurrence_group_id = $2 AND shift_date >= CURRENT_DATE RETURNING id',
+      [tenant_id, req.params.recurrenceGroupId]
+    ));
+    res.json({ deleted_count: result.rows.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ------------------------ GUARD CERTIFICATIONS ------------------------

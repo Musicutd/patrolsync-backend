@@ -362,18 +362,42 @@ async function ensureShiftsTable() {
       shift_date DATE NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
+      break_minutes INTEGER NOT NULL DEFAULT 0,
       employment_type TEXT NOT NULL DEFAULT 'full_time',
       recurrence_group_id TEXT,
       notes TEXT,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS break_minutes INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_guard_lookup ON shifts (tenant_id, user_id, shift_date)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_site_lookup ON shifts (tenant_id, site_id, shift_date)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_shifts_series ON shifts (tenant_id, recurrence_group_id)`);
   console.log('Shifts table ready');
 }
 ensureShiftsTable();
+
+async function ensureShiftTemplatesTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shift_templates (
+      id SERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      site_id INTEGER,
+      name TEXT NOT NULL,
+      color TEXT NOT NULL DEFAULT '#2563eb',
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      break_minutes INTEGER NOT NULL DEFAULT 0,
+      employment_type TEXT NOT NULL DEFAULT 'full_time',
+      notes TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_shift_templates_tenant ON shift_templates (tenant_id, name)`);
+  console.log('Shift templates table ready');
+}
+ensureShiftTemplatesTable();
 
 // ------------------------ COMPLIANCE SWEEP ------------------------
 
@@ -2259,8 +2283,89 @@ function generateShiftDates({ recurrence, start_date, repeat_until, days_of_week
   throw Object.assign(new Error('recurrence must be none, weekly, or monthly'), { statusCode: 400 });
 }
 
+function validTemplateColor(color) {
+  return /^#[0-9a-f]{6}$/i.test(color || '');
+}
+
+app.get('/api/shift-templates', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = req.query.tenant_id || req.auth.tenant_id;
+  if (!tenantId) return res.status(400).json({ error: 'tenant_id is required' });
+  try {
+    const result = await withTenant(tenantId, (client) => client.query(
+      `SELECT st.*, s.name AS site_name
+       FROM shift_templates st LEFT JOIN sites s ON s.id = st.site_id
+       WHERE st.tenant_id = $1 ORDER BY st.name ASC`, [tenantId]
+    ));
+    res.json(result.rows.map(template => ({
+      ...template,
+      paid_hours: Math.max(0, Math.round((computeShiftDurationHours(template.start_time, template.end_time) - template.break_minutes / 60) * 100) / 100)
+    })));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/shift-templates', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, name, color, start_time, end_time, break_minutes, employment_type, notes } = req.body;
+  if (!tenant_id || !name || !start_time || !end_time) {
+    return res.status(400).json({ error: 'tenant_id, name, start_time, and end_time are required' });
+  }
+  if (!TIME_FORMAT_REGEX.test(start_time) || !TIME_FORMAT_REGEX.test(end_time)) {
+    return res.status(400).json({ error: 'Start and end time must use HH:MM format' });
+  }
+  const breakMinutes = Number(break_minutes || 0);
+  if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 720) {
+    return res.status(400).json({ error: 'Break must be between 0 and 720 minutes' });
+  }
+  const templateColor = validTemplateColor(color) ? color : '#2563eb';
+  const employmentType = ['full_time', 'part_time'].includes(employment_type) ? employment_type : 'full_time';
+  try {
+    const result = await withTenant(tenant_id, async (client) => {
+      if (site_id) {
+        const site = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
+        if (site.rows.length === 0) throw Object.assign(new Error('Site not found for this tenant'), { statusCode: 404 });
+      }
+      return client.query(
+        `INSERT INTO shift_templates (tenant_id, site_id, name, color, start_time, end_time, break_minutes, employment_type, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [tenant_id, site_id || null, name.trim(), templateColor, start_time, end_time, breakMinutes, employmentType, notes || null]
+      );
+    });
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
+});
+
+app.patch('/api/shift-templates/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { tenant_id, site_id, name, color, start_time, end_time, break_minutes, employment_type, notes } = req.body;
+  if (!tenant_id || !name || !start_time || !end_time) return res.status(400).json({ error: 'All required template fields must be supplied' });
+  if (!TIME_FORMAT_REGEX.test(start_time) || !TIME_FORMAT_REGEX.test(end_time)) return res.status(400).json({ error: 'Start and end time must use HH:MM format' });
+  const breakMinutes = Number(break_minutes || 0);
+  if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 720) return res.status(400).json({ error: 'Break must be between 0 and 720 minutes' });
+  try {
+    const result = await withTenant(tenant_id, (client) => client.query(
+      `UPDATE shift_templates SET site_id=$1, name=$2, color=$3, start_time=$4, end_time=$5,
+       break_minutes=$6, employment_type=$7, notes=$8, updated_at=NOW()
+       WHERE id=$9 AND tenant_id=$10 RETURNING *`,
+      [site_id || null, name.trim(), validTemplateColor(color) ? color : '#2563eb', start_time, end_time,
+       breakMinutes, ['full_time','part_time'].includes(employment_type) ? employment_type : 'full_time', notes || null, req.params.id, tenant_id]
+    ));
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Template not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/shift-templates/:id', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = req.query.tenant_id;
+  if (!tenantId) return res.status(400).json({ error: 'tenant_id is required' });
+  try {
+    const result = await withTenant(tenantId, (client) => client.query(
+      'DELETE FROM shift_templates WHERE id=$1 AND tenant_id=$2 RETURNING id', [req.params.id, tenantId]
+    ));
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Template not found' });
+    res.json({ deleted: result.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, site_id, user_id, start_date, start_time, end_time,
+  const { tenant_id, site_id, user_id, start_date, start_time, end_time, break_minutes,
     employment_type, recurrence, days_of_week, repeat_until, notes } = req.body;
   if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
     return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
@@ -2270,6 +2375,8 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   }
   const employmentType = ['full_time', 'part_time'].includes(employment_type) ? employment_type : 'full_time';
   const recurrenceType = ['none', 'weekly', 'monthly'].includes(recurrence) ? recurrence : 'none';
+  const breakMinutes = Number(break_minutes || 0);
+  if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 720) return res.status(400).json({ error: 'Break must be between 0 and 720 minutes' });
 
   try {
     const dates = generateShiftDates({ recurrence: recurrenceType, start_date, repeat_until, days_of_week });
@@ -2285,9 +2392,9 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       const inserted = [];
       for (const date of dates) {
         const result = await client.query(
-          `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, employment_type, recurrence_group_id, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-          [tenant_id, site_id, user_id, date.toISODate(), start_time, end_time, employmentType, seriesId, notes || null]
+          `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, break_minutes, employment_type, recurrence_group_id, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+          [tenant_id, site_id, user_id, date.toISODate(), start_time, end_time, breakMinutes, employmentType, seriesId, notes || null]
         );
         inserted.push(result.rows[0]);
       }
@@ -2321,7 +2428,7 @@ app.get('/api/shifts', requireAuth, async (req, res) => {
       query += ' ORDER BY sh.shift_date ASC, sh.start_time ASC LIMIT 500';
       return client.query(query, params);
     });
-    res.json(result.rows.map(shift => ({ ...shift, duration_hours: computeShiftDurationHours(shift.start_time, shift.end_time) })));
+    res.json(result.rows.map(shift => ({ ...shift, duration_hours: Math.max(0, Math.round((computeShiftDurationHours(shift.start_time, shift.end_time) - Number(shift.break_minutes || 0) / 60) * 100) / 100) })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2329,7 +2436,7 @@ app.get('/api/shifts', requireAuth, async (req, res) => {
 
 app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { tenant_id, site_id, shift_date, start_time, end_time, employment_type, notes } = req.body;
+  const { tenant_id, site_id, shift_date, start_time, end_time, break_minutes, employment_type, notes } = req.body;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
   if (start_time && !TIME_FORMAT_REGEX.test(start_time)) return res.status(400).json({ error: 'start_time must use HH:MM format' });
   if (end_time && !TIME_FORMAT_REGEX.test(end_time)) return res.status(400).json({ error: 'end_time must use HH:MM format' });
@@ -2338,9 +2445,10 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
     const result = await withTenant(tenant_id, (client) => client.query(
       `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
        start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
-       employment_type = COALESCE($5, employment_type), notes = $6
-       WHERE id = $7 AND tenant_id = $8 RETURNING *`,
-      [site_id || null, shift_date || null, start_time || null, end_time || null, employmentType, notes ?? null, id, tenant_id]
+       break_minutes = COALESCE($5, break_minutes), employment_type = COALESCE($6, employment_type), notes = $7
+       WHERE id = $8 AND tenant_id = $9 RETURNING *`,
+      [site_id || null, shift_date || null, start_time || null, end_time || null,
+       break_minutes === undefined ? null : Number(break_minutes), employmentType, notes ?? null, id, tenant_id]
     ));
     if (result.rows.length === 0) return res.status(404).json({ error: 'Shift not found' });
     res.json(result.rows[0]);

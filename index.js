@@ -312,22 +312,38 @@ async function ensureGuardCertificationsTable() {
       id SERIAL PRIMARY KEY,
       tenant_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      issuer TEXT,
+      cert_name TEXT NOT NULL,
+      cert_number TEXT,
       issue_date DATE,
-      expiry_date DATE,
-      notes TEXT,
+      expiry_date DATE NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
 
-  // Migration safety: ensure all expected columns exist
-  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS name TEXT`);
-  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS issuer TEXT`);
+  // Migration safety for databases created by the older name/issuer schema.
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS cert_name TEXT`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS cert_number TEXT`);
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS issue_date DATE`);
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS expiry_date DATE`);
-  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS notes TEXT`);
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+
+  const legacyNameColumn = await pool.query(`
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'guard_certifications'
+      AND column_name = 'name'
+  `);
+  if (legacyNameColumn.rows.length > 0) {
+    await pool.query(`
+      UPDATE guard_certifications
+      SET cert_name = name
+      WHERE cert_name IS NULL AND name IS NOT NULL
+    `);
+    // New writes use cert_name, so the legacy name column must no longer
+    // reject inserts that intentionally omit it.
+    await pool.query(`ALTER TABLE guard_certifications ALTER COLUMN name DROP NOT NULL`);
+  }
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_guard_certifications_user ON guard_certifications (tenant_id, user_id)`);
   console.log('Guard certifications table ready');
@@ -2162,6 +2178,20 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
 
 // ------------------------ GUARD CERTIFICATIONS ------------------------
 
+const CERT_EXPIRY_WARNING_DAYS = 30;
+
+function computeCertStatus(expiryDate) {
+  const today = DateTime.now().startOf('day');
+  const expiry = DateTime.fromJSDate(new Date(expiryDate)).startOf('day');
+  const daysRemaining = Math.round(expiry.diff(today, 'days').days);
+
+  let status = 'valid';
+  if (daysRemaining < 0) status = 'expired';
+  else if (daysRemaining <= CERT_EXPIRY_WARNING_DAYS) status = 'expiring_soon';
+
+  return { status, days_remaining: daysRemaining };
+}
+
 app.get('/api/certifications', requireAuth, async (req, res) => {
   const { tenant_id: queryTenant } = req.query;
   const { user_id } = req.query;
@@ -2179,7 +2209,7 @@ app.get('/api/certifications', requireAuth, async (req, res) => {
            FROM guard_certifications c
            JOIN users u ON u.id = c.user_id
            WHERE c.tenant_id = $1 AND c.user_id = $2
-           ORDER BY c.expiry_date ASC NULLS LAST, c.name ASC`,
+           ORDER BY c.expiry_date ASC, c.cert_name ASC`,
           [effectiveTenantId, user_id]
         );
       }
@@ -2188,11 +2218,11 @@ app.get('/api/certifications', requireAuth, async (req, res) => {
          FROM guard_certifications c
          JOIN users u ON u.id = c.user_id
          WHERE c.tenant_id = $1
-         ORDER BY c.expiry_date ASC NULLS LAST, c.name ASC`,
+         ORDER BY c.expiry_date ASC, c.cert_name ASC`,
         [effectiveTenantId]
       );
     });
-    res.json(result.rows);
+    res.json(result.rows.map(cert => ({ ...cert, ...computeCertStatus(cert.expiry_date) })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2206,63 +2236,60 @@ app.get('/api/certifications/expiring', requireAuth, requireAdmin, async (req, r
   }
 
   try {
-    const result = await withTenant(effectiveTenantId, async (client) => {
-      const today = new Date();
-      const thirtyDaysLater = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-      const expiringRes = await client.query(
+    const result = await withTenant(effectiveTenantId, (client) =>
+      client.query(
         `SELECT c.*, u.email as guard_email
          FROM guard_certifications c
          JOIN users u ON u.id = c.user_id
          WHERE c.tenant_id = $1
-           AND c.expiry_date IS NOT NULL
-           AND c.expiry_date <= $2
          ORDER BY c.expiry_date ASC`,
-        [effectiveTenantId, thirtyDaysLater]
-      );
-
-      const rows = expiringRes.rows.map(row => {
-        const expiryDate = new Date(row.expiry_date);
-        const daysUntilExpiry = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
-        return {
-          ...row,
-          days_until_expiry: daysUntilExpiry,
-          is_expired: daysUntilExpiry < 0
-        };
-      });
-
-      return { rows };
-    });
-    res.json(result.rows);
+        [effectiveTenantId]
+      )
+    );
+    const flagged = result.rows
+      .map(cert => ({ ...cert, ...computeCertStatus(cert.expiry_date) }))
+      .filter(cert => cert.status === 'expired' || cert.status === 'expiring_soon');
+    res.json(flagged);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/api/certifications', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, user_id, name, issuer, issue_date, expiry_date, notes } = req.body;
-  if (!tenant_id || !user_id || !name) {
-    return res.status(400).json({ error: 'tenant_id, user_id, and name are required' });
+  const { tenant_id, user_id, cert_name, cert_number, issue_date, expiry_date } = req.body;
+  if (!tenant_id || !user_id || !cert_name || !expiry_date) {
+    return res.status(400).json({ error: 'tenant_id, user_id, cert_name, and expiry_date are required' });
+  }
+  if (Number.isNaN(new Date(expiry_date).getTime())) {
+    return res.status(400).json({ error: 'expiry_date must be a valid date' });
   }
 
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
-        `INSERT INTO guard_certifications (tenant_id, user_id, name, issuer, issue_date, expiry_date, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [tenant_id, user_id, name, issuer || null, issue_date || null, expiry_date || null, notes || null]
-      )
-    );
+    const result = await withTenant(tenant_id, async (client) => {
+      const guardCheck = await client.query(
+        "SELECT id FROM users WHERE id = $1 AND tenant_id = $2 AND role = 'guard'",
+        [user_id, tenant_id]
+      );
+      if (guardCheck.rows.length === 0) {
+        const err = new Error('Guard not found for this tenant');
+        err.statusCode = 404;
+        throw err;
+      }
+      return client.query(
+        `INSERT INTO guard_certifications (tenant_id, user_id, cert_name, cert_number, issue_date, expiry_date)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [tenant_id, user_id, cert_name, cert_number || null, issue_date || null, expiry_date]
+      );
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
 app.patch('/api/certifications/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { tenant_id, name, issuer, issue_date, expiry_date, notes } = req.body;
+  const { tenant_id, cert_name, cert_number, issue_date, expiry_date } = req.body;
   if (!tenant_id) {
     return res.status(400).json({ error: 'tenant_id is required' });
   }
@@ -2271,14 +2298,13 @@ app.patch('/api/certifications/:id', requireAuth, requireAdmin, async (req, res)
     const result = await withTenant(tenant_id, (client) =>
       client.query(
         `UPDATE guard_certifications
-         SET name = COALESCE($3, name),
-             issuer = COALESCE($4, issuer),
-             issue_date = COALESCE($5, issue_date),
-             expiry_date = COALESCE($6, expiry_date),
-             notes = COALESCE($7, notes)
+         SET cert_name = COALESCE($3, cert_name),
+             cert_number = $4,
+             issue_date = $5,
+             expiry_date = COALESCE($6, expiry_date)
          WHERE id = $1 AND tenant_id = $2
          RETURNING *`,
-        [id, tenant_id, name, issuer, issue_date, expiry_date, notes]
+        [id, tenant_id, cert_name || null, cert_number || null, issue_date || null, expiry_date || null]
       )
     );
     if (result.rows.length === 0) {
@@ -2300,11 +2326,14 @@ app.delete('/api/certifications/:id', requireAuth, requireAdmin, async (req, res
   try {
     const result = await withTenant(tenant_id, (client) =>
       client.query(
-        'DELETE FROM guard_certifications WHERE id = $1 AND tenant_id = $2 RETURNING id',
+        'DELETE FROM guard_certifications WHERE id = $1 AND tenant_id = $2 RETURNING *',
         [id, tenant_id]
       )
     );
-    res.json({ deleted_count: result.rows.length });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Certification not found' });
+    }
+    res.json({ deleted: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -475,6 +475,30 @@ async function ensureTimesheetsTable() {
 }
 ensureTimesheetsTable();
 
+async function ensureAvailabilityAndLeaveTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS guard_availability (
+      id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      weekday INTEGER NOT NULL, is_available BOOLEAN NOT NULL DEFAULT TRUE,
+      available_from TEXT, available_until TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(tenant_id,user_id,weekday), CHECK (weekday BETWEEN 0 AND 6)
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS leave_requests (
+      id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+      start_date DATE NOT NULL, end_date DATE NOT NULL, leave_type TEXT NOT NULL,
+      reason TEXT, status TEXT NOT NULL DEFAULT 'pending', requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ, reviewed_by INTEGER, review_notes TEXT,
+      CHECK (end_date >= start_date)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_leave_review ON leave_requests (tenant_id,status,start_date)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_guard_availability_lookup ON guard_availability (tenant_id,user_id,weekday)`);
+  console.log('Availability and leave tables ready');
+}
+ensureAvailabilityAndLeaveTables();
+
 // ------------------------ COMPLIANCE SWEEP ------------------------
 
 function mostRecentFixedOccurrenceUTC(times, nowUTC, zone) {
@@ -2517,6 +2541,78 @@ app.get('/api/attendance', requireAuth, requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ------------------------ AVAILABILITY & LEAVE ------------------------
+
+app.get('/api/availability', requireAuth, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const userId = req.auth.role === 'admin' && req.query.user_id ? Number(req.query.user_id) : req.auth.user_id;
+  try {
+    const result = await withTenant(tenantId, client => client.query(
+      'SELECT * FROM guard_availability WHERE tenant_id=$1 AND user_id=$2 ORDER BY weekday', [tenantId,userId]
+    ));
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/availability', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can update their availability' });
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  const days = req.body.days;
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!Array.isArray(days) || days.length !== 7) return res.status(400).json({ error: 'Availability must include all seven weekdays' });
+  try {
+    const rows = await withTenant(tenantId, async client => {
+      const saved=[];
+      for (const day of days) {
+        const weekday=Number(day.weekday),available=Boolean(day.is_available);
+        if (!Number.isInteger(weekday)||weekday<0||weekday>6) throw Object.assign(new Error('Invalid weekday'),{statusCode:400});
+        if (available && (!TIME_FORMAT_REGEX.test(day.available_from||'')||!TIME_FORMAT_REGEX.test(day.available_until||''))) throw Object.assign(new Error('Available days require valid start and end times'),{statusCode:400});
+        const result=await client.query(
+          `INSERT INTO guard_availability (tenant_id,user_id,weekday,is_available,available_from,available_until)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (tenant_id,user_id,weekday) DO UPDATE SET
+           is_available=EXCLUDED.is_available,available_from=EXCLUDED.available_from,available_until=EXCLUDED.available_until,updated_at=NOW() RETURNING *`,
+          [tenantId,req.auth.user_id,weekday,available,available?day.available_from:null,available?day.available_until:null]
+        );saved.push(result.rows[0]);
+      }return saved;
+    });
+    res.json(rows);
+  } catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.post('/api/leave-requests', requireAuth, async (req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can request leave'});
+  const tenantId=attendanceTenant(req,req.body.tenant_id);const {start_date,end_date,leave_type,reason}=req.body;
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!validTimesheetPeriod(start_date,end_date))return res.status(400).json({error:'Choose a valid leave period of no more than 32 days'});
+  if(!['annual','sick','unpaid','other'].includes(leave_type))return res.status(400).json({error:'Invalid leave type'});
+  try{const result=await withTenant(tenantId,client=>client.query(
+    `INSERT INTO leave_requests (tenant_id,user_id,start_date,end_date,leave_type,reason) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [tenantId,req.auth.user_id,start_date,end_date,leave_type,reason||null]));res.status(201).json(result.rows[0]);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.get('/api/leave-requests',requireAuth,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>{let query=`SELECT l.*,u.email AS guard_email,r.email AS reviewer_email FROM leave_requests l JOIN users u ON u.id=l.user_id LEFT JOIN users r ON r.id=l.reviewed_by WHERE l.tenant_id=$1`;const params=[tenantId];if(req.auth.role!=='admin'){params.push(req.auth.user_id);query+=` AND l.user_id=$${params.length}`}else if(req.query.user_id){params.push(req.query.user_id);query+=` AND l.user_id=$${params.length}`}if(req.query.status){params.push(req.query.status);query+=` AND l.status=$${params.length}`}query+=' ORDER BY l.requested_at DESC LIMIT 250';return client.query(query,params)});res.json(result.rows);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.patch('/api/leave-requests/:id/review',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.body.tenant_id);const {status,review_notes}=req.body;
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!['approved','rejected'].includes(status))return res.status(400).json({error:'Invalid review status'});
+  if(status==='rejected'&&!String(review_notes||'').trim())return res.status(400).json({error:'A rejection reason is required'});
+  try{const result=await withTenant(tenantId,client=>client.query(
+    `UPDATE leave_requests SET status=$1,review_notes=$2,reviewed_at=NOW(),reviewed_by=$3 WHERE id=$4 AND tenant_id=$5 AND status='pending' RETURNING *`,
+    [status,String(review_notes||'').trim()||null,req.auth.user_id,req.params.id,tenantId]));if(!result.rows.length)return res.status(409).json({error:'Request not found or already reviewed'});res.json(result.rows[0]);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.delete('/api/leave-requests/:id',requireAuth,async(req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Only guards can cancel requests'});const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query("DELETE FROM leave_requests WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND status='pending' RETURNING id",[req.params.id,tenantId,req.auth.user_id]));if(!result.rows.length)return res.status(409).json({error:'Only pending requests can be cancelled'});res.json({deleted:result.rows[0]});}catch(err){res.status(500).json({error:err.message});}
+});
+
 // ------------------------ TIMESHEETS & APPROVALS ------------------------
 
 function validTimesheetPeriod(start, end) {
@@ -2742,6 +2838,29 @@ async function analyseProposedShifts(client, tenantId, userId, dates, startTime,
     }
   }
 
+  const availabilityResult = await client.query(
+    'SELECT * FROM guard_availability WHERE tenant_id=$1 AND user_id=$2', [tenantId,userId]
+  );
+  const availabilityByDay = new Map(availabilityResult.rows.map(row => [Number(row.weekday),row]));
+  const leaveResult = await client.query(
+    `SELECT id,start_date,end_date,leave_type FROM leave_requests
+     WHERE tenant_id=$1 AND user_id=$2 AND status='approved' AND start_date <= $3 AND end_date >= $4`,
+    [tenantId,userId,lastDate,firstDate]
+  );
+  const availability_conflicts=[];
+  const timeMinutes=value=>{const [h,m]=String(value).split(':').map(Number);return h*60+m};
+  for(const candidate of proposed){
+    const leave=leaveResult.rows.find(item=>candidate.date>=String(item.start_date).slice(0,10)&&candidate.date<=String(item.end_date).slice(0,10));
+    if(leave){availability_conflicts.push({date:candidate.date,type:'approved_leave',message:`${candidate.date}: guard is on approved ${leave.leave_type} leave.`});continue;}
+    if(availabilityResult.rows.length){
+      const rule=availabilityByDay.get(candidate.start.weekday%7);
+      if(!rule||!rule.is_available){availability_conflicts.push({date:candidate.date,type:'unavailable_day',message:`${candidate.date}: guard marked this weekday unavailable.`});continue;}
+      let shiftStart=timeMinutes(startTime),shiftEnd=timeMinutes(endTime),availableStart=timeMinutes(rule.available_from),availableEnd=timeMinutes(rule.available_until);
+      if(shiftEnd<=shiftStart)shiftEnd+=1440;if(availableEnd<=availableStart)availableEnd+=1440;
+      if(shiftStart<availableStart||shiftEnd>availableEnd)availability_conflicts.push({date:candidate.date,type:'outside_availability',message:`${candidate.date}: ${startTime}–${endTime} is outside availability ${rule.available_from}–${rule.available_until}.`});
+    }
+  }
+
   const weeklyHours = new Map();
   for (const shift of existing) {
     const week = shift.start.startOf('week').toISODate();
@@ -2756,7 +2875,7 @@ async function analyseProposedShifts(client, tenantId, userId, dates, startTime,
     .filter(([, hours]) => hours > WEEKLY_OVERTIME_WARNING_HOURS)
     .map(([week_start, hours]) => ({ type: 'overtime', week_start, scheduled_hours: Math.round(hours * 100) / 100, threshold_hours: WEEKLY_OVERTIME_WARNING_HOURS,
       message: `Week of ${week_start}: ${Math.round(hours * 100) / 100} scheduled hours exceeds the ${WEEKLY_OVERTIME_WARNING_HOURS}-hour threshold.` }));
-  return { conflicts, warnings, proposed_count: proposed.length };
+  return { conflicts, availability_conflicts, warnings, proposed_count: proposed.length };
 }
 
 app.get('/api/shift-templates', requireAuth, requireAdmin, async (req, res) => {
@@ -2868,6 +2987,7 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
         err.conflicts = analysis.conflicts;
         throw err;
       }
+      if(analysis.availability_conflicts.length){const err=new Error(`Cannot create shifts: guard is unavailable on ${analysis.availability_conflicts.length} proposed date(s).`);err.statusCode=409;err.code='GUARD_UNAVAILABLE';err.availability_conflicts=analysis.availability_conflicts;throw err;}
       if (dry_run) return { dryRun: true, analysis };
 
       const seriesId = recurrenceType === 'none' ? null : crypto.randomUUID();
@@ -2885,7 +3005,7 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
     if (shifts.dryRun) return res.json({ valid: true, ...shifts.analysis });
     res.status(201).json({ created_count: shifts.inserted.length, recurrence_group_id: shifts.inserted[0].recurrence_group_id, shifts: shifts.inserted, warnings: shifts.analysis.warnings });
   } catch (err) {
-    res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts });
+    res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts, availability_conflicts:err.availability_conflicts });
   }
 });
 
@@ -2938,6 +3058,7 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
         const err = new Error('Cannot save this shift because it overlaps the guard\'s existing schedule.');
         err.statusCode = 409; err.code = 'SHIFT_CONFLICT'; err.conflicts = analysis.conflicts; throw err;
       }
+      if(analysis.availability_conflicts.length){const err=new Error('Cannot save this shift because the guard is unavailable.');err.statusCode=409;err.code='GUARD_UNAVAILABLE';err.availability_conflicts=analysis.availability_conflicts;throw err;}
       const updated = await client.query(
         `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
          start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
@@ -2949,7 +3070,7 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
       return { shift: updated.rows[0], warnings: analysis.warnings };
     });
     res.json(result);
-  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts }); }
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts, availability_conflicts:err.availability_conflicts }); }
 });
 
 app.delete('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {

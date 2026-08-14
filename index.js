@@ -173,6 +173,18 @@ async function ensureIncidentsTable() {
 }
 ensureIncidentsTable();
 
+async function ensureHandoverTable(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS handover_logs (
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,from_user_id INTEGER NOT NULL,
+    to_user_id INTEGER,summary TEXT NOT NULL,outstanding_actions TEXT,equipment_status TEXT NOT NULL DEFAULT 'ok',
+    status TEXT NOT NULL DEFAULT 'pending',acknowledged_by INTEGER,acknowledged_at TIMESTAMPTZ,
+    resolved_by INTEGER,resolved_at TIMESTAMPTZ,resolution_notes TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_handover_tenant_site_status ON handover_logs(tenant_id,site_id,status,created_at DESC)`);
+  console.log('Handover table ready');
+}
+ensureHandoverTable();
+
 async function ensureIncidentPhotosTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incident_photos (
@@ -2559,6 +2571,16 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ------------------------ SHIFT HANDOVERS ------------------------
+
+app.post('/api/handovers',requireAuth,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),toUser=req.body.to_user_id?Number(req.body.to_user_id):null,summary=String(req.body.summary||'').trim(),actions=String(req.body.outstanding_actions||'').trim(),equipment=['ok','attention','fault'].includes(req.body.equipment_status)?req.body.equipment_status:'ok';if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!summary)return res.status(400).json({error:'Site and handover summary are required'});try{const result=await withTenant(tenantId,async client=>{if(req.auth.role!=='admin'){const assigned=await client.query('SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND site_id=$2 AND user_id=$3',[tenantId,siteId,req.auth.user_id]);if(!assigned.rows.length)throw Object.assign(new Error('You are not assigned to this site'),{statusCode:403});}if(toUser){const target=await client.query(`SELECT 1 FROM guard_assignments ga JOIN users u ON u.id=ga.user_id WHERE ga.tenant_id=$1 AND ga.site_id=$2 AND ga.user_id=$3 AND u.role='guard'`,[tenantId,siteId,toUser]);if(!target.rows.length)throw Object.assign(new Error('Receiving guard is not assigned to this site'),{statusCode:400});}return client.query(`INSERT INTO handover_logs (tenant_id,site_id,from_user_id,to_user_id,summary,outstanding_actions,equipment_status) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[tenantId,siteId,req.auth.user_id,toUser,summary,actions||null,equipment])});res.status(201).json(result.rows[0]);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+
+app.get('/api/handovers',requireAuth,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>{const params=[tenantId];let where='h.tenant_id=$1';if(req.query.site_id){params.push(req.query.site_id);where+=` AND h.site_id=$${params.length}`;}if(req.query.status&&req.query.status!=='all'){params.push(req.query.status);where+=` AND h.status=$${params.length}`;}if(req.auth.role!=='admin'){params.push(req.auth.user_id);where+=` AND EXISTS(SELECT 1 FROM guard_assignments ga WHERE ga.tenant_id=h.tenant_id AND ga.site_id=h.site_id AND ga.user_id=$${params.length})`;}return client.query(`SELECT h.*,s.name AS site_name,fu.email AS from_email,tu.email AS to_email,au.email AS acknowledged_email FROM handover_logs h JOIN sites s ON s.id=h.site_id JOIN users fu ON fu.id=h.from_user_id LEFT JOIN users tu ON tu.id=h.to_user_id LEFT JOIN users au ON au.id=h.acknowledged_by WHERE ${where} ORDER BY h.created_at DESC LIMIT 300`,params)});res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
+
+app.patch('/api/handovers/:id/acknowledge',requireAuth,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,async client=>{const handover=await client.query('SELECT * FROM handover_logs WHERE id=$1 AND tenant_id=$2 AND status=$3',[req.params.id,tenantId,'pending']);if(!handover.rows.length)throw Object.assign(new Error('Handover is no longer pending'),{statusCode:409});const h=handover.rows[0];if(req.auth.role!=='admin'){if(Number(h.from_user_id)===req.auth.user_id)throw Object.assign(new Error('The outgoing guard cannot acknowledge their own handover'),{statusCode:403});if(h.to_user_id&&Number(h.to_user_id)!==req.auth.user_id)throw Object.assign(new Error('This handover is assigned to another guard'),{statusCode:403});const assigned=await client.query('SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND site_id=$2 AND user_id=$3',[tenantId,h.site_id,req.auth.user_id]);if(!assigned.rows.length)throw Object.assign(new Error('You are not assigned to this site'),{statusCode:403});}return client.query("UPDATE handover_logs SET status='acknowledged',acknowledged_by=$1,acknowledged_at=NOW() WHERE id=$2 AND tenant_id=$3 AND status='pending' RETURNING *",[req.auth.user_id,req.params.id,tenantId])});if(!result.rows.length)return res.status(409).json({error:'Handover was already acknowledged'});res.json(result.rows[0]);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+
+app.patch('/api/handovers/:id/resolve',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),notes=String(req.body.resolution_notes||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!notes)return res.status(400).json({error:'Resolution notes are required'});try{const result=await withTenant(tenantId,client=>client.query("UPDATE handover_logs SET status='resolved',resolved_by=$1,resolved_at=NOW(),resolution_notes=$2 WHERE id=$3 AND tenant_id=$4 AND status<>'resolved' RETURNING *",[req.auth.user_id,notes,req.params.id,tenantId]));if(!result.rows.length)return res.status(409).json({error:'Handover is already resolved or unavailable'});res.json(result.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
 
 // ------------------------ INCIDENTS ------------------------
 

@@ -248,6 +248,24 @@ async function ensureAuditLogsTable() {
 }
 ensureAuditLogsTable();
 
+async function ensurePatrolRoutesTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS patrol_routes (
+    id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, site_id INTEGER NOT NULL,
+    name TEXT NOT NULL, description TEXT, strict_order BOOLEAN NOT NULL DEFAULT TRUE,
+    estimated_minutes INTEGER, active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,site_id,name)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS patrol_route_checkpoints (
+    id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, route_id INTEGER NOT NULL REFERENCES patrol_routes(id) ON DELETE CASCADE,
+    checkpoint_id INTEGER NOT NULL, position INTEGER NOT NULL,
+    UNIQUE(route_id,checkpoint_id), UNIQUE(route_id,position)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_patrol_routes_tenant_site ON patrol_routes(tenant_id,site_id)`);
+  console.log('Patrol route tables ready');
+}
+ensurePatrolRoutesTables();
+
 async function ensureGuardAssignmentsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS guard_assignments (
@@ -2204,6 +2222,68 @@ app.get('/api/guard-progress', requireAuth, async (req, res) => {
 });
 
 // ------------------------ PATROL SCHEDULES & LOGS ------------------------
+
+app.get('/api/patrol-routes', requireAuth, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const siteId = req.query.site_id ? Number(req.query.site_id) : null;
+  try {
+    const result = await withTenant(tenantId, client => {
+      const params = [tenantId];
+      let where = 'r.tenant_id=$1';
+      if (siteId) { params.push(siteId); where += ` AND r.site_id=$${params.length}`; }
+      return client.query(`SELECT r.*,s.name AS site_name,
+        COALESCE(json_agg(json_build_object('checkpoint_id',c.id,'name',c.name,'position',rc.position)
+          ORDER BY rc.position) FILTER (WHERE c.id IS NOT NULL),'[]') AS checkpoints
+        FROM patrol_routes r JOIN sites s ON s.id=r.site_id
+        LEFT JOIN patrol_route_checkpoints rc ON rc.route_id=r.id
+        LEFT JOIN checkpoints c ON c.id=rc.checkpoint_id
+        WHERE ${where} GROUP BY r.id,s.name ORDER BY r.active DESC,r.name`, params);
+    });
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/patrol-routes', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  const siteId = Number(req.body.site_id), checkpointIds = (req.body.checkpoint_ids || []).map(Number);
+  const name = String(req.body.name || '').trim();
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!siteId || !name || !checkpointIds.length) return res.status(400).json({ error: 'Site, route name, and at least one checkpoint are required' });
+  if (new Set(checkpointIds).size !== checkpointIds.length) return res.status(400).json({ error: 'A checkpoint can only appear once in a route' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN'); await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);
+    const valid = await client.query('SELECT id FROM checkpoints WHERE tenant_id=$1 AND site_id=$2 AND id=ANY($3::int[])',[tenantId,siteId,checkpointIds]);
+    if (valid.rows.length !== checkpointIds.length) throw Object.assign(new Error('Every checkpoint must belong to the selected site'),{statusCode:400});
+    const route = await client.query(`INSERT INTO patrol_routes (tenant_id,site_id,name,description,strict_order,estimated_minutes)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,[tenantId,siteId,name,req.body.description||null,req.body.strict_order!==false,req.body.estimated_minutes||null]);
+    for (let i=0;i<checkpointIds.length;i++) await client.query('INSERT INTO patrol_route_checkpoints (tenant_id,route_id,checkpoint_id,position) VALUES ($1,$2,$3,$4)',[tenantId,route.rows[0].id,checkpointIds[i],i+1]);
+    await client.query('COMMIT'); res.status(201).json(route.rows[0]);
+  } catch (err) { await client.query('ROLLBACK'); res.status(err.statusCode||500).json({ error: err.code==='23505'?'A route with this name already exists at the site':err.message }); }
+  finally { client.release(); }
+});
+
+app.put('/api/patrol-routes/:id', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.body.tenant_id), routeId=Number(req.params.id);
+  const siteId=Number(req.body.site_id), checkpointIds=(req.body.checkpoint_ids||[]).map(Number), name=String(req.body.name||'').trim();
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!siteId||!name||!checkpointIds.length||new Set(checkpointIds).size!==checkpointIds.length) return res.status(400).json({ error: 'Valid site, unique checkpoint order, and route name are required' });
+  const client=await pool.connect(); try { await client.query('BEGIN'); await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);
+    const valid=await client.query('SELECT id FROM checkpoints WHERE tenant_id=$1 AND site_id=$2 AND id=ANY($3::int[])',[tenantId,siteId,checkpointIds]);
+    if(valid.rows.length!==checkpointIds.length) throw Object.assign(new Error('Every checkpoint must belong to the selected site'),{statusCode:400});
+    const updated=await client.query(`UPDATE patrol_routes SET site_id=$1,name=$2,description=$3,strict_order=$4,estimated_minutes=$5,active=$6,updated_at=NOW() WHERE id=$7 AND tenant_id=$8 RETURNING *`,[siteId,name,req.body.description||null,req.body.strict_order!==false,req.body.estimated_minutes||null,req.body.active!==false,routeId,tenantId]);
+    if(!updated.rows.length) throw Object.assign(new Error('Route not found'),{statusCode:404});
+    await client.query('DELETE FROM patrol_route_checkpoints WHERE route_id=$1 AND tenant_id=$2',[routeId,tenantId]);
+    for(let i=0;i<checkpointIds.length;i++) await client.query('INSERT INTO patrol_route_checkpoints (tenant_id,route_id,checkpoint_id,position) VALUES ($1,$2,$3,$4)',[tenantId,routeId,checkpointIds[i],i+1]);
+    await client.query('COMMIT'); res.json(updated.rows[0]);
+  } catch(err){await client.query('ROLLBACK');res.status(err.statusCode||500).json({error:err.code==='23505'?'A route with this name already exists at the site':err.message});} finally{client.release();}
+});
+
+app.delete('/api/patrol-routes/:id', requireAuth, requireAdmin, async (req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query('DELETE FROM patrol_routes WHERE id=$1 AND tenant_id=$2 RETURNING id',[req.params.id,tenantId]));if(!result.rows.length)return res.status(404).json({error:'Route not found'});res.json({deleted:true});}catch(err){res.status(500).json({error:err.message});}
+});
 
 app.post('/api/patrol-schedules', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, schedule_type, config } = req.body;

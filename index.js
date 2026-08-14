@@ -155,6 +155,20 @@ async function ensureIncidentsTable() {
       reported_at TIMESTAMP DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS reference_code TEXT`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'general'`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'reported'`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS assigned_to INTEGER`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution TEXT`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_reference ON incidents(tenant_id,reference_code) WHERE reference_code IS NOT NULL`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS incident_activities (
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    user_id INTEGER,activity_type TEXT NOT NULL,note TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_incident_activities_incident ON incident_activities(tenant_id,incident_id,created_at)`);
   console.log('Incidents table ready');
 }
 ensureIncidentsTable();
@@ -2549,11 +2563,13 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
 // ------------------------ INCIDENTS ------------------------
 
 app.post('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id, site_id, checkpoint_id, description, severity, photos } = req.body;
+  const { tenant_id, site_id, checkpoint_id, description, severity, category, photos } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || !site_id || !description) {
     return res.status(400).json({ error: 'tenant_id, site_id, and description are required' });
   }
+  const tenantId=attendanceTenant(req,tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const incidentCategory=['security','safety','medical','fire','property','access','conduct','general'].includes(category)?category:'general';
 
   const photoList = Array.isArray(photos) ? photos.slice(0, MAX_PHOTOS_PER_INCIDENT) : [];
   for (const p of photoList) {
@@ -2571,10 +2587,13 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
     await client.query(`SET app.current_tenant = '${tenant_id}'`);
 
     const incidentResult = await client.query(
-      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low']
+      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity,category) VALUES ($1, $2, $3, $4, $5, $6,$7) RETURNING *',
+      [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low',incidentCategory]
     );
-    const incident = incidentResult.rows[0];
+    let incident = incidentResult.rows[0];
+    const reference='INC-'+new Date().getUTCFullYear()+'-'+String(incident.id).padStart(6,'0');
+    incident=(await client.query('UPDATE incidents SET reference_code=$1 WHERE id=$2 RETURNING *',[reference,incident.id])).rows[0];
+    await client.query(`INSERT INTO incident_activities (tenant_id,incident_id,user_id,activity_type,note) VALUES ($1,$2,$3,'reported',$4)`,[tenantId,incident.id,user_id,'Incident reported with '+photoList.length+' photo(s)']);
 
     for (const photoData of photoList) {
       await client.query(
@@ -2594,13 +2613,14 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
 });
 
 app.get('/api/incidents', requireAuth, async (req, res) => {
-  const { tenant_id, date } = req.query;
+  const { tenant_id, date, status, category, site_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const result = await withTenant(tenant_id, (client) => {
-      const baseQuery = `
-        SELECT i.*, COALESCE(p.photo_count, 0) AS photo_count
+      let baseQuery = `
+        SELECT i.*, COALESCE(p.photo_count, 0) AS photo_count,s.name AS site_name,reporter.email AS reporter_email,assignee.email AS assigned_email
         FROM incidents i
+        JOIN sites s ON s.id=i.site_id LEFT JOIN users reporter ON reporter.id=i.user_id LEFT JOIN users assignee ON assignee.id=i.assigned_to
         LEFT JOIN (
           SELECT incident_id, COUNT(*) AS photo_count
           FROM incident_photos
@@ -2609,15 +2629,23 @@ app.get('/api/incidents', requireAuth, async (req, res) => {
         ) p ON p.incident_id = i.id
         WHERE i.tenant_id = $1
       `;
-      return date
-        ? client.query(baseQuery + ' AND i.reported_at::date = $2 ORDER BY i.reported_at DESC', [tenant_id, date])
-        : client.query(baseQuery + ' ORDER BY i.reported_at DESC', [tenant_id]);
+      const params=[tenant_id];if(date){params.push(date);baseQuery+=` AND i.reported_at::date=$${params.length}`;}if(status){params.push(status);baseQuery+=` AND i.status=$${params.length}`;}if(category){params.push(category);baseQuery+=` AND i.category=$${params.length}`;}if(site_id){params.push(site_id);baseQuery+=` AND i.site_id=$${params.length}`;}return client.query(baseQuery+' ORDER BY i.reported_at DESC LIMIT 500',params);
     });
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.patch('/api/incidents/:id/case',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.body.tenant_id),status=req.body.status,assignedTo=req.body.assigned_to?Number(req.body.assigned_to):null,resolution=String(req.body.resolution||'').trim();
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(status&&!['reported','acknowledged','investigating','resolved','closed'].includes(status))return res.status(400).json({error:'Invalid incident status'});if(['resolved','closed'].includes(status)&&!resolution)return res.status(400).json({error:'Resolution details are required'});
+  const client=await pool.connect();try{await client.query('BEGIN');await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);if(assignedTo){const owner=await client.query("SELECT 1 FROM users WHERE id=$1 AND tenant_id=$2 AND role='admin'",[assignedTo,tenantId]);if(!owner.rows.length)throw Object.assign(new Error('Assigned supervisor not found'),{statusCode:400});}const current=await client.query('SELECT * FROM incidents WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[req.params.id,tenantId]);if(!current.rows.length)throw Object.assign(new Error('Incident not found'),{statusCode:404});const nextStatus=status||current.rows[0].status;const updated=await client.query(`UPDATE incidents SET status=$1,assigned_to=$2,resolution=CASE WHEN $3<>'' THEN $3 ELSE resolution END,acknowledged_at=CASE WHEN $1 IN ('acknowledged','investigating','resolved','closed') THEN COALESCE(acknowledged_at,NOW()) ELSE acknowledged_at END,resolved_at=CASE WHEN $1 IN ('resolved','closed') THEN COALESCE(resolved_at,NOW()) ELSE NULL END,updated_at=NOW() WHERE id=$4 AND tenant_id=$5 RETURNING *`,[nextStatus,assignedTo,resolution,req.params.id,tenantId]);const changes=[];if(nextStatus!==current.rows[0].status)changes.push('Status: '+current.rows[0].status+' → '+nextStatus);if(assignedTo!==current.rows[0].assigned_to)changes.push(assignedTo?'Case assigned to supervisor #'+assignedTo:'Case unassigned');if(resolution)changes.push('Resolution: '+resolution);await client.query(`INSERT INTO incident_activities (tenant_id,incident_id,user_id,activity_type,note) VALUES ($1,$2,$3,'case_updated',$4)`,[tenantId,req.params.id,req.auth.user_id,changes.join('; ')||'Case updated']);await client.query('COMMIT');res.json(updated.rows[0]);}catch(err){await client.query('ROLLBACK');res.status(err.statusCode||500).json({error:err.message});}finally{client.release();}
+});
+
+app.post('/api/incidents/:id/comments',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),note=String(req.body.note||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!note)return res.status(400).json({error:'Comment is required'});try{const result=await withTenant(tenantId,async client=>{const exists=await client.query('SELECT 1 FROM incidents WHERE id=$1 AND tenant_id=$2',[req.params.id,tenantId]);if(!exists.rows.length)throw Object.assign(new Error('Incident not found'),{statusCode:404});return client.query(`INSERT INTO incident_activities (tenant_id,incident_id,user_id,activity_type,note) VALUES ($1,$2,$3,'comment',$4) RETURNING *`,[tenantId,req.params.id,req.auth.user_id,note])});res.status(201).json(result.rows[0]);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+
+app.get('/api/incidents/:id/activities',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>client.query(`SELECT ia.*,u.email AS user_email FROM incident_activities ia LEFT JOIN users u ON u.id=ia.user_id WHERE ia.incident_id=$1 AND ia.tenant_id=$2 ORDER BY ia.created_at`,[req.params.id,tenantId]));res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
 
 app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
   const { id } = req.params;

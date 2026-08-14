@@ -95,6 +95,30 @@ function requireClient(req, res, next) {
   next();
 }
 
+function safeAuditDetails(body) {
+  if (!body || typeof body !== 'object') return {};
+  const hidden = new Set(['password', 'token', 'photo_base64', 'photos']);
+  return Object.fromEntries(Object.entries(body).filter(([key]) => !hidden.has(key.toLowerCase())));
+}
+
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  res.on('finish', () => {
+    if (!req.auth || res.statusCode >= 400 || req.path === '/api/login' || req.path === '/api/signup') return;
+    const tenantId = Number((req.body && req.body.tenant_id) || req.query.tenant_id || req.auth.tenant_id);
+    if (!Number.isInteger(tenantId) || tenantId !== Number(req.auth.tenant_id)) return;
+    const routeName = req.route && req.route.path ? req.route.path : req.path;
+    pool.query(
+      `INSERT INTO audit_logs (tenant_id,user_id,user_email,user_role,action,resource,entity_id,details,ip_address)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [tenantId, req.auth.user_id, req.auth.email || null, req.auth.role, req.method, routeName,
+       req.params && req.params.id ? String(req.params.id) : null, safeAuditDetails(req.body),
+       String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim() || null]
+    ).catch(err => console.error('Audit log write failed:', err.message));
+  });
+  next();
+});
+
 async function checkPlanLimit(client, tenantId, resource) {
   const tenantRes = await client.query('SELECT plan FROM tenants WHERE id = $1', [tenantId]);
   const plan = (tenantRes.rows[0] && tenantRes.rows[0].plan) || 'starter';
@@ -202,6 +226,27 @@ async function ensureNotificationsTable() {
   console.log('Notifications table ready');
 }
 ensureNotificationsTable();
+
+async function ensureAuditLogsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id BIGSERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER,
+      user_email TEXT,
+      user_role TEXT,
+      action TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      entity_id TEXT,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ip_address TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created ON audit_logs(tenant_id,created_at DESC)`);
+  console.log('Audit logs table ready');
+}
+ensureAuditLogsTable();
 
 async function ensureGuardAssignmentsTable() {
   await pool.query(`
@@ -1066,6 +1111,26 @@ app.patch('/api/notifications/:id/resolve', requireAuth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get('/api/audit-logs', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const { action, user_id, from_date, to_date, search } = req.query;
+  try {
+    const result = await withTenant(tenantId, client => {
+      const params = [tenantId];
+      let query = 'SELECT * FROM audit_logs WHERE tenant_id=$1';
+      if (action) { params.push(action); query += ` AND action=$${params.length}`; }
+      if (user_id) { params.push(user_id); query += ` AND user_id=$${params.length}`; }
+      if (from_date) { params.push(from_date); query += ` AND created_at >= $${params.length}::date`; }
+      if (to_date) { params.push(to_date); query += ` AND created_at < ($${params.length}::date + INTERVAL '1 day')`; }
+      if (search) { params.push(`%${search}%`); query += ` AND (resource ILIKE $${params.length} OR user_email ILIKE $${params.length} OR details::text ILIKE $${params.length})`; }
+      query += ' ORDER BY created_at DESC LIMIT 500';
+      return client.query(query, params);
+    });
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ------------------------ SOS ROUTES ------------------------

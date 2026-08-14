@@ -185,6 +185,22 @@ async function ensureHandoverTable(){
 }
 ensureHandoverTable();
 
+async function ensureServiceContractsTable(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS service_contracts (
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,reference_code TEXT NOT NULL,
+    client_name TEXT NOT NULL,start_date DATE NOT NULL,end_date DATE,status TEXT NOT NULL DEFAULT 'draft',
+    billing_model TEXT NOT NULL DEFAULT 'monthly',rate NUMERIC(12,2),currency TEXT NOT NULL DEFAULT 'EUR',
+    sla_patrol_completion_pct NUMERIC(5,2) NOT NULL DEFAULT 95,
+    sla_incident_ack_minutes INTEGER NOT NULL DEFAULT 15,sla_shift_coverage_pct NUMERIC(5,2) NOT NULL DEFAULT 98,
+    report_frequency TEXT NOT NULL DEFAULT 'monthly',notes TEXT,created_by INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,reference_code)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_contracts_tenant_site_status ON service_contracts(tenant_id,site_id,status)`);
+  console.log('Service contracts table ready');
+}
+ensureServiceContractsTable();
+
 async function ensureIncidentPhotosTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS incident_photos (
@@ -2571,6 +2587,18 @@ app.get('/api/patrol-compliance', requireAuth, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ------------------------ CLIENT SERVICE CONTRACTS & SLAS ------------------------
+
+function validPercent(value){const n=Number(value);return Number.isFinite(n)&&n>=0&&n<=100;}
+
+app.get('/api/service-contracts',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,async client=>{await client.query("UPDATE service_contracts SET status='expired',updated_at=NOW() WHERE tenant_id=$1 AND status='active' AND end_date<CURRENT_DATE",[tenantId]);const params=[tenantId];let where='sc.tenant_id=$1';if(req.query.site_id){params.push(req.query.site_id);where+=` AND sc.site_id=$${params.length}`;}if(req.query.status&&req.query.status!=='all'){params.push(req.query.status);where+=` AND sc.status=$${params.length}`;}return client.query(`SELECT sc.*,s.name AS site_name,u.email AS created_by_email FROM service_contracts sc JOIN sites s ON s.id=sc.site_id LEFT JOIN users u ON u.id=sc.created_by WHERE ${where} ORDER BY sc.start_date DESC,sc.id DESC`,params)});res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
+
+app.post('/api/service-contracts',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),clientName=String(req.body.client_name||'').trim(),start=req.body.start_date,end=req.body.end_date||null,billing=['monthly','hourly','per_patrol','fixed'].includes(req.body.billing_model)?req.body.billing_model:'monthly',status=['draft','active','suspended'].includes(req.body.status)?req.body.status:'draft';if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!clientName||!start)return res.status(400).json({error:'Site, client name, and start date are required'});if(end&&new Date(end)<new Date(start))return res.status(400).json({error:'End date cannot be before start date'});if(!validPercent(req.body.sla_patrol_completion_pct)||!validPercent(req.body.sla_shift_coverage_pct))return res.status(400).json({error:'SLA percentages must be between 0 and 100'});try{const result=await withTenant(tenantId,async client=>{const site=await client.query('SELECT 1 FROM sites WHERE id=$1 AND tenant_id=$2',[siteId,tenantId]);if(!site.rows.length)throw Object.assign(new Error('Site not found'),{statusCode:404});let reference=String(req.body.reference_code||'').trim();if(!reference){const sequence=await client.query('SELECT COALESCE(MAX(id),0)+1 AS next FROM service_contracts WHERE tenant_id=$1',[tenantId]);reference='CTR-'+new Date().getUTCFullYear()+'-'+String(sequence.rows[0].next).padStart(5,'0');}return client.query(`INSERT INTO service_contracts (tenant_id,site_id,reference_code,client_name,start_date,end_date,status,billing_model,rate,currency,sla_patrol_completion_pct,sla_incident_ack_minutes,sla_shift_coverage_pct,report_frequency,notes,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,[tenantId,siteId,reference,clientName,start,end,status,billing,req.body.rate||null,String(req.body.currency||'EUR').toUpperCase().slice(0,3),Number(req.body.sla_patrol_completion_pct),Math.max(1,Number(req.body.sla_incident_ack_minutes||15)),Number(req.body.sla_shift_coverage_pct),['weekly','monthly','quarterly'].includes(req.body.report_frequency)?req.body.report_frequency:'monthly',req.body.notes||null,req.auth.user_id])});res.status(201).json(result.rows[0]);}catch(err){res.status(err.statusCode||500).json({error:err.code==='23505'?'Contract reference already exists':err.message});}});
+
+app.put('/api/service-contracts/:id',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),start=req.body.start_date,end=req.body.end_date||null;if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!String(req.body.client_name||'').trim()||!start)return res.status(400).json({error:'Site, client name, and start date are required'});if(end&&new Date(end)<new Date(start))return res.status(400).json({error:'End date cannot be before start date'});if(!validPercent(req.body.sla_patrol_completion_pct)||!validPercent(req.body.sla_shift_coverage_pct))return res.status(400).json({error:'SLA percentages must be between 0 and 100'});try{const result=await withTenant(tenantId,client=>client.query(`UPDATE service_contracts SET site_id=$1,reference_code=$2,client_name=$3,start_date=$4,end_date=$5,status=$6,billing_model=$7,rate=$8,currency=$9,sla_patrol_completion_pct=$10,sla_incident_ack_minutes=$11,sla_shift_coverage_pct=$12,report_frequency=$13,notes=$14,updated_at=NOW() WHERE id=$15 AND tenant_id=$16 RETURNING *`,[siteId,String(req.body.reference_code||'').trim(),String(req.body.client_name).trim(),start,end,['draft','active','suspended','expired'].includes(req.body.status)?req.body.status:'draft',['monthly','hourly','per_patrol','fixed'].includes(req.body.billing_model)?req.body.billing_model:'monthly',req.body.rate||null,String(req.body.currency||'EUR').toUpperCase().slice(0,3),Number(req.body.sla_patrol_completion_pct),Math.max(1,Number(req.body.sla_incident_ack_minutes||15)),Number(req.body.sla_shift_coverage_pct),['weekly','monthly','quarterly'].includes(req.body.report_frequency)?req.body.report_frequency:'monthly',req.body.notes||null,req.params.id,tenantId]));if(!result.rows.length)return res.status(404).json({error:'Contract not found'});res.json(result.rows[0]);}catch(err){res.status(500).json({error:err.code==='23505'?'Contract reference already exists':err.message});}});
+
+app.patch('/api/service-contracts/:id/status',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),status=req.body.status;if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!['draft','active','suspended','expired'].includes(status))return res.status(400).json({error:'Invalid contract status'});try{const result=await withTenant(tenantId,client=>client.query('UPDATE service_contracts SET status=$1,updated_at=NOW() WHERE id=$2 AND tenant_id=$3 RETURNING *',[status,req.params.id,tenantId]));if(!result.rows.length)return res.status(404).json({error:'Contract not found'});res.json(result.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
 
 // ------------------------ SHIFT HANDOVERS ------------------------
 

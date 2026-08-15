@@ -4059,10 +4059,10 @@ function communicationTenant(req, suppliedTenantId) {
   return requestedTenant;
 }
 
-function communicationAudienceSql(role) {
+function communicationAudienceSql(role, userPlaceholder = '$2') {
   return role === 'admin'
-    ? `TRUE`
-    : `(n.audience IN ('all','all_guards') OR n.recipient_user_id = $2)`;
+    ? `(${userPlaceholder}::integer IS NOT NULL)`
+    : `(n.audience IN ('all','all_guards') OR n.recipient_user_id = ${userPlaceholder})`;
 }
 
 app.get('/api/communication-notifications', requireAuth, async (req, res) => {
@@ -4124,7 +4124,7 @@ async function updateCommunicationReceipt(req, res, acknowledge) {
   try {
     const result=await withTenant(tenantId,async client=>{
       const visible=await client.query(`SELECT n.id,n.requires_acknowledgement FROM communication_notifications n
-        WHERE n.id=$1 AND n.tenant_id=$2 AND ${communicationAudienceSql(req.auth.role)}`,[req.params.id,tenantId,req.auth.user_id]);
+        WHERE n.id=$1 AND n.tenant_id=$2 AND ${communicationAudienceSql(req.auth.role, '$3')}`,[req.params.id,tenantId,req.auth.user_id]);
       if (!visible.rowCount) { const e=new Error('Notification not found'); e.statusCode=404; throw e; }
       if (acknowledge&&!visible.rows[0].requires_acknowledgement) { const e=new Error('This notification does not require acknowledgement'); e.statusCode=400; throw e; }
       return client.query(`INSERT INTO communication_notification_receipts(notification_id,tenant_id,user_id,read_at,acknowledged_at)

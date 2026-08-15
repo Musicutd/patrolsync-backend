@@ -448,6 +448,22 @@ async function ensureLoneWorkerTables() {
 }
 ensureLoneWorkerTables();
 
+async function ensureDispatchTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS dispatch_jobs (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, reference_code TEXT NOT NULL,
+    title TEXT NOT NULL, description TEXT, priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'assigned',
+    site_id INTEGER, assigned_guard_id INTEGER NOT NULL, address TEXT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION,
+    created_by_user_id INTEGER, assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), accepted_at TIMESTAMPTZ,
+    en_route_at TIMESTAMPTZ, on_site_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, completion_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,reference_code), CONSTRAINT dispatch_priority CHECK(priority IN ('low','normal','high','critical')),
+    CONSTRAINT dispatch_status CHECK(status IN ('assigned','accepted','en_route','on_site','completed','cancelled'))
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_dispatch_tenant_status ON dispatch_jobs(tenant_id,status,created_at DESC)`);
+  console.log('Dispatch tables ready');
+}
+ensureDispatchTables();
+
 async function ensureAuditLogsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -4342,6 +4358,43 @@ async function runLoneWorkerSweep(){try{const due=await pool.query(`${loneWorker
     VALUES($1,$2,$3,'safety','critical','admins',TRUE)`,[row.tenant_id,'Lone-worker welfare check overdue',`${row.guard_email} at ${row.site_name} missed the required safety check-in.`]);}}
   catch(err){console.error('Lone-worker sweep failed:',err.message);}}
 setInterval(runLoneWorkerSweep,60000);setTimeout(runLoneWorkerSweep,15000);
+
+// ------------------------ PHASE 4.4: DISPATCH COMMAND CENTER ------------------------
+
+app.get('/api/dispatch-jobs',requireAuth,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!['admin','guard'].includes(req.auth.role))return res.status(403).json({error:'Dispatch access denied'});
+  try{const result=await withTenant(tenantId,client=>{let sql=`SELECT d.*,u.email AS guard_email,s.name AS site_name FROM dispatch_jobs d
+    JOIN users u ON u.id=d.assigned_guard_id AND u.tenant_id=d.tenant_id LEFT JOIN sites s ON s.id=d.site_id AND s.tenant_id=d.tenant_id WHERE d.tenant_id=$1`;const params=[tenantId];
+    if(req.auth.role==='guard'){params.push(req.auth.user_id);sql+=` AND d.assigned_guard_id=$2`;}if(req.query.status==='active')sql+=` AND d.status NOT IN ('completed','cancelled')`;sql+=' ORDER BY CASE d.priority WHEN \'critical\' THEN 1 WHEN \'high\' THEN 2 WHEN \'normal\' THEN 3 ELSE 4 END,d.created_at DESC LIMIT 300';return client.query(sql,params);});res.json(result.rows);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.post('/api/dispatch-jobs',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id),guardId=Number(req.body.assigned_guard_id),siteId=req.body.site_id?Number(req.body.site_id):null;
+  const title=String(req.body.title||'').trim(),priority=String(req.body.priority||'normal').toLowerCase();
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!title||!Number.isInteger(guardId))return res.status(400).json({error:'Title and assigned guard are required'});
+  if(!['low','normal','high','critical'].includes(priority))return res.status(400).json({error:'Invalid priority'});
+  try{const result=await withTenant(tenantId,async client=>{const guard=await client.query("SELECT id FROM users WHERE id=$1 AND tenant_id=$2 AND role='guard'",[guardId,tenantId]);if(!guard.rowCount){const e=new Error('Guard not found');e.statusCode=404;throw e;}
+    if(siteId){const site=await client.query('SELECT id FROM sites WHERE id=$1 AND tenant_id=$2',[siteId,tenantId]);if(!site.rowCount){const e=new Error('Site not found');e.statusCode=404;throw e;}}
+    const reference='DSP-'+Date.now().toString(36).toUpperCase()+'-'+crypto.randomBytes(2).toString('hex').toUpperCase();
+    const inserted=await client.query(`INSERT INTO dispatch_jobs(tenant_id,reference_code,title,description,priority,site_id,assigned_guard_id,address,latitude,longitude,created_by_user_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[tenantId,reference,title,String(req.body.description||'').trim()||null,priority,siteId,guardId,String(req.body.address||'').trim()||null,req.body.latitude??null,req.body.longitude??null,req.auth.user_id]);
+    await client.query(`INSERT INTO communication_notifications(tenant_id,title,message,category,priority,audience,recipient_user_id,action_url,requires_acknowledgement,created_by_user_id)
+      VALUES($1,$2,$3,'dispatch',$4,'specific_guard',$5,'my_dispatches.html',TRUE,$6)`,[tenantId,'New dispatch: '+title,`Dispatch ${reference} has been assigned to you.`,priority,guardId,req.auth.user_id]);return inserted;});res.status(201).json(result.rows[0]);}
+  catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.patch('/api/dispatch-jobs/:id/status',requireAuth,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id),status=String(req.body.status||'').toLowerCase();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!['admin','guard'].includes(req.auth.role))return res.status(403).json({error:'Dispatch access denied'});
+  if(!['assigned','accepted','en_route','on_site','completed','cancelled'].includes(status))return res.status(400).json({error:'Invalid dispatch status'});
+  try{const result=await withTenant(tenantId,async client=>{const current=await client.query('SELECT * FROM dispatch_jobs WHERE id=$1 AND tenant_id=$2',[req.params.id,tenantId]);if(!current.rowCount){const e=new Error('Dispatch not found');e.statusCode=404;throw e;}const job=current.rows[0];
+    if(req.auth.role==='guard'&&Number(job.assigned_guard_id)!==Number(req.auth.user_id)){const e=new Error('This dispatch is not assigned to you');e.statusCode=403;throw e;}
+    if(req.auth.role==='guard'){const allowed={assigned:['accepted'],accepted:['en_route'],en_route:['on_site'],on_site:['completed']}[job.status]||[];if(!allowed.includes(status)){const e=new Error(`Move the dispatch from ${job.status} to the next status first`);e.statusCode=409;throw e;}}
+    const timeColumn={accepted:'accepted_at',en_route:'en_route_at',on_site:'on_site_at',completed:'completed_at'}[status];let sql='UPDATE dispatch_jobs SET status=$3,updated_at=NOW(),completion_note=CASE WHEN $3=\'completed\' THEN $4 ELSE completion_note END';if(timeColumn)sql+=`,${timeColumn}=COALESCE(${timeColumn},NOW())`;sql+=' WHERE id=$1 AND tenant_id=$2 RETURNING *';return client.query(sql,[req.params.id,tenantId,status,String(req.body.completion_note||'').trim()||null]);});res.json(result.rows[0]);}
+  catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
 
 // ------------------------ SERVER START ------------------------
 

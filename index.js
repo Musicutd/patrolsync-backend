@@ -423,6 +423,31 @@ async function ensureTeamMessagingTables() {
 }
 ensureTeamMessagingTables();
 
+async function ensureLoneWorkerTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS lone_worker_settings (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, user_id INTEGER NOT NULL, site_id INTEGER NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE, interval_minutes INTEGER NOT NULL DEFAULT 60,
+    grace_minutes INTEGER NOT NULL DEFAULT 10, instructions TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(tenant_id,user_id,site_id),
+    CONSTRAINT lone_worker_interval CHECK(interval_minutes BETWEEN 5 AND 720),
+    CONSTRAINT lone_worker_grace CHECK(grace_minutes BETWEEN 0 AND 120)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lone_worker_checkins (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, setting_id BIGINT NOT NULL REFERENCES lone_worker_settings(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL, site_id INTEGER NOT NULL, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION,
+    accuracy DOUBLE PRECISION, note TEXT, checked_in_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lone_worker_alerts (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, setting_id BIGINT NOT NULL REFERENCES lone_worker_settings(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL, site_id INTEGER NOT NULL, due_at TIMESTAMPTZ NOT NULL,
+    resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), resolved_at TIMESTAMPTZ
+  )`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_lone_worker_open_alert ON lone_worker_alerts(setting_id) WHERE resolved=FALSE`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_lone_worker_checkins_latest ON lone_worker_checkins(tenant_id,setting_id,checked_in_at DESC)`);
+  console.log('Lone-worker safety tables ready');
+}
+ensureLoneWorkerTables();
+
 async function ensureAuditLogsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -4256,6 +4281,67 @@ app.post('/api/team-conversations/:id/messages',requireAuth,async(req,res)=>{
     res.status(201).json(result.rows[0]);
   }catch(err){res.status(err.statusCode||500).json({error:err.message});}
 });
+
+// ------------------------ PHASE 4.3: LONE-WORKER SAFETY ------------------------
+
+function loneWorkerStatusSql() {
+  return `SELECT s.*,u.email AS guard_email,si.name AS site_name,a.clocked_in_at,
+    (SELECT MAX(c.checked_in_at) FROM lone_worker_checkins c WHERE c.setting_id=s.id AND c.user_id=s.user_id) AS last_check_in,
+    la.id AS alert_id,la.created_at AS alert_created_at,
+    COALESCE((SELECT MAX(c.checked_in_at) FROM lone_worker_checkins c WHERE c.setting_id=s.id AND c.user_id=s.user_id),a.clocked_in_at) AS safety_reference
+    FROM lone_worker_settings s JOIN users u ON u.id=s.user_id AND u.tenant_id=s.tenant_id
+    JOIN sites si ON si.id=s.site_id AND si.tenant_id=s.tenant_id
+    LEFT JOIN attendance_sessions a ON a.user_id=s.user_id AND a.site_id=s.site_id AND a.tenant_id=s.tenant_id AND a.clocked_out_at IS NULL
+    LEFT JOIN lone_worker_alerts la ON la.setting_id=s.id AND la.resolved=FALSE`;
+}
+
+app.get('/api/lone-worker/settings',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`${loneWorkerStatusSql()} WHERE s.tenant_id=$1 ORDER BY u.email,si.name`,[tenantId]));res.json(result.rows);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.post('/api/lone-worker/settings',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id),userId=Number(req.body.user_id),siteId=Number(req.body.site_id);
+  const interval=Number(req.body.interval_minutes),grace=Number(req.body.grace_minutes);
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!Number.isInteger(userId)||!Number.isInteger(siteId)||!Number.isInteger(interval)||interval<5||interval>720||!Number.isInteger(grace)||grace<0||grace>120)return res.status(400).json({error:'Guard, site, interval (5–720), and grace (0–120) are required'});
+  try{const result=await withTenant(tenantId,async client=>{
+    const valid=await client.query(`SELECT u.id FROM users u JOIN sites s ON s.tenant_id=u.tenant_id WHERE u.id=$1 AND s.id=$2 AND u.tenant_id=$3 AND u.role='guard'`,[userId,siteId,tenantId]);
+    if(!valid.rowCount){const e=new Error('Guard or site not found');e.statusCode=404;throw e;}
+    return client.query(`INSERT INTO lone_worker_settings(tenant_id,user_id,site_id,enabled,interval_minutes,grace_minutes,instructions)
+      VALUES($1,$2,$3,TRUE,$4,$5,$6) ON CONFLICT(tenant_id,user_id,site_id) DO UPDATE SET enabled=TRUE,interval_minutes=$4,grace_minutes=$5,instructions=$6,updated_at=NOW() RETURNING *`,
+      [tenantId,userId,siteId,interval,grace,String(req.body.instructions||'').trim()||null]);});res.status(201).json(result.rows[0]);}
+  catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.patch('/api/lone-worker/settings/:id/toggle',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query('UPDATE lone_worker_settings SET enabled=$3,updated_at=NOW() WHERE id=$1 AND tenant_id=$2 RETURNING *',[req.params.id,tenantId,Boolean(req.body.enabled)]));if(!result.rowCount)return res.status(404).json({error:'Setting not found'});res.json(result.rows[0]);}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.get('/api/lone-worker/current',requireAuth,async(req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`${loneWorkerStatusSql()} WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.enabled=TRUE AND a.id IS NOT NULL ORDER BY a.clocked_in_at DESC LIMIT 1`,[tenantId,req.auth.user_id]));
+    if(!result.rowCount)return res.json({active:false});const row=result.rows[0],reference=new Date(row.safety_reference),due=new Date(reference.getTime()+Number(row.interval_minutes)*60000),escalates=new Date(due.getTime()+Number(row.grace_minutes)*60000);res.json({active:true,setting:row,due_at:due,escalates_at:escalates,overdue:Date.now()>escalates.getTime()});}
+  catch(err){res.status(500).json({error:err.message});}
+});
+
+app.post('/api/lone-worker/check-in',requireAuth,async(req,res)=>{
+  if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,async client=>{const active=await client.query(`${loneWorkerStatusSql()} WHERE s.tenant_id=$1 AND s.user_id=$2 AND s.enabled=TRUE AND a.id IS NOT NULL ORDER BY a.clocked_in_at DESC LIMIT 1`,[tenantId,req.auth.user_id]);
+    if(!active.rowCount){const e=new Error('No active lone-worker session. Clock in at a configured site first.');e.statusCode=409;throw e;}const s=active.rows[0];
+    const check=await client.query(`INSERT INTO lone_worker_checkins(tenant_id,setting_id,user_id,site_id,latitude,longitude,accuracy,note) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[tenantId,s.id,req.auth.user_id,s.site_id,req.body.latitude??null,req.body.longitude??null,req.body.accuracy??null,String(req.body.note||'').trim()||null]);
+    await client.query('UPDATE lone_worker_alerts SET resolved=TRUE,resolved_at=NOW() WHERE setting_id=$1 AND resolved=FALSE',[s.id]);return check;});res.status(201).json(result.rows[0]);}
+  catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+async function runLoneWorkerSweep(){try{const due=await pool.query(`${loneWorkerStatusSql()} WHERE s.enabled=TRUE AND a.id IS NOT NULL AND COALESCE((SELECT MAX(c.checked_in_at) FROM lone_worker_checkins c WHERE c.setting_id=s.id AND c.user_id=s.user_id),a.clocked_in_at)+(s.interval_minutes+s.grace_minutes)*INTERVAL '1 minute'<NOW()`);
+  for(const row of due.rows){const alert=await pool.query(`INSERT INTO lone_worker_alerts(tenant_id,setting_id,user_id,site_id,due_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING id`,[row.tenant_id,row.id,row.user_id,row.site_id,new Date(new Date(row.safety_reference).getTime()+(Number(row.interval_minutes)+Number(row.grace_minutes))*60000)]);if(alert.rowCount)await pool.query(`INSERT INTO communication_notifications(tenant_id,title,message,category,priority,audience,requires_acknowledgement)
+    VALUES($1,$2,$3,'safety','critical','admins',TRUE)`,[row.tenant_id,'Lone-worker welfare check overdue',`${row.guard_email} at ${row.site_name} missed the required safety check-in.`]);}}
+  catch(err){console.error('Lone-worker sweep failed:',err.message);}}
+setInterval(runLoneWorkerSweep,60000);setTimeout(runLoneWorkerSweep,15000);
 
 // ------------------------ SERVER START ------------------------
 

@@ -363,6 +363,42 @@ async function ensureNotificationsTable() {
 }
 ensureNotificationsTable();
 
+async function ensureCommunicationNotificationsTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS communication_notifications (
+      id BIGSERIAL PRIMARY KEY,
+      tenant_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'general',
+      priority TEXT NOT NULL DEFAULT 'normal',
+      audience TEXT NOT NULL DEFAULT 'all_guards',
+      recipient_user_id INTEGER,
+      action_url TEXT,
+      requires_acknowledgement BOOLEAN NOT NULL DEFAULT FALSE,
+      created_by_user_id INTEGER,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT communication_notification_priority CHECK (priority IN ('low','normal','high','critical')),
+      CONSTRAINT communication_notification_audience CHECK (audience IN ('all','admins','all_guards','specific_guard'))
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS communication_notification_receipts (
+      notification_id BIGINT NOT NULL REFERENCES communication_notifications(id) ON DELETE CASCADE,
+      tenant_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      read_at TIMESTAMPTZ,
+      acknowledged_at TIMESTAMPTZ,
+      PRIMARY KEY (notification_id, user_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_comm_notifications_tenant_created ON communication_notifications(tenant_id,created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_comm_notification_receipts_user ON communication_notification_receipts(tenant_id,user_id)`);
+  console.log('Communication notification tables ready');
+}
+ensureCommunicationNotificationsTables();
+
 async function ensureAuditLogsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -4012,6 +4048,102 @@ app.delete('/api/certifications/:id', requireAuth, requireAdmin, async (req, res
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ------------------------ PHASE 4: NOTIFICATIONS & ESCALATIONS ------------------------
+
+function communicationTenant(req, suppliedTenantId) {
+  const tokenTenant = Number(req.auth && req.auth.tenant_id);
+  const requestedTenant = Number(suppliedTenantId || tokenTenant);
+  if (!Number.isInteger(tokenTenant) || !Number.isInteger(requestedTenant) || tokenTenant !== requestedTenant) return null;
+  return requestedTenant;
+}
+
+function communicationAudienceSql(role) {
+  return role === 'admin'
+    ? `TRUE`
+    : `(n.audience IN ('all','all_guards') OR n.recipient_user_id = $2)`;
+}
+
+app.get('/api/communication-notifications', requireAuth, async (req, res) => {
+  const tenantId = communicationTenant(req, req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!['admin', 'guard'].includes(req.auth.role)) return res.status(403).json({ error: 'Notification inbox is unavailable for this role' });
+  const userId = Number(req.auth.user_id);
+  const status = String(req.query.status || 'active');
+  try {
+    const result = await withTenant(tenantId, (client) => client.query(
+      `SELECT n.*, r.read_at, r.acknowledged_at, u.email AS recipient_email, creator.email AS created_by_email
+       FROM communication_notifications n
+       LEFT JOIN communication_notification_receipts r ON r.notification_id=n.id AND r.user_id=$2 AND r.tenant_id=n.tenant_id
+       LEFT JOIN users u ON u.id=n.recipient_user_id AND u.tenant_id=n.tenant_id
+       LEFT JOIN users creator ON creator.id=n.created_by_user_id AND creator.tenant_id=n.tenant_id
+       WHERE n.tenant_id=$1 AND ${communicationAudienceSql(req.auth.role)}
+         AND (n.expires_at IS NULL OR n.expires_at > NOW())
+         AND ($3='all' OR $3='active' OR ($3='unread' AND r.read_at IS NULL) OR ($3='ack_required' AND n.requires_acknowledgement=TRUE AND r.acknowledged_at IS NULL))
+       ORDER BY CASE n.priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 ELSE 4 END, n.created_at DESC LIMIT 250`,
+      [tenantId, userId, status]
+    ));
+    res.json({ notifications: result.rows, unread_count: result.rows.filter(x => !x.read_at).length,
+      acknowledgement_count: result.rows.filter(x => x.requires_acknowledgement && !x.acknowledged_at).length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/communication-notifications', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = communicationTenant(req, req.body.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const title=String(req.body.title||'').trim(), message=String(req.body.message||'').trim();
+  const category=String(req.body.category||'general').trim().toLowerCase(), priority=String(req.body.priority||'normal').trim().toLowerCase();
+  const audience=String(req.body.audience||'all_guards').trim().toLowerCase(), recipientUserId=req.body.recipient_user_id?Number(req.body.recipient_user_id):null;
+  const actionUrl=String(req.body.action_url||'').trim()||null, expiresAt=req.body.expires_at||null;
+  if (!title || !message) return res.status(400).json({ error: 'Title and message are required' });
+  if (title.length>160 || message.length>4000) return res.status(400).json({ error: 'Title or message is too long' });
+  if (!['low','normal','high','critical'].includes(priority)) return res.status(400).json({ error: 'Invalid priority' });
+  if (!['all','admins','all_guards','specific_guard'].includes(audience)) return res.status(400).json({ error: 'Invalid audience' });
+  if (audience==='specific_guard' && !Number.isInteger(recipientUserId)) return res.status(400).json({ error: 'Select a guard' });
+  if (actionUrl && (/^\s*(javascript|data):/i.test(actionUrl) || actionUrl.length>500)) return res.status(400).json({ error: 'Invalid action URL' });
+  try {
+    const result = await withTenant(tenantId, async client => {
+      if (audience==='specific_guard') {
+        const guard=await client.query("SELECT id FROM users WHERE id=$1 AND tenant_id=$2 AND role='guard'",[recipientUserId,tenantId]);
+        if (!guard.rowCount) { const e=new Error('Guard not found'); e.statusCode=404; throw e; }
+      }
+      return client.query(`INSERT INTO communication_notifications
+        (tenant_id,title,message,category,priority,audience,recipient_user_id,action_url,requires_acknowledgement,created_by_user_id,expires_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+        [tenantId,title,message,category,priority,audience,audience==='specific_guard'?recipientUserId:null,actionUrl,
+         Boolean(req.body.requires_acknowledgement),req.auth.user_id,expiresAt]);
+    });
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(err.statusCode||500).json({ error: err.message }); }
+});
+
+async function updateCommunicationReceipt(req, res, acknowledge) {
+  const tenantId=communicationTenant(req,req.body.tenant_id||req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error:'Tenant access denied' });
+  try {
+    const result=await withTenant(tenantId,async client=>{
+      const visible=await client.query(`SELECT n.id,n.requires_acknowledgement FROM communication_notifications n
+        WHERE n.id=$1 AND n.tenant_id=$2 AND ${communicationAudienceSql(req.auth.role)}`,[req.params.id,tenantId,req.auth.user_id]);
+      if (!visible.rowCount) { const e=new Error('Notification not found'); e.statusCode=404; throw e; }
+      if (acknowledge&&!visible.rows[0].requires_acknowledgement) { const e=new Error('This notification does not require acknowledgement'); e.statusCode=400; throw e; }
+      return client.query(`INSERT INTO communication_notification_receipts(notification_id,tenant_id,user_id,read_at,acknowledged_at)
+        VALUES($1,$2,$3,NOW(),${acknowledge?'NOW()':'NULL'}) ON CONFLICT(notification_id,user_id) DO UPDATE SET
+        read_at=COALESCE(communication_notification_receipts.read_at,NOW()), acknowledged_at=${acknowledge?'NOW()':'communication_notification_receipts.acknowledged_at'} RETURNING *`,
+        [req.params.id,tenantId,req.auth.user_id]);
+    });
+    res.json(result.rows[0]);
+  } catch(err) { res.status(err.statusCode||500).json({ error:err.message }); }
+}
+app.patch('/api/communication-notifications/:id/read',requireAuth,(req,res)=>updateCommunicationReceipt(req,res,false));
+app.patch('/api/communication-notifications/:id/acknowledge',requireAuth,(req,res)=>updateCommunicationReceipt(req,res,true));
+
+app.delete('/api/communication-notifications/:id',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.query.tenant_id);
+  if (!tenantId) return res.status(403).json({ error:'Tenant access denied' });
+  try { const result=await withTenant(tenantId,client=>client.query('DELETE FROM communication_notifications WHERE id=$1 AND tenant_id=$2 RETURNING id',[req.params.id,tenantId]));
+    if(!result.rowCount)return res.status(404).json({error:'Notification not found'}); res.json({deleted:true});
+  } catch(err){res.status(500).json({error:err.message});}
 });
 
 // ------------------------ SERVER START ------------------------

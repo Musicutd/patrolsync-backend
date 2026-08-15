@@ -399,6 +399,30 @@ async function ensureCommunicationNotificationsTables() {
 }
 ensureCommunicationNotificationsTables();
 
+async function ensureTeamMessagingTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS team_conversations (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, title TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'company', guard_user_id INTEGER, created_by_user_id INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT team_conversation_kind CHECK (kind IN ('company','direct'))
+  )`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_company_channel ON team_conversations(tenant_id) WHERE kind='company'`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_team_direct_channel ON team_conversations(tenant_id,guard_user_id) WHERE kind='direct'`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS team_messages (
+    id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL,
+    conversation_id BIGINT NOT NULL REFERENCES team_conversations(id) ON DELETE CASCADE,
+    sender_user_id INTEGER NOT NULL, sender_role TEXT NOT NULL, message TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_team_messages_conversation ON team_messages(tenant_id,conversation_id,created_at)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS team_conversation_reads (
+    tenant_id INTEGER NOT NULL, conversation_id BIGINT NOT NULL REFERENCES team_conversations(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL, last_read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(conversation_id,user_id)
+  )`);
+  console.log('Team messaging tables ready');
+}
+ensureTeamMessagingTables();
+
 async function ensureAuditLogsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -4144,6 +4168,93 @@ app.delete('/api/communication-notifications/:id',requireAuth,requireAdmin,async
   try { const result=await withTenant(tenantId,client=>client.query('DELETE FROM communication_notifications WHERE id=$1 AND tenant_id=$2 RETURNING id',[req.params.id,tenantId]));
     if(!result.rowCount)return res.status(404).json({error:'Notification not found'}); res.json({deleted:true});
   } catch(err){res.status(500).json({error:err.message});}
+});
+
+// ------------------------ PHASE 4.2: TEAM MESSAGING ------------------------
+
+function conversationAccessSql(role, userPlaceholder = '$2') {
+  return role === 'admin' ? `(${userPlaceholder}::integer IS NOT NULL)` : `(c.kind='company' OR (c.kind='direct' AND c.guard_user_id=${userPlaceholder}))`;
+}
+
+async function ensureCompanyConversation(client, tenantId, creatorId) {
+  await client.query(`INSERT INTO team_conversations(tenant_id,title,kind,created_by_user_id)
+    VALUES($1,'Company Announcements','company',$2) ON CONFLICT DO NOTHING`,[tenantId,creatorId]);
+}
+
+app.get('/api/team-conversations',requireAuth,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.query.tenant_id);
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!['admin','guard'].includes(req.auth.role))return res.status(403).json({error:'Messaging is unavailable for this role'});
+  try{
+    const result=await withTenant(tenantId,async client=>{
+      await ensureCompanyConversation(client,tenantId,req.auth.user_id);
+      return client.query(`SELECT c.*,u.email AS guard_email,
+        (SELECT m.message FROM team_messages m WHERE m.conversation_id=c.id AND m.tenant_id=c.tenant_id ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+        (SELECT m.created_at FROM team_messages m WHERE m.conversation_id=c.id AND m.tenant_id=c.tenant_id ORDER BY m.created_at DESC LIMIT 1) AS last_message_at,
+        (SELECT COUNT(*)::int FROM team_messages m WHERE m.conversation_id=c.id AND m.tenant_id=c.tenant_id
+          AND m.sender_user_id<>$2 AND m.created_at>COALESCE(r.last_read_at,'1970-01-01')) AS unread_count
+        FROM team_conversations c LEFT JOIN users u ON u.id=c.guard_user_id AND u.tenant_id=c.tenant_id
+        LEFT JOIN team_conversation_reads r ON r.conversation_id=c.id AND r.user_id=$2
+        WHERE c.tenant_id=$1 AND ${conversationAccessSql(req.auth.role)}
+        ORDER BY COALESCE((SELECT MAX(created_at) FROM team_messages WHERE conversation_id=c.id),c.created_at) DESC`,
+        [tenantId,req.auth.user_id]);
+    });
+    res.json(result.rows);
+  }catch(err){res.status(500).json({error:err.message});}
+});
+
+app.post('/api/team-conversations/direct',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id),guardId=Number(req.body.guard_user_id);
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!Number.isInteger(guardId))return res.status(400).json({error:'Select a guard'});
+  try{
+    const result=await withTenant(tenantId,async client=>{
+      const guard=await client.query("SELECT id,email FROM users WHERE id=$1 AND tenant_id=$2 AND role='guard'",[guardId,tenantId]);
+      if(!guard.rowCount){const e=new Error('Guard not found');e.statusCode=404;throw e;}
+      return client.query(`INSERT INTO team_conversations(tenant_id,title,kind,guard_user_id,created_by_user_id)
+        VALUES($1,$2,'direct',$3,$4) ON CONFLICT(tenant_id,guard_user_id) WHERE kind='direct'
+        DO UPDATE SET title=EXCLUDED.title RETURNING *`,[tenantId,guard.rows[0].email,guardId,req.auth.user_id]);
+    });
+    res.status(201).json(result.rows[0]);
+  }catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.get('/api/team-conversations/:id/messages',requireAuth,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.query.tenant_id);
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{
+    const result=await withTenant(tenantId,async client=>{
+      const access=await client.query(`SELECT c.id FROM team_conversations c WHERE c.id=$1 AND c.tenant_id=$2 AND ${conversationAccessSql(req.auth.role,'$3')}`,
+        [req.params.id,tenantId,req.auth.user_id]);
+      if(!access.rowCount){const e=new Error('Conversation not found');e.statusCode=404;throw e;}
+      await client.query(`INSERT INTO team_conversation_reads(tenant_id,conversation_id,user_id,last_read_at) VALUES($1,$2,$3,NOW())
+        ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read_at=NOW()`,[tenantId,req.params.id,req.auth.user_id]);
+      return client.query(`SELECT m.*,u.email AS sender_email FROM team_messages m LEFT JOIN users u ON u.id=m.sender_user_id AND u.tenant_id=m.tenant_id
+        WHERE m.tenant_id=$1 AND m.conversation_id=$2 ORDER BY m.created_at ASC LIMIT 500`,[tenantId,req.params.id]);
+    });
+    res.json(result.rows);
+  }catch(err){res.status(err.statusCode||500).json({error:err.message});}
+});
+
+app.post('/api/team-conversations/:id/messages',requireAuth,async(req,res)=>{
+  const tenantId=communicationTenant(req,req.body.tenant_id),message=String(req.body.message||'').trim();
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!message)return res.status(400).json({error:'Message is required'});
+  if(message.length>4000)return res.status(400).json({error:'Message is too long'});
+  try{
+    const result=await withTenant(tenantId,async client=>{
+      const access=await client.query(`SELECT c.id,c.kind FROM team_conversations c WHERE c.id=$1 AND c.tenant_id=$2 AND ${conversationAccessSql(req.auth.role,'$3')}`,
+        [req.params.id,tenantId,req.auth.user_id]);
+      if(!access.rowCount){const e=new Error('Conversation not found');e.statusCode=404;throw e;}
+      if(req.auth.role==='guard'&&access.rows[0].kind==='company'){const e=new Error('Only admins can post company announcements');e.statusCode=403;throw e;}
+      const inserted=await client.query(`INSERT INTO team_messages(tenant_id,conversation_id,sender_user_id,sender_role,message)
+        VALUES($1,$2,$3,$4,$5) RETURNING *`,[tenantId,req.params.id,req.auth.user_id,req.auth.role,message]);
+      await client.query(`INSERT INTO team_conversation_reads(tenant_id,conversation_id,user_id,last_read_at) VALUES($1,$2,$3,NOW())
+        ON CONFLICT(conversation_id,user_id) DO UPDATE SET last_read_at=NOW()`,[tenantId,req.params.id,req.auth.user_id]);
+      return inserted;
+    });
+    res.status(201).json(result.rows[0]);
+  }catch(err){res.status(err.statusCode||500).json({error:err.message});}
 });
 
 // ------------------------ SERVER START ------------------------

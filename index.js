@@ -3259,7 +3259,7 @@ app.post('/api/attendance/clock-out', requireAuth, async (req, res) => {
       );
       return result.rows[0];
     });
-    res.json({ active: false, session: completed });
+    res.json({ active: false, session: null, completed_session: completed });
   } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
 });
 

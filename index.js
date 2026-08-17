@@ -26,6 +26,33 @@ const LOCATION_HISTORY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const LOCATION_HISTORY_RETENTION_HOURS = 48;
 const MAX_PHOTOS_PER_INCIDENT = 3;
 const MAX_PHOTO_BASE64_LENGTH = 3 * 1024 * 1024;
+const APP_STARTED_AT = new Date();
+const REQUEST_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_REQUEST_LIMIT = Number(process.env.AUTH_REQUEST_LIMIT || 20);
+const API_KEY_REQUEST_LIMIT = Number(process.env.API_KEY_REQUEST_LIMIT || 300);
+const AUDIT_RETENTION_DAYS = Number(process.env.AUDIT_RETENTION_DAYS || 365);
+const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS || 90);
+const requestWindows = new Map();
+
+function requestIp(req) { return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim(); }
+function fixedWindowRateLimit(name, limit) {
+  return (req, res, next) => {
+    const now = Date.now(), key = `${name}:${requestIp(req)}`;
+    let state = requestWindows.get(key);
+    if (!state || now >= state.resetAt) state = { count: 0, resetAt: now + REQUEST_LIMIT_WINDOW_MS };
+    state.count += 1; requestWindows.set(key, state);
+    res.setHeader('X-RateLimit-Limit', String(limit)); res.setHeader('X-RateLimit-Remaining', String(Math.max(0, limit-state.count))); res.setHeader('X-RateLimit-Reset', String(Math.ceil(state.resetAt/1000)));
+    if (state.count > limit) { res.setHeader('Retry-After', String(Math.ceil((state.resetAt-now)/1000))); return res.status(429).json({error:'Too many requests. Please wait and try again.',request_id:req.requestId}); }
+    next();
+  };
+}
+app.use((req,res,next)=>{
+  req.requestId=String(req.headers['x-request-id']||crypto.randomUUID()).slice(0,100);req.requestStartedAt=Date.now();
+  res.setHeader('X-Request-ID',req.requestId);res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');
+  res.on('finish',()=>{if(res.statusCode>=500)console.error(JSON.stringify({level:'error',type:'http_5xx',request_id:req.requestId,method:req.method,path:req.path,status:res.statusCode,duration_ms:Date.now()-req.requestStartedAt}))});next();
+});
+app.use(['/api/auth/login','/api/client-auth/login'],fixedWindowRateLimit('login',AUTH_REQUEST_LIMIT));
+app.use('/api/public/v1',fixedWindowRateLimit('integration-api',API_KEY_REQUEST_LIMIT));
 
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        client_accounts: 1,        monthly_price: 39,  overage: null },
@@ -489,6 +516,8 @@ async function ensureQualityTables(){
 async function ensureStaffAccessColumns(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);console.log('Staff access columns ready');}ensureStaffAccessColumns();
 
 async function ensureIntegrationTables(){await pool.query(`CREATE TABLE IF NOT EXISTS integration_api_keys(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,name TEXT NOT NULL,key_prefix TEXT NOT NULL,key_hash TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,last_used_at TIMESTAMPTZ,created_by_user_id INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE TABLE IF NOT EXISTS webhook_endpoints(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,name TEXT NOT NULL,url TEXT NOT NULL,secret TEXT NOT NULL,event_filter TEXT NOT NULL DEFAULT '*',active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE TABLE IF NOT EXISTS webhook_deliveries(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,webhook_id BIGINT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,event_type TEXT NOT NULL,payload JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),response_status INTEGER,last_error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),delivered_at TIMESTAMPTZ)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_webhook_queue ON webhook_deliveries(status,next_attempt_at)`);console.log('Integration tables ready');}ensureIntegrationTables();
+
+async function ensureOperationsTables(){await pool.query(`CREATE TABLE IF NOT EXISTS system_events(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER,event_type TEXT NOT NULL,severity TEXT NOT NULL DEFAULT 'info',message TEXT NOT NULL,details JSONB NOT NULL DEFAULT '{}'::jsonb,request_id TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_events_tenant_created ON system_events(tenant_id,created_at DESC)`);console.log('Operations monitoring table ready');}ensureOperationsTables();
 
 async function ensureAuditLogsTable() {
   await pool.query(`
@@ -1351,12 +1380,14 @@ app.get('/', (req, res) => {
 
 app.get('/health', async (req, res) => {
   try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'healthy', database: 'connected' });
+    const started=Date.now();await pool.query('SELECT 1');
+    res.json({status:'healthy',service:'PatrolSync Backend',database:'connected',database_latency_ms:Date.now()-started,uptime_seconds:Math.floor(process.uptime()),timestamp:new Date().toISOString(),request_id:req.requestId});
   } catch (err) {
-    res.status(500).json({ status: 'unhealthy', error: err.message });
+    res.status(503).json({status:'unhealthy',database:'disconnected',error:err.message,request_id:req.requestId});
   }
 });
+
+app.get('/ready',async(req,res)=>{try{await pool.query('SELECT 1');res.json({ready:true,request_id:req.requestId})}catch(err){res.status(503).json({ready:false,error:'Database unavailable',request_id:req.requestId})}});
 
 app.get('/api/timezones', (req, res) => {
   res.json(getAllTimezones());
@@ -4464,6 +4495,13 @@ app.patch('/api/integrations/webhooks/:id/toggle',requireAuth,requireOwnerAdmin,
 app.post('/api/integrations/webhooks/:id/test',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.body.tenant_id);if(!t)return res.status(403).json({error:'Tenant access denied'});const payload={event:'test.integration',tenant_id:t,occurred_at:new Date().toISOString(),data:{message:'PatrolSync webhook test'}};const r=await pool.query(`INSERT INTO webhook_deliveries(tenant_id,webhook_id,event_type,payload) SELECT tenant_id,id,'test.integration',$3 FROM webhook_endpoints WHERE id=$1 AND tenant_id=$2 RETURNING id`,[req.params.id,t,JSON.stringify(payload)]);if(!r.rowCount)return res.status(404).json({error:'Webhook not found'});res.json({queued:true})});
 app.get('/api/public/v1/summary',requireIntegrationKey,async(req,res)=>{const t=req.integration.tenant_id;try{const[s,g,c]=await Promise.all([pool.query('SELECT COUNT(*)::int count FROM sites WHERE tenant_id=$1',[t]),pool.query("SELECT COUNT(*)::int count FROM users WHERE tenant_id=$1 AND role='guard'",[t]),pool.query("SELECT COUNT(*)::int count FROM attendance_sessions WHERE tenant_id=$1 AND clocked_out_at IS NULL",[t])]);res.json({tenant_id:t,sites:s.rows[0].count,guards:g.rows[0].count,currently_clocked_in:c.rows[0].count})}catch(e){res.status(500).json({error:e.message})}});
 async function processWebhookQueue(){try{const rows=await pool.query(`SELECT d.*,w.url,w.secret FROM webhook_deliveries d JOIN webhook_endpoints w ON w.id=d.webhook_id WHERE d.status IN ('queued','failed') AND d.next_attempt_at<=NOW() AND d.attempts<5 AND w.active=TRUE ORDER BY d.created_at LIMIT 20`);for(const d of rows.rows){const body=JSON.stringify(d.payload),signature=crypto.createHmac('sha256',d.secret).update(body).digest('hex');try{const response=await fetch(d.url,{method:'POST',headers:{'Content-Type':'application/json','X-PatrolSync-Signature':'sha256='+signature,'X-PatrolSync-Event':d.event_type},body,signal:AbortSignal.timeout(10000)});if(!response.ok)throw Object.assign(new Error('HTTP '+response.status),{status:response.status});await pool.query(`UPDATE webhook_deliveries SET status='delivered',attempts=attempts+1,response_status=$2,delivered_at=NOW(),last_error=NULL WHERE id=$1`,[d.id,response.status])}catch(e){await pool.query(`UPDATE webhook_deliveries SET status='failed',attempts=attempts+1,response_status=$2,last_error=$3,next_attempt_at=NOW()+(POWER(2,attempts)*INTERVAL '1 minute') WHERE id=$1`,[d.id,e.status||null,String(e.message).slice(0,500)])}}}catch(e){console.error('Webhook worker failed:',e.message)}}setInterval(processWebhookQueue,30000);setTimeout(processWebhookQueue,10000);
+
+// ------------------------ PHASE 4.11: PRODUCTION HARDENING ------------------------
+app.get('/api/system-health',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.query.tenant_id);if(!t)return res.status(403).json({error:'Tenant access denied'});try{const dbStarted=Date.now();await pool.query('SELECT 1');const dbLatency=Date.now()-dbStarted;const[webhooks,events,audit,activeUsers]=await Promise.all([pool.query(`SELECT COUNT(*) FILTER(WHERE status='queued')::int queued,COUNT(*) FILTER(WHERE status='failed')::int failed,COUNT(*) FILTER(WHERE status='delivered')::int delivered,MAX(delivered_at) last_delivered_at FROM webhook_deliveries WHERE tenant_id=$1`,[t]),pool.query(`SELECT id,event_type,severity,message,details,request_id,created_at FROM system_events WHERE tenant_id IS NULL OR tenant_id=$1 ORDER BY created_at DESC LIMIT 50`,[t]),pool.query(`SELECT COUNT(*)::int total,MAX(created_at) latest_at FROM audit_logs WHERE tenant_id=$1`,[t]),pool.query(`SELECT COUNT(*)::int total FROM users WHERE tenant_id=$1 AND COALESCE(account_active,TRUE)=TRUE`,[t])]);const memory=process.memoryUsage();res.json({status:'healthy',generated_at:new Date(),started_at:APP_STARTED_AT,uptime_seconds:Math.floor(process.uptime()),database:{connected:true,latency_ms:dbLatency,pool_total:pool.totalCount,pool_idle:pool.idleCount,pool_waiting:pool.waitingCount},memory:{rss_mb:Math.round(memory.rss/1048576),heap_used_mb:Math.round(memory.heapUsed/1048576)},webhooks:webhooks.rows[0],audit:audit.rows[0],active_users:activeUsers.rows[0].total,retention:{audit_days:AUDIT_RETENTION_DAYS,webhook_days:WEBHOOK_RETENTION_DAYS},events:events.rows,request_id:req.requestId})}catch(e){res.status(503).json({status:'unhealthy',error:e.message,request_id:req.requestId})}});
+
+async function runOperationsCleanup(){try{const result=await pool.query(`WITH a AS (DELETE FROM audit_logs WHERE created_at<NOW()-($1::int*INTERVAL '1 day') RETURNING 1),w AS (DELETE FROM webhook_deliveries WHERE created_at<NOW()-($2::int*INTERVAL '1 day') RETURNING 1),e AS (DELETE FROM system_events WHERE created_at<NOW()-INTERVAL '30 days' RETURNING 1) SELECT (SELECT COUNT(*) FROM a)::int audit_deleted,(SELECT COUNT(*) FROM w)::int webhook_deleted,(SELECT COUNT(*) FROM e)::int events_deleted`,[AUDIT_RETENTION_DAYS,WEBHOOK_RETENTION_DAYS]);const counts=result.rows[0];if(counts.audit_deleted||counts.webhook_deleted||counts.events_deleted)console.log('Operations cleanup:',counts)}catch(e){console.error('Operations cleanup failed:',e.message)}}setInterval(runOperationsCleanup,24*60*60*1000);setTimeout(runOperationsCleanup,60000);
+
+app.use((err,req,res,next)=>{console.error(JSON.stringify({level:'error',type:'unhandled_request_error',request_id:req.requestId,method:req.method,path:req.path,message:err.message}));if(res.headersSent)return next(err);res.status(err.statusCode||500).json({error:err.statusCode?err.message:'Unexpected server error',request_id:req.requestId})});
 
 // ------------------------ SERVER START ------------------------
 

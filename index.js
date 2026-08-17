@@ -85,12 +85,21 @@ function getAllTimezones() {
 }
 
 async function withTenant(tenantId, fn) {
+  const normalizedTenantId = Number(tenantId);
+  if (!Number.isInteger(normalizedTenantId) || normalizedTenantId < 1) {
+    const err = new Error('A valid tenant ID is required');
+    err.statusCode = 400;
+    throw err;
+  }
   const client = await pool.connect();
+  let resetError = null;
   try {
-    await client.query(`SET app.current_tenant = '${tenantId}'`);
+    await client.query(`SELECT set_config('app.current_tenant',$1,false)`, [String(normalizedTenantId)]);
     return await fn(client);
   } finally {
-    client.release();
+    try { await client.query('RESET app.current_tenant'); }
+    catch (err) { resetError = err; console.error('Tenant database context reset failed:', err.message); }
+    client.release(resetError || undefined);
   }
 }
 

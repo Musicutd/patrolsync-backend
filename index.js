@@ -2358,10 +2358,11 @@ app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, role } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
+    const includeInactive=req.query.include_inactive==='true';
     const result = await withTenant(tenant_id, (client) =>
       role
-        ? client.query('SELECT * FROM users WHERE tenant_id = $1 AND role = $2 ORDER BY created_at DESC', [tenant_id, role])
-        : client.query('SELECT * FROM users WHERE tenant_id = $1 ORDER BY created_at DESC', [tenant_id])
+        ? client.query(`SELECT * FROM users WHERE tenant_id=$1 AND role=$2 AND ($3::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,role,includeInactive])
+        : client.query(`SELECT * FROM users WHERE tenant_id=$1 AND ($2::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,includeInactive])
     );
     res.json(result.rows);
   } catch (err) {
@@ -2377,16 +2378,18 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'You cannot remove your own account' });
   }
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
-        "DELETE FROM users WHERE id = $1 AND tenant_id = $2 AND role = 'guard' RETURNING id, email",
-        [id, tenant_id]
-      )
-    );
+    const result = await withTenant(tenant_id, async (client) => {
+      await client.query('BEGIN');
+      try {
+        const archived=await client.query("UPDATE users SET account_active=FALSE,password_changed_at=NOW() WHERE id=$1 AND tenant_id=$2 AND role='guard' AND COALESCE(account_active,TRUE)=TRUE RETURNING id,email",[id,tenant_id]);
+        if(archived.rowCount)await client.query('DELETE FROM guard_assignments WHERE tenant_id=$1 AND user_id=$2',[tenant_id,id]);
+        await client.query('COMMIT');return archived;
+      } catch(e) { await client.query('ROLLBACK');throw e; }
+    });
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Guard not found, or user is not a guard' });
+      return res.status(404).json({ error: 'Active guard not found, or guard is already archived' });
     }
-    res.json({ deleted: result.rows[0] });
+    res.json({ archived: result.rows[0],message:'Guard archived. Historical operational records were preserved.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

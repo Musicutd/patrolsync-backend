@@ -545,6 +545,11 @@ async function ensureTenantLifecycleSchema(){
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'active'`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS billing_cycle TEXT NOT NULL DEFAULT 'monthly'`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS renewal_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS platform_notes TEXT`);
   console.log('Subscriber lifecycle columns ready');
 }
 ensureTenantLifecycleSchema().catch(e=>console.error('Subscriber lifecycle setup failed:',e.message));
@@ -2007,23 +2012,7 @@ app.get('/api/tenants', async (req, res) => {
 });
 
 app.patch('/api/tenants/:id/plan', requireAuth, requireAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { plan } = req.body;
-  if (!plan || !VALID_PLANS.includes(plan)) {
-    return res.status(400).json({ error: 'plan must be one of: ' + VALID_PLANS.join(', ') });
-  }
-  if (Number(id) !== req.auth.tenant_id) {
-    return res.status(403).json({ error: 'Cannot modify a different tenant' });
-  }
-  try {
-    const result = await withTenant(id, (client) =>
-      client.query('UPDATE tenants SET plan = $1 WHERE id = $2 RETURNING *', [plan, id])
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tenant not found' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  return res.status(403).json({ error: 'Subscription plans are managed by the PatrolSync platform owner' });
 });
 
 app.patch('/api/tenants/:id/timezone', requireAuth, requireAdmin, async (req, res) => {
@@ -2175,6 +2164,9 @@ app.post('/api/auth/login', async (req, res) => {
     if (!matchedUser || matchedUser.account_active === false) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    const subscriberState=await pool.query(`SELECT COALESCE(account_active,TRUE) active FROM tenants WHERE id=$1`,[matchedUser.tenant_id]);
+    if(!subscriberState.rowCount||subscriberState.rows[0].active===false)return res.status(403).json({error:'Company subscription is suspended. Contact PatrolSync support.'});
 
     if(matchedUser.email_mfa_enabled&&['admin','staff'].includes(matchedUser.role)){const challengeToken=await createEmailMfaChallenge(matchedUser,'login');return res.status(202).json({mfa_required:true,challenge_token:challengeToken,masked_email:matchedUser.email.replace(/^(.{2}).*(@.*)$/,'$1***$2'),expires_in_minutes:10})}
 
@@ -4617,7 +4609,7 @@ app.use((err,req,res,next)=>{console.error(JSON.stringify({level:'error',type:'u
 // ------------------------ PLATFORM SUBSCRIBER LIFECYCLE ------------------------
 app.get('/api/platform/subscribers',requirePlatformAuth,async(req,res)=>{
   try{
-    const result=await pool.query(`SELECT t.id,t.name,t.slug,t.plan,t.timezone,t.created_at,COALESCE(t.account_active,TRUE) account_active,t.suspended_at,t.suspension_reason,COUNT(DISTINCT s.id)::int sites,COUNT(DISTINCT u.id) FILTER(WHERE u.role='guard' AND COALESCE(u.account_active,TRUE)=TRUE)::int guards,COUNT(DISTINCT u.id) FILTER(WHERE u.role='admin' AND COALESCE(u.account_active,TRUE)=TRUE)::int admins FROM tenants t LEFT JOIN sites s ON s.tenant_id=t.id LEFT JOIN users u ON u.tenant_id=t.id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 500`);
+    const result=await pool.query(`SELECT t.id,t.name,t.slug,t.plan,t.timezone,t.created_at,COALESCE(t.account_active,TRUE) account_active,t.suspended_at,t.suspension_reason,t.subscription_status,t.billing_cycle,t.trial_ends_at,t.renewal_at,t.platform_notes,COUNT(DISTINCT s.id)::int sites,COUNT(DISTINCT u.id) FILTER(WHERE u.role='guard' AND COALESCE(u.account_active,TRUE)=TRUE)::int guards,COUNT(DISTINCT u.id) FILTER(WHERE u.role='admin' AND COALESCE(u.account_active,TRUE)=TRUE)::int admins FROM tenants t LEFT JOIN sites s ON s.tenant_id=t.id LEFT JOIN users u ON u.tenant_id=t.id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 500`);
     await platformAudit(req,'VIEW','subscriber_lifecycle',{count:result.rowCount});
     res.json(result.rows);
   }catch(e){res.status(500).json({error:e.message})}
@@ -4643,6 +4635,27 @@ app.post('/api/platform/subscribers/:id/reactivate',requirePlatformAuth,async(re
     if(!changed.rowCount)return res.status(404).json({error:'Suspended subscriber company not found'});
     await platformAudit(req,'REACTIVATE','tenant',{tenant_id:id,company:changed.rows[0].name});
     res.json({message:'Subscriber reactivated. Users may log in again.'});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.patch('/api/platform/subscribers/:id/subscription',requirePlatformAuth,async(req,res)=>{
+  const id=Number(req.params.id),plan=String(req.body.plan||''),subscriptionStatus=String(req.body.subscription_status||''),billingCycle=String(req.body.billing_cycle||'monthly'),notes=String(req.body.platform_notes||'').trim().slice(0,2000);
+  const statuses=['trialing','active','past_due','suspended','cancelled'],cycles=['monthly','annual','custom'];
+  if(!Number.isInteger(id)||id<1)return res.status(400).json({error:'Invalid company ID'});
+  if(!VALID_PLANS.includes(plan))return res.status(400).json({error:'Invalid subscription plan'});
+  if(!statuses.includes(subscriptionStatus))return res.status(400).json({error:'Invalid subscription status'});
+  if(!cycles.includes(billingCycle))return res.status(400).json({error:'Invalid billing cycle'});
+  const dateOrNull=value=>{if(!value)return null;const d=new Date(value);return Number.isNaN(d.getTime())?undefined:d.toISOString()};
+  const trialEnds=dateOrNull(req.body.trial_ends_at),renewal=dateOrNull(req.body.renewal_at);
+  if(trialEnds===undefined||renewal===undefined)return res.status(400).json({error:'Invalid trial or renewal date'});
+  const active=!['suspended','cancelled'].includes(subscriptionStatus);
+  try{
+    const before=(await pool.query(`SELECT id,name,plan,subscription_status,billing_cycle,trial_ends_at,renewal_at,platform_notes,COALESCE(account_active,TRUE) account_active FROM tenants WHERE id=$1`,[id])).rows[0];
+    if(!before)return res.status(404).json({error:'Subscriber company not found'});
+    const changed=(await pool.query(`UPDATE tenants SET plan=$2,subscription_status=$3,billing_cycle=$4,trial_ends_at=$5,renewal_at=$6,platform_notes=$7,account_active=$8,suspended_at=CASE WHEN $8 THEN NULL ELSE COALESCE(suspended_at,NOW()) END,suspension_reason=CASE WHEN $8 THEN NULL ELSE COALESCE(suspension_reason,'Subscription status changed by platform owner') END WHERE id=$1 RETURNING id,name,plan,subscription_status,billing_cycle,trial_ends_at,renewal_at,platform_notes,account_active`,[id,plan,subscriptionStatus,billingCycle,trialEnds,renewal,notes,active])).rows[0];
+    if(!active)await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Subscription disabled' WHERE tenant_id=$1 AND revoked_at IS NULL`,[id]);
+    await platformAudit(req,'UPDATE_SUBSCRIPTION','tenant',{tenant_id:id,company:before.name,before,after:changed});
+    res.json({message:'Subscription updated.',subscriber:changed});
   }catch(e){res.status(500).json({error:e.message})}
 });
 

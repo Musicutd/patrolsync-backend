@@ -1987,7 +1987,7 @@ app.get('/api/client-portal/reports/compliance-pdf', requireAuth, requireClient,
 
 // ------------------------ TENANT ROUTES ------------------------
 
-app.post('/api/tenants', async (req, res) => {
+app.post('/api/tenants', requirePlatformAuth, async (req, res) => {
   const { name, slug, plan } = req.body;
   if (!name || !slug) return res.status(400).json({ error: 'name and slug are required' });
   const chosenPlan = VALID_PLANS.includes(plan) ? plan : 'starter';
@@ -2002,9 +2002,9 @@ app.post('/api/tenants', async (req, res) => {
   }
 });
 
-app.get('/api/tenants', async (req, res) => {
+app.get('/api/tenants', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM tenants ORDER BY created_at DESC');
+    const result = await pool.query('SELECT id,name,slug,plan,timezone,emergency_phone,emergency_whatsapp,created_at FROM tenants WHERE id=$1', [req.auth.tenant_id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });

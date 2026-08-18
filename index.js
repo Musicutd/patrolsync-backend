@@ -9,9 +9,23 @@ const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 require('dotenv').config();
 
+const IS_PRODUCTION=String(process.env.NODE_ENV||'').toLowerCase()==='production';
+function normalizedOrigin(value){try{return new URL(String(value||'').trim()).origin}catch(_){return null}}
+const allowedOrigins=new Set([
+  normalizedOrigin(process.env.FRONTEND_URL),
+  'https://patrolsync.co',
+  'https://www.patrolsync.co',
+  ...String(process.env.ALLOWED_ORIGINS||'').split(',').map(normalizedOrigin)
+].filter(Boolean));
+if(!IS_PRODUCTION){allowedOrigins.add('http://localhost:3000');allowedOrigins.add('http://127.0.0.1:3000');}
+
 const app = express();
-app.use(cors());
+app.disable('x-powered-by');
+app.set('trust proxy',1);
+app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&origin!=='null'&&!allowedOrigins.has(origin))return res.status(403).json({error:'Origin is not allowed'});if(origin==='null'&&IS_PRODUCTION)return res.status(403).json({error:'Local-file browser requests are not allowed in production'});next()});
+app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After'],maxAge:86400}));
 app.use(express.json({ limit: '12mb' }));
+app.use((err,req,res,next)=>{if(err instanceof SyntaxError&&err.status===400&&'body' in err)return res.status(400).json({error:'Malformed JSON request'});if(err?.type==='entity.too.large')return res.status(413).json({error:'Request body is too large'});next(err)});
 
 const databaseSsl = { rejectUnauthorized: false };
 const systemDatabaseUrl = process.env.SYSTEM_DATABASE_URL || process.env.DATABASE_URL;
@@ -43,6 +57,22 @@ const AUDIT_RETENTION_DAYS = Number(process.env.AUDIT_RETENTION_DAYS || 365);
 const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS || 90);
 const requestWindows = new Map();
 
+function getProductionSecurityPosture(){
+  const frontendOrigin=normalizedOrigin(process.env.FRONTEND_URL),jwtValue=String(process.env.JWT_SECRET||''),platformValue=String(process.env.PLATFORM_JWT_SECRET||'');
+  const checks=[
+    {key:'node_environment',critical:true,passed:IS_PRODUCTION,message:IS_PRODUCTION?'NODE_ENV is production':'Set NODE_ENV=production'},
+    {key:'frontend_https',critical:true,passed:Boolean(frontendOrigin?.startsWith('https://')),message:frontendOrigin?.startsWith('https://')?'Frontend URL uses HTTPS':'FRONTEND_URL must use HTTPS'},
+    {key:'jwt_secret',critical:true,passed:jwtValue.length>=32&&jwtValue!=='patrolsync-dev-secret',message:jwtValue.length>=32?'Subscriber JWT secret is strong':'JWT_SECRET must contain at least 32 characters'},
+    {key:'platform_jwt_secret',critical:true,passed:platformValue.length>=32&&platformValue!==jwtValue,message:platformValue.length>=32&&platformValue!==jwtValue?'Platform JWT secret is strong and separate':'PLATFORM_JWT_SECRET must be 32+ characters and different from JWT_SECRET'},
+    {key:'system_database_path',critical:true,passed:Boolean(process.env.SYSTEM_DATABASE_URL),message:process.env.SYSTEM_DATABASE_URL?'Trusted system database path configured':'SYSTEM_DATABASE_URL is missing'},
+    {key:'tenant_database_path',critical:true,passed:Boolean(process.env.TENANT_DATABASE_URL)&&DATABASE_PATHS_SEPARATED,message:Boolean(process.env.TENANT_DATABASE_URL)&&DATABASE_PATHS_SEPARATED?'Restricted tenant database path configured':'TENANT_DATABASE_URL must be configured separately'},
+    {key:'cors_allowlist',critical:true,passed:allowedOrigins.size>0&&!allowedOrigins.has('*'),message:`${allowedOrigins.size} explicit browser origin(s) allowed`},
+    {key:'bootstrap_password_removed',critical:false,passed:!process.env.PLATFORM_ADMIN_PASSWORD,message:process.env.PLATFORM_ADMIN_PASSWORD?'Remove PLATFORM_ADMIN_PASSWORD after the owner account is created':'Platform bootstrap password removed'},
+    {key:'email_provider',critical:false,passed:Boolean(process.env.BREVO_API_KEY&&process.env.EMAIL_FROM_ADDRESS),message:process.env.BREVO_API_KEY&&process.env.EMAIL_FROM_ADDRESS?'Transactional email configured':'Transactional email is incomplete'}
+  ];
+  return {ready:checks.every(x=>!x.critical||x.passed),checks,allowed_origins:[...allowedOrigins]};
+}
+
 function requestIp(req) { return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim(); }
 function fixedWindowRateLimit(name, limit) {
   return (req, res, next) => {
@@ -57,11 +87,14 @@ function fixedWindowRateLimit(name, limit) {
 }
 app.use((req,res,next)=>{
   req.requestId=String(req.headers['x-request-id']||crypto.randomUUID()).slice(0,100);req.requestStartedAt=Date.now();
-  res.setHeader('X-Request-ID',req.requestId);res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');
+  res.setHeader('X-Request-ID',req.requestId);res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'none'; frame-ancestors 'none'; base-uri 'none'");res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()');res.setHeader('X-DNS-Prefetch-Control','off');if(IS_PRODUCTION)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');if(req.path.startsWith('/api/auth')||req.path.startsWith('/api/platform')||req.path.startsWith('/api/security'))res.setHeader('Cache-Control','no-store');
+  if(req.method==='TRACE'||req.method==='TRACK')return res.status(405).json({error:'Method not allowed',request_id:req.requestId});
   res.on('finish',()=>{if(res.statusCode>=500)console.error(JSON.stringify({level:'error',type:'http_5xx',request_id:req.requestId,method:req.method,path:req.path,status:res.statusCode,duration_ms:Date.now()-req.requestStartedAt}))});next();
 });
-app.use(['/api/auth/login','/api/client-auth/login'],fixedWindowRateLimit('login',AUTH_REQUEST_LIMIT));
+app.use(['/api/auth/login','/api/client-auth/login','/api/auth/guard-login','/api/auth/guard-login-v2','/api/auth/forgot-password','/api/auth/forgot-password-by-role','/api/auth/scoped-forgot-password','/api/auth/reset-password'],fixedWindowRateLimit('authentication',AUTH_REQUEST_LIMIT));
+app.use('/api/signup',fixedWindowRateLimit('signup',5));
 app.use('/api/public/v1',fixedWindowRateLimit('integration-api',API_KEY_REQUEST_LIMIT));
+setInterval(()=>{const now=Date.now();for(const[key,value]of requestWindows.entries())if(now>=value.resetAt)requestWindows.delete(key)},10*60*1000);
 
 const PLAN_LIMITS = {
   starter:    { locations: 1,        checkpoints: 10,       guards: 3,        client_accounts: 1,        monthly_price: 39,  overage: null },
@@ -4607,6 +4640,8 @@ async function runOperationsCleanup(){try{const result=await pool.query(`WITH a 
 app.use((err,req,res,next)=>{console.error(JSON.stringify({level:'error',type:'unhandled_request_error',request_id:req.requestId,method:req.method,path:req.path,message:err.message}));if(res.headersSent)return next(err);res.status(err.statusCode||500).json({error:err.statusCode?err.message:'Unexpected server error',request_id:req.requestId})});
 
 // ------------------------ PLATFORM DATABASE ISOLATION SETUP ------------------------
+app.get('/api/platform/security-posture',requirePlatformAuth,async(req,res)=>{try{const posture=getProductionSecurityPosture();await platformAudit(req,'VIEW','production_security_posture',{ready:posture.ready,failed_checks:posture.checks.filter(x=>!x.passed).map(x=>x.key)});res.json({...posture,generated_at:new Date(),headers:{hsts:IS_PRODUCTION,content_security_policy:true,frame_protection:true,no_sniff:true,sensitive_cache_control:true},rate_limits:{authentication_per_15_minutes:AUTH_REQUEST_LIMIT,signup_per_15_minutes:5,integration_api_per_15_minutes:API_KEY_REQUEST_LIMIT}})}catch(e){res.status(500).json({error:e.message})}});
+
 app.get('/api/platform/database-isolation',requirePlatformAuth,async(req,res)=>{
   let tenantClient;
   try{
@@ -4796,4 +4831,7 @@ app.delete('/api/platform/subscribers/:id',requirePlatformAuth,async(req,res)=>{
 
 app.listen(PORT, () => {
   console.log(`PatrolSync backend running on port ${PORT}`);
+  const posture=getProductionSecurityPosture(),issues=posture.checks.filter(x=>!x.passed);
+  if(issues.length)console.warn('Production security configuration warnings:',issues.map(x=>`${x.key}: ${x.message}`).join(' | '));
+  else console.log('Production API security posture: ready');
 });

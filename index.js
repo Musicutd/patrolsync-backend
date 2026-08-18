@@ -120,6 +120,8 @@ async function requireAuth(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
+    const tenantState=await pool.query(`SELECT COALESCE(account_active,TRUE) active FROM tenants WHERE id=$1`,[req.auth.tenant_id]);
+    if(!tenantState.rowCount||tenantState.rows[0].active===false)return res.status(403).json({error:'Company subscription is suspended. Contact PatrolSync support.'});
     if(req.auth.role==='client')return next();
     const check=await pool.query(`SELECT account_active,password_changed_at FROM users WHERE id=$1 AND tenant_id=$2`,[req.auth.user_id,req.auth.tenant_id]);
     if(!check.rowCount||check.rows[0].account_active===false)return res.status(401).json({error:'Account disabled or removed'});
@@ -538,6 +540,14 @@ async function ensureQualityTables(){
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_corrective_actions_status ON corrective_actions(tenant_id,status,due_at)`);
   console.log('Quality inspection tables ready');
 }ensureQualityTables();
+
+async function ensureTenantLifecycleSchema(){
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS suspension_reason TEXT`);
+  console.log('Subscriber lifecycle columns ready');
+}
+ensureTenantLifecycleSchema().catch(e=>console.error('Subscriber lifecycle setup failed:',e.message));
 
 async function ensureStaffAccessColumns(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_active_identity_unique ON users(tenant_id,LOWER(email),role) WHERE account_active=TRUE AND role IN('guard','staff')`);console.log('Staff access columns and active identity protection ready');}ensureStaffAccessColumns().catch(e=>console.error('Staff access setup failed:',e.message));
 async function ensureEmailMfaSchema(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE`);await pool.query(`CREATE TABLE IF NOT EXISTS email_mfa_challenges(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,purpose TEXT NOT NULL CHECK(purpose IN('login','enable')),token_hash TEXT NOT NULL UNIQUE,code_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE INDEX IF NOT EXISTS email_mfa_challenges_lookup ON email_mfa_challenges(token_hash,expires_at) WHERE used_at IS NULL`);console.log('Email MFA schema ready')}ensureEmailMfaSchema().catch(e=>console.error('Email MFA setup failed:',e.message));
@@ -1792,7 +1802,7 @@ app.post('/api/client-auth/login', async (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
 
   try {
-    const tenantsRes = await pool.query('SELECT id FROM tenants');
+    const tenantsRes = await pool.query('SELECT id FROM tenants WHERE COALESCE(account_active,TRUE)=TRUE');
     let matched = null;
     let matchedTenantId = null;
 
@@ -2139,7 +2149,7 @@ app.post('/api/auth/login', async (req, res) => {
       );
       candidates = result.rows;
     } else {
-      const tenantsRes = await pool.query('SELECT id FROM tenants');
+      const tenantsRes = await pool.query('SELECT id FROM tenants WHERE COALESCE(account_active,TRUE)=TRUE');
       for (const t of tenantsRes.rows) {
         const result = await withTenant(t.id, (client) =>
           client.query('SELECT * FROM users WHERE tenant_id = $1 AND LOWER(email) = $2', [t.id, normalizedEmail])
@@ -4603,6 +4613,63 @@ app.get('/api/system-health',requireAuth,requireOwnerAdmin,async(req,res)=>{cons
 async function runOperationsCleanup(){try{const result=await pool.query(`WITH a AS (DELETE FROM audit_logs WHERE created_at<NOW()-($1::int*INTERVAL '1 day') RETURNING 1),w AS (DELETE FROM webhook_deliveries WHERE created_at<NOW()-($2::int*INTERVAL '1 day') RETURNING 1),e AS (DELETE FROM system_events WHERE created_at<NOW()-INTERVAL '30 days' RETURNING 1),s AS (DELETE FROM auth_sessions WHERE expires_at<NOW()-INTERVAL '90 days' RETURNING 1),m AS (DELETE FROM email_mfa_challenges WHERE expires_at<NOW()-INTERVAL '7 days' RETURNING 1) SELECT (SELECT COUNT(*) FROM a)::int audit_deleted,(SELECT COUNT(*) FROM w)::int webhook_deleted,(SELECT COUNT(*) FROM e)::int events_deleted,(SELECT COUNT(*) FROM s)::int sessions_deleted,(SELECT COUNT(*) FROM m)::int mfa_challenges_deleted`,[AUDIT_RETENTION_DAYS,WEBHOOK_RETENTION_DAYS]);const counts=result.rows[0];if(Object.values(counts).some(Number))console.log('Operations cleanup:',counts)}catch(e){console.error('Operations cleanup failed:',e.message)}}setInterval(runOperationsCleanup,24*60*60*1000);setTimeout(runOperationsCleanup,60000);
 
 app.use((err,req,res,next)=>{console.error(JSON.stringify({level:'error',type:'unhandled_request_error',request_id:req.requestId,method:req.method,path:req.path,message:err.message}));if(res.headersSent)return next(err);res.status(err.statusCode||500).json({error:err.statusCode?err.message:'Unexpected server error',request_id:req.requestId})});
+
+// ------------------------ PLATFORM SUBSCRIBER LIFECYCLE ------------------------
+app.get('/api/platform/subscribers',requirePlatformAuth,async(req,res)=>{
+  try{
+    const result=await pool.query(`SELECT t.id,t.name,t.slug,t.plan,t.timezone,t.created_at,COALESCE(t.account_active,TRUE) account_active,t.suspended_at,t.suspension_reason,COUNT(DISTINCT s.id)::int sites,COUNT(DISTINCT u.id) FILTER(WHERE u.role='guard' AND COALESCE(u.account_active,TRUE)=TRUE)::int guards,COUNT(DISTINCT u.id) FILTER(WHERE u.role='admin' AND COALESCE(u.account_active,TRUE)=TRUE)::int admins FROM tenants t LEFT JOIN sites s ON s.tenant_id=t.id LEFT JOIN users u ON u.tenant_id=t.id GROUP BY t.id ORDER BY t.created_at DESC LIMIT 500`);
+    await platformAudit(req,'VIEW','subscriber_lifecycle',{count:result.rowCount});
+    res.json(result.rows);
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.post('/api/platform/subscribers/:id/suspend',requirePlatformAuth,async(req,res)=>{
+  const id=Number(req.params.id),reason=String(req.body.reason||'Suspended by platform owner').trim().slice(0,500);
+  if(!Number.isInteger(id)||id<1)return res.status(400).json({error:'Invalid company ID'});
+  try{
+    const changed=await pool.query(`UPDATE tenants SET account_active=FALSE,suspended_at=NOW(),suspension_reason=$2 WHERE id=$1 AND COALESCE(account_active,TRUE)=TRUE RETURNING id,name`,[id,reason]);
+    if(!changed.rowCount)return res.status(404).json({error:'Active subscriber company not found'});
+    await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Subscriber suspended' WHERE tenant_id=$1 AND revoked_at IS NULL`,[id]);
+    await platformAudit(req,'SUSPEND','tenant',{tenant_id:id,company:changed.rows[0].name,reason});
+    res.json({message:'Subscriber suspended. Existing sessions were revoked.'});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.post('/api/platform/subscribers/:id/reactivate',requirePlatformAuth,async(req,res)=>{
+  const id=Number(req.params.id);
+  if(!Number.isInteger(id)||id<1)return res.status(400).json({error:'Invalid company ID'});
+  try{
+    const changed=await pool.query(`UPDATE tenants SET account_active=TRUE,suspended_at=NULL,suspension_reason=NULL WHERE id=$1 AND COALESCE(account_active,TRUE)=FALSE RETURNING id,name`,[id]);
+    if(!changed.rowCount)return res.status(404).json({error:'Suspended subscriber company not found'});
+    await platformAudit(req,'REACTIVATE','tenant',{tenant_id:id,company:changed.rows[0].name});
+    res.json({message:'Subscriber reactivated. Users may log in again.'});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.delete('/api/platform/subscribers/:id',requirePlatformAuth,async(req,res)=>{
+  const id=Number(req.params.id),confirmation=String(req.body.confirmation||'').trim();
+  if(!Number.isInteger(id)||id<1)return res.status(400).json({error:'Invalid company ID'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const tenant=(await client.query(`SELECT id,name,COALESCE(account_active,TRUE) account_active FROM tenants WHERE id=$1 FOR UPDATE`,[id])).rows[0];
+    if(!tenant){await client.query('ROLLBACK');return res.status(404).json({error:'Subscriber company not found'})}
+    if(tenant.account_active){await client.query('ROLLBACK');return res.status(409).json({error:'Suspend the subscriber before permanent deletion'})}
+    if(confirmation!==`DELETE ${id}`){await client.query('ROLLBACK');return res.status(400).json({error:`Type DELETE ${id} to confirm permanent deletion`})}
+    const tables=(await client.query(`SELECT table_name FROM information_schema.columns WHERE table_schema='public' AND column_name='tenant_id' AND table_name<>'tenants' ORDER BY table_name`)).rows.map(r=>r.table_name);
+    const blockers=[];
+    for(const table of tables){
+      if(!/^[a-z_][a-z0-9_]*$/i.test(table))continue;
+      const count=Number((await client.query(`SELECT COUNT(*)::int count FROM "${table}" WHERE tenant_id=$1`,[id])).rows[0].count);
+      if(count)blockers.push({table,count});
+    }
+    if(blockers.length){await client.query('ROLLBACK');return res.status(409).json({error:'Permanent deletion blocked because company records exist. Keep it suspended to preserve its history.',blockers})}
+    await client.query(`DELETE FROM tenants WHERE id=$1`,[id]);
+    await client.query(`INSERT INTO platform_audit_logs(platform_admin_id,admin_email,action,resource,details,ip_address,request_id) VALUES($1,$2,'PERMANENT_DELETE','tenant',$3::jsonb,$4,$5)`,[req.platformAdmin.id,req.platformAdmin.email,JSON.stringify({tenant_id:id,company:tenant.name}),requestIp(req),req.requestId||null]);
+    await client.query('COMMIT');
+    res.json({message:'Empty subscriber company permanently deleted.'});
+  }catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message})}finally{client.release()}
+});
 
 // ------------------------ SERVER START ------------------------
 

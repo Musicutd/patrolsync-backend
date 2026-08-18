@@ -4632,21 +4632,22 @@ app.post('/api/platform/database-isolation/bootstrap-role',requirePlatformAuth,a
     if(!capability?.can_create_role&&!capability?.is_superuser)return res.status(403).json({error:'The current PostgreSQL role cannot create the restricted login. Use the manual SQL setup instead.'});
     const password=crypto.randomBytes(36).toString('base64url');
     await client.query('BEGIN');
-    const exists=(await client.query(`SELECT 1 FROM pg_roles WHERE rolname='patrolsync_tenant_app'`)).rowCount>0;
+    const baseRoleExists=(await client.query(`SELECT 1 FROM pg_roles WHERE rolname='patrolsync_tenant_app'`)).rowCount>0;
+    const roleName=baseRoleExists?'patrolsync_tenant_'+crypto.randomBytes(4).toString('hex'):'patrolsync_tenant_app';
+    const quotedRole=quotePgIdentifier(roleName);
     const quotedPassword=password.replace(/'/g,"''");
-    if(exists)await client.query(`ALTER ROLE patrolsync_tenant_app WITH LOGIN PASSWORD '${quotedPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
-    else await client.query(`CREATE ROLE patrolsync_tenant_app LOGIN PASSWORD '${quotedPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
-    await client.query(`GRANT CONNECT ON DATABASE ${quotePgIdentifier((await client.query('SELECT current_database() db')).rows[0].db)} TO patrolsync_tenant_app`);
-    await client.query(`GRANT USAGE ON SCHEMA public TO patrolsync_tenant_app`);
-    await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO patrolsync_tenant_app`);
-    await client.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO patrolsync_tenant_app`);
-    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO patrolsync_tenant_app`);
-    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO patrolsync_tenant_app`);
+    await client.query(`CREATE ROLE ${quotedRole} LOGIN PASSWORD '${quotedPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
+    await client.query(`GRANT CONNECT ON DATABASE ${quotePgIdentifier((await client.query('SELECT current_database() db')).rows[0].db)} TO ${quotedRole}`);
+    await client.query(`GRANT USAGE ON SCHEMA public TO ${quotedRole}`);
+    await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO ${quotedRole}`);
+    await client.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${quotedRole}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO ${quotedRole}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO ${quotedRole}`);
     await client.query('COMMIT');
-    const connection=new URL(systemDatabaseUrl);connection.username='patrolsync_tenant_app';connection.password=password;
-    await platformAudit(req,'ROTATE_TENANT_DB_ROLE','database_security',{role:'patrolsync_tenant_app',existing_role_rotated:exists});
+    const connection=new URL(systemDatabaseUrl);connection.username=roleName;connection.password=password;
+    await platformAudit(req,'CREATE_TENANT_DB_ROLE','database_security',{role:roleName,legacy_role_already_existed:baseRoleExists});
     res.setHeader('Cache-Control','no-store');
-    res.json({message:exists?'Restricted tenant database password rotated.':'Restricted tenant database role created.',tenant_database_url:connection.toString(),warning:'Copy this URL now. It will not be shown again. Saving it in Render invalidates any previous TENANT_DATABASE_URL password.'});
+    res.json({message:`Restricted tenant database role ${roleName} created.`,tenant_role:roleName,tenant_database_url:connection.toString(),warning:'Copy this URL now. It will not be shown again.'});
   }catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message})}finally{client.release()}
 });
 

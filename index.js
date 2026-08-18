@@ -30,15 +30,21 @@ app.use((err,req,res,next)=>{if(err instanceof SyntaxError&&err.status===400&&'b
 const databaseSsl = { rejectUnauthorized: false };
 const systemDatabaseUrl = process.env.SYSTEM_DATABASE_URL || process.env.DATABASE_URL;
 const tenantDatabaseUrl = process.env.TENANT_DATABASE_URL || process.env.DATABASE_URL;
-const systemPool = new Pool({ connectionString: systemDatabaseUrl, ssl: databaseSsl });
+const DATABASE_POOL_MAX = Math.max(2, Math.min(50, Number(process.env.DATABASE_POOL_MAX || 10)));
+const DATABASE_IDLE_TIMEOUT_MS = Math.max(1000, Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000));
+const DATABASE_CONNECT_TIMEOUT_MS = Math.max(1000, Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 10000));
+function databasePoolConfig(connectionString){return {connectionString,ssl:databaseSsl,max:DATABASE_POOL_MAX,idleTimeoutMillis:DATABASE_IDLE_TIMEOUT_MS,connectionTimeoutMillis:DATABASE_CONNECT_TIMEOUT_MS,allowExitOnIdle:false}}
+const systemPool = new Pool(databasePoolConfig(systemDatabaseUrl));
 // Existing direct database work remains on the trusted system path. Tenant-scoped
 // work uses tenantPool through withTenant(). Until TENANT_DATABASE_URL is supplied,
 // both names intentionally share one pool so this deployment remains compatible.
 const tenantPool = tenantDatabaseUrl === systemDatabaseUrl
   ? systemPool
-  : new Pool({ connectionString: tenantDatabaseUrl, ssl: databaseSsl });
+  : new Pool(databasePoolConfig(tenantDatabaseUrl));
 const pool = systemPool;
 const DATABASE_PATHS_SEPARATED = tenantPool !== systemPool;
+systemPool.on('error',err=>console.error(JSON.stringify({level:'error',type:'system_pool_error',message:err.message})));
+if(DATABASE_PATHS_SEPARATED)tenantPool.on('error',err=>console.error(JSON.stringify({level:'error',type:'tenant_pool_error',message:err.message})));
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
@@ -56,6 +62,11 @@ const API_KEY_REQUEST_LIMIT = Number(process.env.API_KEY_REQUEST_LIMIT || 300);
 const AUDIT_RETENTION_DAYS = Number(process.env.AUDIT_RETENTION_DAYS || 365);
 const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS || 90);
 const requestWindows = new Map();
+const PERFORMANCE_SAMPLE_WINDOW_MS = 15 * 60 * 1000;
+const PERFORMANCE_MAX_SAMPLES = 20000;
+const performanceSamples = [];
+function percentile(values,percentage){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b);return sorted[Math.min(sorted.length-1,Math.max(0,Math.ceil((percentage/100)*sorted.length)-1))]}
+function trimPerformanceSamples(now=Date.now()){const cutoff=now-PERFORMANCE_SAMPLE_WINDOW_MS;while(performanceSamples.length&&performanceSamples[0].finished_at<cutoff)performanceSamples.shift();if(performanceSamples.length>PERFORMANCE_MAX_SAMPLES)performanceSamples.splice(0,performanceSamples.length-PERFORMANCE_MAX_SAMPLES)}
 
 function getProductionSecurityPosture(){
   const frontendOrigin=normalizedOrigin(process.env.FRONTEND_URL),jwtValue=String(process.env.JWT_SECRET||''),platformValue=String(process.env.PLATFORM_JWT_SECRET||'');
@@ -89,7 +100,7 @@ app.use((req,res,next)=>{
   req.requestId=String(req.headers['x-request-id']||crypto.randomUUID()).slice(0,100);req.requestStartedAt=Date.now();
   res.setHeader('X-Request-ID',req.requestId);res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('X-Frame-Options','DENY');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('Content-Security-Policy',"default-src 'none'; frame-ancestors 'none'; base-uri 'none'");res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()');res.setHeader('X-DNS-Prefetch-Control','off');if(IS_PRODUCTION)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');if(req.path.startsWith('/api/auth')||req.path.startsWith('/api/platform')||req.path.startsWith('/api/security'))res.setHeader('Cache-Control','no-store');
   if(req.method==='TRACE'||req.method==='TRACK')return res.status(405).json({error:'Method not allowed',request_id:req.requestId});
-  res.on('finish',()=>{if(res.statusCode>=500)console.error(JSON.stringify({level:'error',type:'http_5xx',request_id:req.requestId,method:req.method,path:req.path,status:res.statusCode,duration_ms:Date.now()-req.requestStartedAt}))});next();
+  res.on('finish',()=>{const duration=Date.now()-req.requestStartedAt;if(req.path!=='/health'){performanceSamples.push({finished_at:Date.now(),method:req.method,path:String(req.route?.path||req.path).replace(/\/\d+(?=\/|$)/g,'/:id').slice(0,180),status:res.statusCode,duration_ms:duration});trimPerformanceSamples()}if(res.statusCode>=500)console.error(JSON.stringify({level:'error',type:'http_5xx',request_id:req.requestId,method:req.method,path:req.path,status:res.statusCode,duration_ms:duration}))});next();
 });
 app.use(['/api/auth/login','/api/client-auth/login','/api/auth/guard-login','/api/auth/guard-login-v2','/api/auth/forgot-password','/api/auth/forgot-password-by-role','/api/auth/scoped-forgot-password','/api/auth/reset-password'],fixedWindowRateLimit('authentication',AUTH_REQUEST_LIMIT));
 app.use('/api/signup',fixedWindowRateLimit('signup',5));
@@ -4763,6 +4774,25 @@ app.post('/api/platform/database-isolation/activate',requirePlatformAuth,async(r
 });
 
 function quotePgIdentifier(value){return '"'+String(value).replace(/"/g,'""')+'"'}
+
+// ------------------------ PHASE 6: PERFORMANCE OBSERVABILITY ------------------------
+app.get('/api/platform/performance',requirePlatformAuth,async(req,res)=>{
+  try{
+    trimPerformanceSamples();
+    const samples=[...performanceSamples],durations=samples.map(x=>x.duration_ms),errors=samples.filter(x=>x.status>=500),slow=samples.filter(x=>x.duration_ms>=1000);
+    const routeMap=new Map();
+    for(const item of samples){const key=`${item.method} ${item.path}`,current=routeMap.get(key)||{route:key,requests:0,errors:0,total_ms:0,max_ms:0};current.requests++;current.total_ms+=item.duration_ms;current.max_ms=Math.max(current.max_ms,item.duration_ms);if(item.status>=500)current.errors++;routeMap.set(key,current)}
+    const routes=[...routeMap.values()].map(x=>({...x,average_ms:Math.round(x.total_ms/x.requests)})).sort((a,b)=>b.average_ms-a.average_ms||b.requests-a.requests).slice(0,25).map(({total_ms,...x})=>x);
+    const dbStarted=Date.now();await pool.query('SELECT 1');const databaseLatencyMs=Date.now()-dbStarted;
+    let tableActivity=[],indexActivity=[],databaseStats=null;
+    try{tableActivity=(await pool.query(`SELECT relname table_name,seq_scan::bigint,idx_scan::bigint,n_live_tup::bigint live_rows,n_dead_tup::bigint dead_rows,CASE WHEN n_live_tup+n_dead_tup=0 THEN 0 ELSE ROUND(100.0*n_dead_tup/(n_live_tup+n_dead_tup),1) END dead_row_percent FROM pg_stat_user_tables ORDER BY n_live_tup DESC NULLS LAST LIMIT 30`)).rows}catch(_){}
+    try{indexActivity=(await pool.query(`SELECT schemaname,indexrelname index_name,relname table_name,idx_scan::bigint,pg_relation_size(indexrelid)::bigint size_bytes FROM pg_stat_user_indexes WHERE schemaname='public' ORDER BY idx_scan ASC,pg_relation_size(indexrelid) DESC LIMIT 30`)).rows}catch(_){}
+    try{databaseStats=(await pool.query(`SELECT numbackends::int connections,xact_commit::bigint commits,xact_rollback::bigint rollbacks,blks_read::bigint blocks_read,blks_hit::bigint blocks_hit,temp_files::bigint,temp_bytes::bigint,deadlocks::bigint,stats_reset FROM pg_stat_database WHERE datname=current_database()`)).rows[0]||null}catch(_){}
+    const hitTotal=Number(databaseStats?.blocks_hit||0)+Number(databaseStats?.blocks_read||0);const cacheHitPercent=hitTotal?Math.round(Number(databaseStats.blocks_hit)*10000/hitTotal)/100:null;
+    await platformAudit(req,'VIEW','performance_observability',{sample_count:samples.length});
+    res.json({generated_at:new Date(),window_minutes:15,http:{requests:samples.length,errors_5xx:errors.length,error_rate_percent:samples.length?Math.round(errors.length*10000/samples.length)/100:0,slow_requests:slow.length,p50_ms:percentile(durations,50),p95_ms:percentile(durations,95),p99_ms:percentile(durations,99),max_ms:durations.length?Math.max(...durations):0,routes},database:{latency_ms:databaseLatencyMs,cache_hit_percent:cacheHitPercent,stats:databaseStats,system_pool:{total:systemPool.totalCount,idle:systemPool.idleCount,waiting:systemPool.waitingCount,max:DATABASE_POOL_MAX},tenant_pool:{shared_with_system:!DATABASE_PATHS_SEPARATED,total:tenantPool.totalCount,idle:tenantPool.idleCount,waiting:tenantPool.waitingCount,max:DATABASE_POOL_MAX},tables:tableActivity,indexes:indexActivity},process:{uptime_seconds:Math.floor(process.uptime()),heap_used_bytes:process.memoryUsage().heapUsed,rss_bytes:process.memoryUsage().rss,node_version:process.version}});
+  }catch(e){res.status(500).json({error:e.message})}
+});
 
 // ------------------------ PLATFORM SUBSCRIBER LIFECYCLE ------------------------
 app.get('/api/platform/subscribers',requirePlatformAuth,async(req,res)=>{

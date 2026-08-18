@@ -23,7 +23,7 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy',1);
 app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&origin!=='null'&&!allowedOrigins.has(origin))return res.status(403).json({error:'Origin is not allowed'});if(origin==='null'&&IS_PRODUCTION)return res.status(403).json({error:'Local-file browser requests are not allowed in production'});next()});
-app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After'],maxAge:86400}));
+app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After','X-Cache','X-Cache-Age'],maxAge:86400}));
 app.use(express.json({ limit: '12mb' }));
 app.use((err,req,res,next)=>{if(err instanceof SyntaxError&&err.status===400&&'body' in err)return res.status(400).json({error:'Malformed JSON request'});if(err?.type==='entity.too.large')return res.status(413).json({error:'Request body is too large'});next(err)});
 
@@ -62,6 +62,30 @@ const API_KEY_REQUEST_LIMIT = Number(process.env.API_KEY_REQUEST_LIMIT || 300);
 const AUDIT_RETENTION_DAYS = Number(process.env.AUDIT_RETENTION_DAYS || 365);
 const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS || 90);
 const requestWindows = new Map();
+const PLATFORM_CACHE_MAX_ENTRIES=Math.max(20,Math.min(500,Number(process.env.PLATFORM_CACHE_MAX_ENTRIES||100)));
+const platformResponseCache=new Map();
+const platformCacheStats={hits:0,misses:0,stores:0,evictions:0,invalidations:0,bypasses:0};
+function prunePlatformCache(now=Date.now()){
+  for(const[key,value]of platformResponseCache)if(value.expiresAt<=now)platformResponseCache.delete(key);
+  while(platformResponseCache.size>PLATFORM_CACHE_MAX_ENTRIES){platformResponseCache.delete(platformResponseCache.keys().next().value);platformCacheStats.evictions++}
+}
+function clearPlatformCache(reason='manual'){
+  const removed=platformResponseCache.size;platformResponseCache.clear();platformCacheStats.invalidations++;
+  return{removed,reason,at:new Date().toISOString()};
+}
+function platformCache(name,ttlMs){
+  return(req,res,next)=>{
+    if(req.method!=='GET'||req.query?.fresh==='1'){platformCacheStats.bypasses++;res.set('X-Cache','BYPASS');return next()}
+    prunePlatformCache();
+    const key=`${name}:${req.originalUrl}`,cached=platformResponseCache.get(key);
+    if(cached){platformCacheStats.hits++;res.set('X-Cache','HIT');res.set('X-Cache-Age',String(Math.max(0,Math.floor((Date.now()-cached.createdAt)/1000))));return res.status(cached.status).type('application/json').send(cached.body)}
+    platformCacheStats.misses++;res.set('X-Cache','MISS');
+    const originalJson=res.json.bind(res);
+    res.json=body=>{if(res.statusCode>=200&&res.statusCode<300){platformResponseCache.set(key,{body:JSON.stringify(body),status:res.statusCode,createdAt:Date.now(),expiresAt:Date.now()+ttlMs,name});platformCacheStats.stores++;prunePlatformCache()}return originalJson(body)};
+    next();
+  };
+}
+app.use((req,res,next)=>{if(req.path.startsWith('/api/platform/')&&req.path!=='/api/platform/cache'&&req.method!=='GET'){res.on('finish',()=>{if(res.statusCode>=200&&res.statusCode<300)clearPlatformCache(`${req.method} ${req.path}`)})}next()});
 const OBJECT_STORAGE_ENDPOINT=String(process.env.OBJECT_STORAGE_ENDPOINT||'').replace(/\/$/,''),OBJECT_STORAGE_BUCKET=String(process.env.OBJECT_STORAGE_BUCKET||''),OBJECT_STORAGE_ACCESS_KEY=String(process.env.OBJECT_STORAGE_ACCESS_KEY||''),OBJECT_STORAGE_SECRET_KEY=String(process.env.OBJECT_STORAGE_SECRET_KEY||''),OBJECT_STORAGE_REGION=String(process.env.OBJECT_STORAGE_REGION||'auto');
 const OBJECT_STORAGE_CONFIGURED=Boolean(OBJECT_STORAGE_ENDPOINT&&OBJECT_STORAGE_BUCKET&&OBJECT_STORAGE_ACCESS_KEY&&OBJECT_STORAGE_SECRET_KEY);
 function hmac(key,value,encoding){return crypto.createHmac('sha256',key).update(value).digest(encoding)}
@@ -2273,6 +2297,23 @@ app.post('/api/auth/mfa/verify',fixedWindowRateLimit('mfa-verify',20),async(req,
 app.get('/api/security/sessions',requireAuth,requireAdmin,async(req,res)=>{try{const[sessions,events]=await Promise.all([pool.query(`SELECT id,role,ip_address,user_agent,created_at,last_seen_at,expires_at,revoked_at,revoked_reason FROM auth_sessions WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 100`,[req.auth.tenant_id,req.auth.user_id]),pool.query(`SELECT event_type,severity,message,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type IN('account_login','new_device_login','session_revoked','other_sessions_revoked') AND (details->>'user_id')::int=$2 ORDER BY created_at DESC LIMIT 50`,[req.auth.tenant_id,req.auth.user_id])]);res.json({current_session_id:req.auth.session_id||null,sessions:sessions.rows.map(x=>({...x,current:x.id===req.auth.session_id,status:x.revoked_at?'revoked':new Date(x.expires_at)<=new Date()?'expired':'active'})),events:events.rows})}catch(e){res.status(500).json({error:e.message})}});
 app.delete('/api/security/sessions/:id',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Revoked by account owner' WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND revoked_at IS NULL RETURNING id,ip_address,user_agent`,[req.params.id,req.auth.tenant_id,req.auth.user_id]);if(!result.rowCount)return res.status(404).json({error:'Active session not found'});await pool.query(`INSERT INTO system_events(tenant_id,event_type,severity,message,details,request_id) VALUES($1,'session_revoked','warning','Administrator session revoked',$2::jsonb,$3)`,[req.auth.tenant_id,JSON.stringify({user_id:req.auth.user_id,session_id:req.params.id,ip_address:result.rows[0].ip_address,user_agent:result.rows[0].user_agent}),req.requestId]);res.json({revoked:true,current_session_revoked:req.params.id===req.auth.session_id})}catch(e){res.status(500).json({error:e.message})}});
 app.post('/api/security/sessions/revoke-others',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Other sessions signed out' WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL AND expires_at>NOW() AND ($3::uuid IS NULL OR id<>$3::uuid) RETURNING id`,[req.auth.tenant_id,req.auth.user_id,req.auth.session_id||null]);await pool.query(`INSERT INTO system_events(tenant_id,event_type,severity,message,details,request_id) VALUES($1,'other_sessions_revoked','warning','All other administrator sessions revoked',$2::jsonb,$3)`,[req.auth.tenant_id,JSON.stringify({user_id:req.auth.user_id,revoked_count:result.rowCount}),req.requestId]);res.json({revoked_count:result.rowCount})}catch(e){res.status(500).json({error:e.message})}});
+
+// ------------------------ PHASE 6.6: PLATFORM RESPONSE CACHE ------------------------
+app.use('/api/platform/overview',requirePlatformAuth,platformCache('overview',15000));
+app.use('/api/platform/audit',requirePlatformAuth,platformCache('audit',10000));
+app.use('/api/platform/security-posture',requirePlatformAuth,platformCache('security-posture',60000));
+app.use('/api/platform/database-isolation',requirePlatformAuth,platformCache('database-isolation',30000));
+app.use('/api/platform/performance',requirePlatformAuth,platformCache('performance',5000));
+app.use('/api/platform/storage',requirePlatformAuth,platformCache('storage',10000));
+app.use('/api/platform/subscribers',requirePlatformAuth,platformCache('subscribers',15000));
+
+app.get('/api/platform/cache',requirePlatformAuth,(req,res)=>{
+  prunePlatformCache();
+  const entries=[...platformResponseCache.entries()].map(([key,value])=>({key,name:value.name,age_seconds:Math.max(0,Math.floor((Date.now()-value.createdAt)/1000)),expires_in_seconds:Math.max(0,Math.ceil((value.expiresAt-Date.now())/1000)),bytes:Buffer.byteLength(value.body)}));
+  const requests=platformCacheStats.hits+platformCacheStats.misses,bytes=entries.reduce((sum,x)=>sum+x.bytes,0);
+  res.json({enabled:true,scope:'Private platform read endpoints only',max_entries:PLATFORM_CACHE_MAX_ENTRIES,current_entries:entries.length,current_bytes:bytes,hit_rate_percent:requests?Math.round(platformCacheStats.hits*10000/requests)/100:0,stats:{...platformCacheStats},entries});
+});
+app.delete('/api/platform/cache',requirePlatformAuth,async(req,res)=>{const result=clearPlatformCache('platform owner');await platformAudit(req,'CLEAR','platform_response_cache',result);res.json({message:`${result.removed} cached response(s) cleared.`,...result})});
 
 // ------------------------ PHASE 5.8: PLATFORM ADMIN FOUNDATION ------------------------
 const platformDigest=value=>crypto.createHmac('sha256',PLATFORM_JWT_SECRET).update(String(value)).digest('hex');

@@ -4606,6 +4606,52 @@ async function runOperationsCleanup(){try{const result=await pool.query(`WITH a 
 
 app.use((err,req,res,next)=>{console.error(JSON.stringify({level:'error',type:'unhandled_request_error',request_id:req.requestId,method:req.method,path:req.path,message:err.message}));if(res.headersSent)return next(err);res.status(err.statusCode||500).json({error:err.statusCode?err.message:'Unexpected server error',request_id:req.requestId})});
 
+// ------------------------ PLATFORM DATABASE ISOLATION SETUP ------------------------
+app.get('/api/platform/database-isolation',requirePlatformAuth,async(req,res)=>{
+  let tenantClient;
+  try{
+    const systemRole=(await pool.query(`SELECT current_user role_name,r.rolsuper is_superuser,r.rolbypassrls bypasses_rls,r.rolcreaterole can_create_role FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
+    tenantClient=await tenantPool.connect();
+    const tenantRole=(await tenantClient.query(`SELECT current_user role_name,r.rolsuper is_superuser,r.rolbypassrls bypasses_rls FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
+    const first=(await pool.query(`SELECT id FROM tenants ORDER BY id LIMIT 1`)).rows[0];
+    let crossTenantVisible=null;
+    if(first){await tenantClient.query(`SELECT set_config('app.current_tenant',$1,false)`,[String(first.id)]);crossTenantVisible=Number((await tenantClient.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id<>$1`,[first.id])).rows[0].count);await tenantClient.query('RESET app.current_tenant')}
+    const policies=await pool.query(`SELECT COUNT(DISTINCT c.oid)::int tenant_tables,COUNT(DISTINCT c.oid) FILTER(WHERE c.relrowsecurity)::int rls_enabled,COUNT(DISTINCT c.oid) FILTER(WHERE c.relforcerowsecurity)::int rls_forced,COUNT(DISTINCT c.oid) FILTER(WHERE p.tablename IS NOT NULL)::int tables_with_policy FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_policies p ON p.schemaname=n.nspname AND p.tablename=c.relname AND p.policyname='patrolsync_tenant_isolation' WHERE n.nspname='public' AND c.relkind IN('r','p')`);
+    const p=policies.rows[0],separated=systemRole.role_name!==tenantRole.role_name,isolationPassed=separated&&crossTenantVisible===0;
+    await platformAudit(req,'VIEW','database_isolation_status',{system_role:systemRole.role_name,tenant_role:tenantRole.role_name,separated,isolation_passed:isolationPassed});
+    res.json({status:isolationPassed?'isolated':separated?'separated_not_enforced':'compatibility_mode',system_role:systemRole,tenant_role:tenantRole,paths_separated:separated,tenant_context:first?.id||null,cross_tenant_users_visible:crossTenantVisible,policies:p,next_action:!separated?'Generate a restricted tenant connection, then set TENANT_DATABASE_URL in Render.':crossTenantVisible>0?'Prepare and enforce RLS policies in the next controlled step.':'Tenant isolation is enforced.'});
+  }catch(e){res.status(500).json({error:e.message})}finally{if(tenantClient)tenantClient.release()}
+});
+
+app.post('/api/platform/database-isolation/bootstrap-role',requirePlatformAuth,async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    if(!systemDatabaseUrl) return res.status(503).json({error:'SYSTEM_DATABASE_URL or DATABASE_URL is not configured'});
+    if(DATABASE_PATHS_SEPARATED)return res.status(409).json({error:'Tenant and system database paths are already separated. Password rotation is disabled here to avoid breaking the active tenant connection.'});
+    const capability=(await client.query(`SELECT r.rolcreaterole can_create_role,r.rolsuper is_superuser FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
+    if(!capability?.can_create_role&&!capability?.is_superuser)return res.status(403).json({error:'The current PostgreSQL role cannot create the restricted login. Use the manual SQL setup instead.'});
+    const password=crypto.randomBytes(36).toString('base64url');
+    await client.query('BEGIN');
+    const exists=(await client.query(`SELECT 1 FROM pg_roles WHERE rolname='patrolsync_tenant_app'`)).rowCount>0;
+    const quotedPassword=password.replace(/'/g,"''");
+    if(exists)await client.query(`ALTER ROLE patrolsync_tenant_app WITH LOGIN PASSWORD '${quotedPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
+    else await client.query(`CREATE ROLE patrolsync_tenant_app LOGIN PASSWORD '${quotedPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
+    await client.query(`GRANT CONNECT ON DATABASE ${quotePgIdentifier((await client.query('SELECT current_database() db')).rows[0].db)} TO patrolsync_tenant_app`);
+    await client.query(`GRANT USAGE ON SCHEMA public TO patrolsync_tenant_app`);
+    await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO patrolsync_tenant_app`);
+    await client.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO patrolsync_tenant_app`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO patrolsync_tenant_app`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE,SELECT ON SEQUENCES TO patrolsync_tenant_app`);
+    await client.query('COMMIT');
+    const connection=new URL(systemDatabaseUrl);connection.username='patrolsync_tenant_app';connection.password=password;
+    await platformAudit(req,'ROTATE_TENANT_DB_ROLE','database_security',{role:'patrolsync_tenant_app',existing_role_rotated:exists});
+    res.setHeader('Cache-Control','no-store');
+    res.json({message:exists?'Restricted tenant database password rotated.':'Restricted tenant database role created.',tenant_database_url:connection.toString(),warning:'Copy this URL now. It will not be shown again. Saving it in Render invalidates any previous TENANT_DATABASE_URL password.'});
+  }catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message})}finally{client.release()}
+});
+
+function quotePgIdentifier(value){return '"'+String(value).replace(/"/g,'""')+'"'}
+
 // ------------------------ PLATFORM SUBSCRIBER LIFECYCLE ------------------------
 app.get('/api/platform/subscribers',requirePlatformAuth,async(req,res)=>{
   try{

@@ -62,6 +62,15 @@ const API_KEY_REQUEST_LIMIT = Number(process.env.API_KEY_REQUEST_LIMIT || 300);
 const AUDIT_RETENTION_DAYS = Number(process.env.AUDIT_RETENTION_DAYS || 365);
 const WEBHOOK_RETENTION_DAYS = Number(process.env.WEBHOOK_RETENTION_DAYS || 90);
 const requestWindows = new Map();
+const OBJECT_STORAGE_ENDPOINT=String(process.env.OBJECT_STORAGE_ENDPOINT||'').replace(/\/$/,''),OBJECT_STORAGE_BUCKET=String(process.env.OBJECT_STORAGE_BUCKET||''),OBJECT_STORAGE_ACCESS_KEY=String(process.env.OBJECT_STORAGE_ACCESS_KEY||''),OBJECT_STORAGE_SECRET_KEY=String(process.env.OBJECT_STORAGE_SECRET_KEY||''),OBJECT_STORAGE_REGION=String(process.env.OBJECT_STORAGE_REGION||'auto');
+const OBJECT_STORAGE_CONFIGURED=Boolean(OBJECT_STORAGE_ENDPOINT&&OBJECT_STORAGE_BUCKET&&OBJECT_STORAGE_ACCESS_KEY&&OBJECT_STORAGE_SECRET_KEY);
+function hmac(key,value,encoding){return crypto.createHmac('sha256',key).update(value).digest(encoding)}
+function objectStoragePath(key){return'/'+[OBJECT_STORAGE_BUCKET,...String(key).split('/')].map(encodeURIComponent).join('/')}
+async function objectStorageRequest(method,key,body=null,contentType='application/octet-stream'){
+  if(!OBJECT_STORAGE_CONFIGURED)throw new Error('Object storage is not configured');const now=new Date(),amzDate=now.toISOString().replace(/[:-]|\.\d{3}/g,''),date=amzDate.slice(0,8),payload=body||Buffer.alloc(0),payloadHash=crypto.createHash('sha256').update(payload).digest('hex'),url=new URL(OBJECT_STORAGE_ENDPOINT);url.pathname=objectStoragePath(key);const canonicalUri=url.pathname,canonicalHeaders=`host:${url.host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${amzDate}\n`,signedHeaders='host;x-amz-content-sha256;x-amz-date',canonicalRequest=[method,canonicalUri,'',canonicalHeaders,signedHeaders,payloadHash].join('\n'),scope=`${date}/${OBJECT_STORAGE_REGION}/s3/aws4_request`,stringToSign=['AWS4-HMAC-SHA256',amzDate,scope,crypto.createHash('sha256').update(canonicalRequest).digest('hex')].join('\n'),dateKey=hmac('AWS4'+OBJECT_STORAGE_SECRET_KEY,date),regionKey=hmac(dateKey,OBJECT_STORAGE_REGION),serviceKey=hmac(regionKey,'s3'),signingKey=hmac(serviceKey,'aws4_request'),signature=hmac(signingKey,stringToSign,'hex'),headers={'x-amz-date':amzDate,'x-amz-content-sha256':payloadHash,Authorization:`AWS4-HMAC-SHA256 Credential=${OBJECT_STORAGE_ACCESS_KEY}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`};if(body)headers['Content-Type']=contentType;const response=await fetch(url,{method,headers,body:body||undefined,signal:AbortSignal.timeout(20000)});if(!response.ok)throw new Error(`Object storage ${method} failed with HTTP ${response.status}: ${(await response.text()).slice(0,300)}`);return response}
+function parseImageDataUrl(value){const match=/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\r\n]+)$/.exec(String(value||''));if(!match)throw Object.assign(new Error('Photos must be JPEG, PNG, or WebP data URLs'),{statusCode:400});const buffer=Buffer.from(match[2].replace(/\s/g,''),'base64');if(!buffer.length||buffer.length>2*1024*1024)throw Object.assign(new Error('Each decoded photo must be between 1 byte and 2 MB'),{statusCode:400});return{contentType:match[1],buffer,checksum:crypto.createHash('sha256').update(buffer).digest('hex'),extension:match[1]==='image/jpeg'?'jpg':match[1].split('/')[1]}}
+async function storeIncidentPhoto(tenantId,incidentId,dataUrl){const image=parseImageDataUrl(dataUrl);if(!OBJECT_STORAGE_CONFIGURED)return{provider:'database',photoData:dataUrl,key:null,...image};const key=`tenants/${tenantId}/incidents/${incidentId}/${crypto.randomUUID()}.${image.extension}`;await objectStorageRequest('PUT',key,image.buffer,image.contentType);return{provider:'s3',photoData:null,key,...image}}
+async function readIncidentPhoto(row){if(row.photo_data)return row.photo_data;if(row.storage_provider==='s3'&&row.storage_key){const response=await objectStorageRequest('GET',row.storage_key),buffer=Buffer.from(await response.arrayBuffer()),checksum=crypto.createHash('sha256').update(buffer).digest('hex');if(row.checksum_sha256&&checksum!==row.checksum_sha256)throw new Error('Stored evidence checksum mismatch');return`data:${row.content_type||'application/octet-stream'};base64,${buffer.toString('base64')}`}return null}
 const PERFORMANCE_SAMPLE_WINDOW_MS = 15 * 60 * 1000;
 const PERFORMANCE_MAX_SAMPLES = 20000;
 const performanceSamples = [];
@@ -421,6 +430,13 @@ async function ensureIncidentPhotosTable() {
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE incident_photos ALTER COLUMN photo_data DROP NOT NULL`);
+  await pool.query(`ALTER TABLE incident_photos ADD COLUMN IF NOT EXISTS storage_provider TEXT NOT NULL DEFAULT 'database'`);
+  await pool.query(`ALTER TABLE incident_photos ADD COLUMN IF NOT EXISTS storage_key TEXT`);
+  await pool.query(`ALTER TABLE incident_photos ADD COLUMN IF NOT EXISTS content_type TEXT`);
+  await pool.query(`ALTER TABLE incident_photos ADD COLUMN IF NOT EXISTS size_bytes INTEGER`);
+  await pool.query(`ALTER TABLE incident_photos ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_photos_storage_key ON incident_photos(storage_key) WHERE storage_key IS NOT NULL`);
   console.log('Incident photos table ready');
 }
 ensureIncidentPhotosTable();
@@ -3239,9 +3255,11 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
     if (p.length > MAX_PHOTO_BASE64_LENGTH) {
       return res.status(400).json({ error: 'One or more photos are too large. Please retake at a lower quality.' });
     }
+    try{parseImageDataUrl(p)}catch(e){return res.status(e.statusCode||400).json({error:e.message})}
   }
 
   const client = await pool.connect();
+  const uploadedKeys=[];
   try {
     await client.query('BEGIN');
     await client.query(`SET app.current_tenant = '${tenant_id}'`);
@@ -3256,9 +3274,10 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
     await client.query(`INSERT INTO incident_activities (tenant_id,incident_id,user_id,activity_type,note) VALUES ($1,$2,$3,'reported',$4)`,[tenantId,incident.id,user_id,'Incident reported with '+photoList.length+' photo(s)']);
 
     for (const photoData of photoList) {
+      const stored=await storeIncidentPhoto(tenantId,incident.id,photoData);if(stored.key)uploadedKeys.push(stored.key);
       await client.query(
-        'INSERT INTO incident_photos (tenant_id, incident_id, photo_data) VALUES ($1, $2, $3)',
-        [tenant_id, incident.id, photoData]
+        'INSERT INTO incident_photos (tenant_id,incident_id,photo_data,storage_provider,storage_key,content_type,size_bytes,checksum_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+        [tenantId,incident.id,stored.photoData,stored.provider,stored.key,stored.contentType,stored.buffer.length,stored.checksum]
       );
     }
 
@@ -3266,6 +3285,7 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
     res.status(201).json({ ...incident, photo_count: photoList.length });
   } catch (err) {
     await client.query('ROLLBACK');
+    for(const key of uploadedKeys)await objectStorageRequest('DELETE',key).catch(()=>{});
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -3314,11 +3334,11 @@ app.get('/api/incidents/:id/photos', requireAuth, async (req, res) => {
   try {
     const result = await withTenant(tenant_id, (client) =>
       client.query(
-        'SELECT id, photo_data, created_at FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 ORDER BY created_at ASC',
+        'SELECT id,photo_data,storage_provider,storage_key,content_type,size_bytes,checksum_sha256,created_at FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 ORDER BY created_at ASC',
         [id, tenant_id]
       )
     );
-    res.json(result.rows);
+    const photos=[];for(const row of result.rows){try{photos.push({...row,photo_data:await readIncidentPhoto(row),storage_key:undefined})}catch(e){photos.push({...row,photo_data:null,storage_key:undefined,storage_error:'Evidence temporarily unavailable'})}}res.json(photos);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -3329,12 +3349,7 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
   const { tenant_id } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
-    const result = await withTenant(tenant_id, (client) =>
-      client.query(
-        'DELETE FROM incident_photos WHERE incident_id = $1 AND tenant_id = $2 RETURNING id',
-        [id, tenant_id]
-      )
-    );
+    const result = await withTenant(tenant_id,async client=>{const rows=await client.query('SELECT id,storage_provider,storage_key FROM incident_photos WHERE incident_id=$1 AND tenant_id=$2',[id,tenant_id]);for(const row of rows.rows)if(row.storage_provider==='s3'&&row.storage_key)await objectStorageRequest('DELETE',row.storage_key);return client.query('DELETE FROM incident_photos WHERE incident_id=$1 AND tenant_id=$2 RETURNING id',[id,tenant_id])});
     res.json({ deleted_count: result.rows.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -4854,6 +4869,9 @@ app.post('/api/platform/load-tests/run',requirePlatformAuth,async(req,res)=>{
   }catch(e){if(testId)await pool.query(`UPDATE platform_load_tests SET status='failed',finished_at=NOW(),failed_requests=failed_requests+1,error_summary=$2::jsonb WHERE id=$1`,[testId,JSON.stringify([{error:String(e.message).slice(0,500),count:1}])]).catch(()=>{});res.status(500).json({error:e.message})}
   finally{if(locked)await lockClient.query(`SELECT pg_advisory_unlock(hashtext('patrolsync-controlled-load-test'))`).catch(()=>{});lockClient.release()}
 });
+app.get('/api/platform/storage',requirePlatformAuth,async(req,res)=>{try{const counts=(await pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE photo_data IS NOT NULL)::int database_photos,COUNT(*) FILTER(WHERE storage_provider='s3' AND storage_key IS NOT NULL)::int object_photos,COALESCE(SUM(size_bytes),0)::bigint known_bytes FROM incident_photos`)).rows[0];res.json({configured:OBJECT_STORAGE_CONFIGURED,provider:'s3-compatible',endpoint_host:OBJECT_STORAGE_ENDPOINT?new URL(OBJECT_STORAGE_ENDPOINT).host:null,bucket:OBJECT_STORAGE_BUCKET||null,region:OBJECT_STORAGE_REGION,counts})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/platform/storage/test',requirePlatformAuth,async(req,res)=>{if(!OBJECT_STORAGE_CONFIGURED)return res.status(409).json({error:'Object storage environment variables are incomplete'});const key=`platform-tests/${crypto.randomUUID()}.txt`,body=Buffer.from(`PatrolSync storage test ${new Date().toISOString()}`);try{await objectStorageRequest('PUT',key,body,'text/plain');const response=await objectStorageRequest('GET',key),received=Buffer.from(await response.arrayBuffer());if(!crypto.timingSafeEqual(crypto.createHash('sha256').update(body).digest(),crypto.createHash('sha256').update(received).digest()))throw new Error('Downloaded test object did not match uploaded content');await objectStorageRequest('DELETE',key);await platformAudit(req,'TEST','object_storage',{bucket:OBJECT_STORAGE_BUCKET,endpoint_host:new URL(OBJECT_STORAGE_ENDPOINT).host});res.json({message:'Private object storage upload, download, checksum, and deletion passed.'})}catch(e){await objectStorageRequest('DELETE',key).catch(()=>{});res.status(502).json({error:e.message})}});
+app.post('/api/platform/storage/migrate-incident-photos',requirePlatformAuth,async(req,res)=>{if(!OBJECT_STORAGE_CONFIGURED)return res.status(409).json({error:'Configure and test object storage first'});if(String(req.body.confirmation||'')!=='MIGRATE PHOTOS')return res.status(400).json({error:'Type MIGRATE PHOTOS to confirm'});const requestedLimit=Number(req.body.limit||10),limit=Number.isFinite(requestedLimit)?Math.max(1,Math.min(25,Math.floor(requestedLimit))):10,rows=(await pool.query(`SELECT id,tenant_id,incident_id,photo_data FROM incident_photos WHERE photo_data IS NOT NULL ORDER BY id LIMIT $1`,[limit])).rows,migrated=[],failed=[];for(const row of rows){let stored;try{stored=await storeIncidentPhoto(row.tenant_id,row.incident_id,row.photo_data);if(stored.provider!=='s3')throw new Error('External object storage is unavailable');const changed=await pool.query(`UPDATE incident_photos SET photo_data=NULL,storage_provider='s3',storage_key=$2,content_type=$3,size_bytes=$4,checksum_sha256=$5 WHERE id=$1 AND photo_data IS NOT NULL`,[row.id,stored.key,stored.contentType,stored.buffer.length,stored.checksum]);if(!changed.rowCount){await objectStorageRequest('DELETE',stored.key);continue}migrated.push(row.id)}catch(e){if(stored?.key)await objectStorageRequest('DELETE',stored.key).catch(()=>{});failed.push({id:row.id,error:String(e.message).slice(0,500)})}}await platformAudit(req,'MIGRATE','incident_photo_storage',{migrated:migrated.length,failed});res.status(failed.length?207:200).json({message:`${migrated.length} photo(s) migrated; ${failed.length} failed.`,migrated,failed,remaining:Math.max(0,Number((await pool.query(`SELECT COUNT(*)::int count FROM incident_photos WHERE photo_data IS NOT NULL`)).rows[0].count))})});
 
 // ------------------------ PLATFORM SUBSCRIBER LIFECYCLE ------------------------
 app.get('/api/platform/subscribers',requirePlatformAuth,async(req,res)=>{

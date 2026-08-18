@@ -20,11 +20,18 @@ const allowedOrigins=new Set([
 if(!IS_PRODUCTION){allowedOrigins.add('http://localhost:3000');allowedOrigins.add('http://127.0.0.1:3000');}
 
 const app = express();
+const runtimeState={ready:false,draining:false,shutdown_signal:null,shutdown_started_at:null,active_requests:0,total_requests:0};
 app.disable('x-powered-by');
 app.set('trust proxy',1);
 app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&origin!=='null'&&!allowedOrigins.has(origin))return res.status(403).json({error:'Origin is not allowed'});if(origin==='null'&&IS_PRODUCTION)return res.status(403).json({error:'Local-file browser requests are not allowed in production'});next()});
 app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After','X-Cache','X-Cache-Age'],maxAge:86400}));
 app.use(express.json({ limit: '12mb' }));
+app.use((req,res,next)=>{
+  if(runtimeState.draining&&req.path!=='/live')return res.status(503).set('Connection','close').json({error:'Service is restarting',retry_after_seconds:10});
+  runtimeState.active_requests++;runtimeState.total_requests++;
+  let finished=false;const release=()=>{if(!finished){finished=true;runtimeState.active_requests=Math.max(0,runtimeState.active_requests-1)}};
+  res.once('finish',release);res.once('close',release);next();
+});
 app.use((err,req,res,next)=>{if(err instanceof SyntaxError&&err.status===400&&'body' in err)return res.status(400).json({error:'Malformed JSON request'});if(err?.type==='entity.too.large')return res.status(413).json({error:'Request body is too large'});next(err)});
 
 const databaseSsl = { rejectUnauthorized: false };
@@ -99,6 +106,7 @@ const PERFORMANCE_SAMPLE_WINDOW_MS = 15 * 60 * 1000;
 const PERFORMANCE_MAX_SAMPLES = 20000;
 const performanceSamples = [];
 const backgroundJobs = new Map();
+const backgroundTimers = [];
 async function ensureBackgroundJobSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_job_runs(id BIGSERIAL PRIMARY KEY,job_name TEXT NOT NULL,instance_id TEXT NOT NULL,status TEXT NOT NULL,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,duration_ms INTEGER,error_message TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_job_runs_name_started ON platform_job_runs(job_name,started_at DESC)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_job_runs_failures ON platform_job_runs(started_at DESC) WHERE status='failed'`);console.log('Background job history ready')}
 async function ensureLoadTestSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_load_tests(id BIGSERIAL PRIMARY KEY,platform_admin_id BIGINT,scenario TEXT NOT NULL,tenant_id INTEGER,concurrency INTEGER NOT NULL,duration_seconds INTEGER NOT NULL,status TEXT NOT NULL,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,total_requests INTEGER NOT NULL DEFAULT 0,successful_requests INTEGER NOT NULL DEFAULT 0,failed_requests INTEGER NOT NULL DEFAULT 0,requests_per_second NUMERIC,p50_ms INTEGER,p95_ms INTEGER,p99_ms INTEGER,max_ms INTEGER,error_summary JSONB NOT NULL DEFAULT '[]'::jsonb,instance_id TEXT NOT NULL)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_load_tests_started ON platform_load_tests(started_at DESC)`);console.log('Load-test history ready')}
 const BACKGROUND_INSTANCE_ID=String(process.env.RENDER_INSTANCE_ID||process.env.HOSTNAME||crypto.randomUUID()).slice(0,150);
@@ -114,7 +122,7 @@ async function runBackgroundJob(name,fn,trigger='schedule'){
   }catch(e){if(runId)await pool.query(`UPDATE platform_job_runs SET status='failed',finished_at=NOW(),duration_ms=$2,error_message=$3 WHERE id=$1`,[runId,Date.now()-started,String(e.message||e).slice(0,2000)]).catch(()=>{});console.error(JSON.stringify({level:'error',type:'background_job_failed',job:name,message:e.message}));return {status:'failed',error:e.message};}
   finally{if(locked)await lockClient.query(`SELECT pg_advisory_unlock(hashtext($1))`,[`patrolsync-job:${name}`]).catch(()=>{});lockClient.release()}
 }
-function scheduleBackgroundJob(name,intervalMs,initialDelayMs,fn){backgroundJobs.set(name,{name,interval_ms:intervalMs,fn});const execute=()=>runBackgroundJob(name,fn).catch(e=>console.error(`Job ${name} runner failed:`,e.message));setInterval(execute,intervalMs);setTimeout(execute,initialDelayMs)}
+function scheduleBackgroundJob(name,intervalMs,initialDelayMs,fn){backgroundJobs.set(name,{name,interval_ms:intervalMs,fn});const execute=()=>{if(!runtimeState.draining)runBackgroundJob(name,fn).catch(e=>console.error(`Job ${name} runner failed:`,e.message))};const interval=setInterval(execute,intervalMs),initial=setTimeout(execute,initialDelayMs);backgroundTimers.push({type:'interval',handle:interval},{type:'timeout',handle:initial})}
 ensureBackgroundJobSchema().catch(e=>console.error('Background job schema setup failed:',e.message));
 ensureLoadTestSchema().catch(e=>console.error('Load-test schema setup failed:',e.message));
 function percentile(values,percentage){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b);return sorted[Math.min(sorted.length-1,Math.max(0,Math.ceil((percentage/100)*sorted.length)-1))]}
@@ -1538,13 +1546,15 @@ app.get('/', (req, res) => {
 app.get('/health', async (req, res) => {
   try {
     const started=Date.now();await pool.query('SELECT 1');
-    res.json({status:'healthy',service:'PatrolSync Backend',database:'connected',database_latency_ms:Date.now()-started,uptime_seconds:Math.floor(process.uptime()),timestamp:new Date().toISOString(),request_id:req.requestId});
+    const healthy=runtimeState.ready&&!runtimeState.draining;
+    res.status(healthy?200:503).json({status:healthy?'healthy':'draining',service:'PatrolSync Backend',database:'connected',database_latency_ms:Date.now()-started,instance_id:BACKGROUND_INSTANCE_ID,ready:runtimeState.ready,draining:runtimeState.draining,active_requests:runtimeState.active_requests,uptime_seconds:Math.floor(process.uptime()),timestamp:new Date().toISOString(),request_id:req.requestId});
   } catch (err) {
     res.status(503).json({status:'unhealthy',database:'disconnected',error:err.message,request_id:req.requestId});
   }
 });
 
-app.get('/ready',async(req,res)=>{try{await pool.query('SELECT 1');res.json({ready:true,request_id:req.requestId})}catch(err){res.status(503).json({ready:false,error:'Database unavailable',request_id:req.requestId})}});
+app.get('/live',(req,res)=>res.json({live:true,service:'PatrolSync Backend',instance_id:BACKGROUND_INSTANCE_ID,draining:runtimeState.draining,uptime_seconds:Math.floor(process.uptime()),request_id:req.requestId}));
+app.get('/ready',async(req,res)=>{if(!runtimeState.ready||runtimeState.draining)return res.status(503).json({ready:false,draining:runtimeState.draining,error:'Service is not accepting new work',request_id:req.requestId});try{const started=Date.now();await Promise.all([systemPool.query('SELECT 1'),DATABASE_PATHS_SEPARATED?tenantPool.query('SELECT 1'):Promise.resolve()]);res.json({ready:true,instance_id:BACKGROUND_INSTANCE_ID,database_latency_ms:Date.now()-started,system_pool_waiting:systemPool.waitingCount,tenant_pool_waiting:tenantPool.waitingCount,request_id:req.requestId})}catch(err){res.status(503).json({ready:false,error:'Database unavailable',request_id:req.requestId})}});
 
 app.get('/api/timezones', (req, res) => {
   res.json(getAllTimezones());
@@ -2314,6 +2324,12 @@ app.get('/api/platform/cache',requirePlatformAuth,(req,res)=>{
   res.json({enabled:true,scope:'Private platform read endpoints only',max_entries:PLATFORM_CACHE_MAX_ENTRIES,current_entries:entries.length,current_bytes:bytes,hit_rate_percent:requests?Math.round(platformCacheStats.hits*10000/requests)/100:0,stats:{...platformCacheStats},entries});
 });
 app.delete('/api/platform/cache',requirePlatformAuth,async(req,res)=>{const result=clearPlatformCache('platform owner');await platformAudit(req,'CLEAR','platform_response_cache',result);res.json({message:`${result.removed} cached response(s) cleared.`,...result})});
+
+app.get('/api/platform/runtime',requirePlatformAuth,async(req,res)=>{
+  let databaseLatency=null,databaseHealthy=false;
+  try{const started=Date.now();await pool.query('SELECT 1');databaseLatency=Date.now()-started;databaseHealthy=true}catch(_){}
+  res.status(databaseHealthy?200:503).json({instance_id:BACKGROUND_INSTANCE_ID,ready:runtimeState.ready,draining:runtimeState.draining,shutdown_signal:runtimeState.shutdown_signal,shutdown_started_at:runtimeState.shutdown_started_at,started_at:APP_STARTED_AT,uptime_seconds:Math.floor(process.uptime()),active_requests:runtimeState.active_requests,total_requests:runtimeState.total_requests,database:{healthy:databaseHealthy,latency_ms:databaseLatency,paths_separated:DATABASE_PATHS_SEPARATED,system_pool:{total:systemPool.totalCount,idle:systemPool.idleCount,waiting:systemPool.waitingCount,max:DATABASE_POOL_MAX},tenant_pool:{total:tenantPool.totalCount,idle:tenantPool.idleCount,waiting:tenantPool.waitingCount,max:DATABASE_POOL_MAX}},background:{scheduled_jobs:backgroundJobs.size,timer_handles:backgroundTimers.length},cache:{entries:platformResponseCache.size,hits:platformCacheStats.hits,misses:platformCacheStats.misses},memory:{heap_used_bytes:process.memoryUsage().heapUsed,rss_bytes:process.memoryUsage().rss},node_version:process.version});
+});
 
 // ------------------------ PHASE 5.8: PLATFORM ADMIN FOUNDATION ------------------------
 const platformDigest=value=>crypto.createHmac('sha256',PLATFORM_JWT_SECRET).update(String(value)).digest('hex');
@@ -4994,9 +5010,33 @@ app.delete('/api/platform/subscribers/:id',requirePlatformAuth,async(req,res)=>{
 
 // ------------------------ SERVER START ------------------------
 
-app.listen(PORT, () => {
+const server=app.listen(PORT, () => {
+  runtimeState.ready=true;
   console.log(`PatrolSync backend running on port ${PORT}`);
   const posture=getProductionSecurityPosture(),issues=posture.checks.filter(x=>!x.passed);
   if(issues.length)console.warn('Production security configuration warnings:',issues.map(x=>`${x.key}: ${x.message}`).join(' | '));
   else console.log('Production API security posture: ready');
 });
+server.keepAliveTimeout=65000;
+server.headersTimeout=66000;
+server.requestTimeout=30000;
+
+let shutdownPromise=null;
+function beginGracefulShutdown(signal){
+  if(shutdownPromise)return shutdownPromise;
+  shutdownPromise=(async()=>{
+    runtimeState.ready=false;runtimeState.draining=true;runtimeState.shutdown_signal=signal;runtimeState.shutdown_started_at=new Date().toISOString();
+    console.log(JSON.stringify({level:'info',type:'graceful_shutdown_started',signal,instance_id:BACKGROUND_INSTANCE_ID,active_requests:runtimeState.active_requests}));
+    for(const timer of backgroundTimers){if(timer.type==='interval')clearInterval(timer.handle);else clearTimeout(timer.handle)}
+    const forceTimer=setTimeout(()=>{console.error(JSON.stringify({level:'error',type:'graceful_shutdown_timeout',active_requests:runtimeState.active_requests}));process.exit(1)},25000);forceTimer.unref();
+    await new Promise(resolve=>server.close(resolve));
+    await Promise.allSettled([systemPool.end(),...(DATABASE_PATHS_SEPARATED?[tenantPool.end()]:[])]);
+    clearTimeout(forceTimer);
+    console.log(JSON.stringify({level:'info',type:'graceful_shutdown_complete',signal,instance_id:BACKGROUND_INSTANCE_ID}));
+    process.exit(0);
+  })();
+  return shutdownPromise;
+}
+process.once('SIGTERM',()=>beginGracefulShutdown('SIGTERM'));
+process.once('SIGINT',()=>beginGracefulShutdown('SIGINT'));
+process.on('unhandledRejection',reason=>console.error(JSON.stringify({level:'error',type:'unhandled_rejection',message:String(reason?.stack||reason)})));

@@ -124,6 +124,7 @@ async function requireAuth(req, res, next) {
     if(!check.rowCount||check.rows[0].account_active===false)return res.status(401).json({error:'Account disabled or removed'});
     const changed=check.rows[0].password_changed_at?new Date(check.rows[0].password_changed_at).getTime():0,issued=Number(req.auth.iat||0)*1000;
     if(changed&&issued<changed-1000)return res.status(401).json({error:'Session expired after a security change. Please log in again.'});
+    if(req.auth.session_id){const session=await pool.query(`SELECT revoked_at,expires_at FROM auth_sessions WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,[req.auth.session_id,req.auth.tenant_id,req.auth.user_id]);if(!session.rowCount||session.rows[0].revoked_at||new Date(session.rows[0].expires_at)<=new Date())return res.status(401).json({error:'This session has been signed out'});pool.query(`UPDATE auth_sessions SET last_seen_at=NOW() WHERE id=$1 AND last_seen_at<NOW()-INTERVAL '5 minutes'`,[req.auth.session_id]).catch(()=>{})}
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token' });
@@ -537,6 +538,8 @@ async function ensureQualityTables(){
 
 async function ensureStaffAccessColumns(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_active_identity_unique ON users(tenant_id,LOWER(email),role) WHERE account_active=TRUE AND role IN('guard','staff')`);console.log('Staff access columns and active identity protection ready');}ensureStaffAccessColumns().catch(e=>console.error('Staff access setup failed:',e.message));
 async function ensureEmailMfaSchema(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE`);await pool.query(`CREATE TABLE IF NOT EXISTS email_mfa_challenges(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,purpose TEXT NOT NULL CHECK(purpose IN('login','enable')),token_hash TEXT NOT NULL UNIQUE,code_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE INDEX IF NOT EXISTS email_mfa_challenges_lookup ON email_mfa_challenges(token_hash,expires_at) WHERE used_at IS NULL`);console.log('Email MFA schema ready')}ensureEmailMfaSchema().catch(e=>console.error('Email MFA setup failed:',e.message));
+async function ensureAuthSessionsSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS auth_sessions(id UUID PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,role TEXT NOT NULL,ip_address TEXT,user_agent TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,revoked_at TIMESTAMPTZ,revoked_reason TEXT)`);await pool.query(`CREATE INDEX IF NOT EXISTS auth_sessions_user_lookup ON auth_sessions(tenant_id,user_id,created_at DESC)`);console.log('Tracked authentication sessions ready')}ensureAuthSessionsSchema().catch(e=>console.error('Auth session setup failed:',e.message));
+async function createTrackedToken(user,req){const sessionId=crypto.randomUUID(),userId=Number(user.id||user.user_id),tenantId=Number(user.tenant_id),role=user.role,email=user.email;await pool.query(`INSERT INTO auth_sessions(id,tenant_id,user_id,role,ip_address,user_agent,expires_at) VALUES($1,$2,$3,$4,$5,$6,NOW()+INTERVAL '12 hours')`,[sessionId,tenantId,userId,role,requestIp(req),String(req.headers['user-agent']||'').slice(0,500)]);return jwt.sign({user_id:userId,tenant_id:tenantId,role,email,session_id:sessionId},JWT_SECRET,{expiresIn:'12h'})}
 
 function mfaDigest(value){return crypto.createHmac('sha256',JWT_SECRET).update(String(value)).digest('hex')}
 async function createEmailMfaChallenge(user,purpose){const rawToken=crypto.randomBytes(32).toString('hex'),code=String(crypto.randomInt(0,1000000)).padStart(6,'0');await pool.query(`UPDATE email_mfa_challenges SET used_at=NOW() WHERE user_id=$1 AND tenant_id=$2 AND purpose=$3 AND used_at IS NULL`,[user.id,user.tenant_id,purpose]);await pool.query(`INSERT INTO email_mfa_challenges(tenant_id,user_id,purpose,token_hash,code_hash,expires_at) VALUES($1,$2,$3,$4,$5,NOW()+INTERVAL '10 minutes')`,[user.tenant_id,user.id,purpose,mfaDigest(rawToken),mfaDigest(code)]);await sendProviderEmail({to:user.email,subject:'Your PatrolSync verification code',html:emailHtml('PatrolSync verification code',`<p>Enter this code to continue:</p><p style="font-size:30px;font-weight:bold;letter-spacing:6px">${code}</p><p>This code expires in 10 minutes and can be used once.</p>`)});return rawToken}
@@ -2161,16 +2164,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     if(matchedUser.email_mfa_enabled&&['admin','staff'].includes(matchedUser.role)){const challengeToken=await createEmailMfaChallenge(matchedUser,'login');return res.status(202).json({mfa_required:true,challenge_token:challengeToken,masked_email:matchedUser.email.replace(/^(.{2}).*(@.*)$/,'$1***$2'),expires_in_minutes:10})}
 
-    const token = jwt.sign(
-      {
-        user_id: matchedUser.id,
-        tenant_id: matchedUser.tenant_id,
-        role: matchedUser.role,
-        email: matchedUser.email
-      },
-      JWT_SECRET,
-      { expiresIn: '12h' }
-    );
+    const token = await createTrackedToken(matchedUser,req);
 
     res.json({
       token,
@@ -2186,7 +2180,11 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/mfa/verify',fixedWindowRateLimit('mfa-verify',20),async(req,res)=>{try{const user=await consumeEmailMfaChallenge(req.body.challenge_token,req.body.code,'login');const token=jwt.sign({user_id:user.user_id,tenant_id:user.tenant_id,role:user.role,email:user.email},JWT_SECRET,{expiresIn:'12h'});res.json({token,tenant_id:user.tenant_id,user:{id:user.user_id,email:user.email,role:user.role}})}catch(e){res.status(e.statusCode||500).json({error:e.statusCode?e.message:'Could not verify code'})}});
+app.post('/api/auth/mfa/verify',fixedWindowRateLimit('mfa-verify',20),async(req,res)=>{try{const user=await consumeEmailMfaChallenge(req.body.challenge_token,req.body.code,'login');const token=await createTrackedToken(user,req);res.json({token,tenant_id:user.tenant_id,user:{id:user.user_id,email:user.email,role:user.role}})}catch(e){res.status(e.statusCode||500).json({error:e.statusCode?e.message:'Could not verify code'})}});
+
+app.get('/api/security/sessions',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`SELECT id,role,ip_address,user_agent,created_at,last_seen_at,expires_at,revoked_at,revoked_reason FROM auth_sessions WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 100`,[req.auth.tenant_id,req.auth.user_id]);res.json({current_session_id:req.auth.session_id||null,sessions:result.rows.map(x=>({...x,current:x.id===req.auth.session_id,status:x.revoked_at?'revoked':new Date(x.expires_at)<=new Date()?'expired':'active'}))})}catch(e){res.status(500).json({error:e.message})}});
+app.delete('/api/security/sessions/:id',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Revoked by account owner' WHERE id=$1 AND tenant_id=$2 AND user_id=$3 AND revoked_at IS NULL RETURNING id`,[req.params.id,req.auth.tenant_id,req.auth.user_id]);if(!result.rowCount)return res.status(404).json({error:'Active session not found'});res.json({revoked:true,current_session_revoked:req.params.id===req.auth.session_id})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/security/sessions/revoke-others',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Other sessions signed out' WHERE tenant_id=$1 AND user_id=$2 AND revoked_at IS NULL AND expires_at>NOW() AND ($3::uuid IS NULL OR id<>$3::uuid) RETURNING id`,[req.auth.tenant_id,req.auth.user_id,req.auth.session_id||null]);res.json({revoked_count:result.rowCount})}catch(e){res.status(500).json({error:e.message})}});
 
 app.get('/api/security/email-mfa',requireAuth,requireAdmin,async(req,res)=>{try{const result=await pool.query(`SELECT email,email_mfa_enabled FROM users WHERE id=$1 AND tenant_id=$2`,[req.auth.user_id,req.auth.tenant_id]);res.json({email:result.rows[0]?.email,enabled:Boolean(result.rows[0]?.email_mfa_enabled),provider_ready:Boolean(process.env.BREVO_API_KEY&&EMAIL_FROM_ADDRESS)})}catch(e){res.status(500).json({error:e.message})}});
 app.post('/api/security/email-mfa/start',requireAuth,requireAdmin,async(req,res)=>{try{if(!process.env.BREVO_API_KEY||!EMAIL_FROM_ADDRESS)return res.status(409).json({error:'Transactional email provider is not configured'});const found=await pool.query(`SELECT id,tenant_id,email,role FROM users WHERE id=$1 AND tenant_id=$2 AND COALESCE(account_active,TRUE)=TRUE`,[req.auth.user_id,req.auth.tenant_id]);if(!found.rowCount)return res.status(404).json({error:'Account not found'});const challengeToken=await createEmailMfaChallenge(found.rows[0],'enable');res.json({challenge_token:challengeToken,message:'Verification code sent',expires_in_minutes:10})}catch(e){res.status(500).json({error:'Could not send verification code'})}});

@@ -4613,13 +4613,14 @@ app.get('/api/platform/database-isolation',requirePlatformAuth,async(req,res)=>{
     const systemRole=(await pool.query(`SELECT current_user role_name,r.rolsuper is_superuser,r.rolbypassrls bypasses_rls,r.rolcreaterole can_create_role FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
     tenantClient=await tenantPool.connect();
     const tenantRole=(await tenantClient.query(`SELECT current_user role_name,r.rolsuper is_superuser,r.rolbypassrls bypasses_rls FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
-    const first=(await pool.query(`SELECT id FROM tenants ORDER BY id LIMIT 1`)).rows[0];
-    let crossTenantVisible=null;
-    if(first){await tenantClient.query(`SELECT set_config('app.current_tenant',$1,false)`,[String(first.id)]);crossTenantVisible=Number((await tenantClient.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id<>$1`,[first.id])).rows[0].count);await tenantClient.query('RESET app.current_tenant')}
-    const policies=await pool.query(`SELECT COUNT(DISTINCT c.oid)::int tenant_tables,COUNT(DISTINCT c.oid) FILTER(WHERE c.relrowsecurity)::int rls_enabled,COUNT(DISTINCT c.oid) FILTER(WHERE c.relforcerowsecurity)::int rls_forced,COUNT(DISTINCT c.oid) FILTER(WHERE p.tablename IS NOT NULL)::int tables_with_policy FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_policies p ON p.schemaname=n.nspname AND p.tablename=c.relname AND p.policyname='patrolsync_tenant_isolation' WHERE n.nspname='public' AND c.relkind IN('r','p')`);
-    const p=policies.rows[0],separated=systemRole.role_name!==tenantRole.role_name,isolationPassed=separated&&crossTenantVisible===0;
+    const first=(await pool.query(`SELECT t.id FROM tenants t ORDER BY (SELECT COUNT(*) FROM users u WHERE u.tenant_id=t.id) DESC,t.id LIMIT 1`)).rows[0];
+    let crossTenantVisible=null,ownUsersVisible=null,expectedOwnUsers=null;
+    if(first){expectedOwnUsers=Number((await pool.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id=$1`,[first.id])).rows[0].count);await tenantClient.query(`SELECT set_config('app.current_tenant',$1,false)`,[String(first.id)]);ownUsersVisible=Number((await tenantClient.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id=$1`,[first.id])).rows[0].count);crossTenantVisible=Number((await tenantClient.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id<>$1`,[first.id])).rows[0].count);await tenantClient.query('RESET app.current_tenant')}
+    const policies=await pool.query(`SELECT COUNT(DISTINCT c.oid)::int tenant_tables,COUNT(DISTINCT c.oid) FILTER(WHERE c.relrowsecurity)::int rls_enabled,COUNT(DISTINCT c.oid) FILTER(WHERE c.relforcerowsecurity)::int rls_forced,COUNT(DISTINCT c.oid) FILTER(WHERE p.policyname IS NOT NULL)::int tables_with_policy FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_policies p ON p.schemaname=n.nspname AND p.tablename=c.relname WHERE n.nspname='public' AND c.relkind IN('r','p')`);
+    const tenantsProtection=(await pool.query(`SELECT c.relrowsecurity rls_enabled,c.relforcerowsecurity rls_forced,EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname='public' AND p.tablename='tenants') has_policy FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname='tenants'`)).rows[0]||{};
+    const p=policies.rows[0],separated=systemRole.role_name!==tenantRole.role_name,coverageComplete=Number(p.tenant_tables)>0&&Number(p.rls_enabled)===Number(p.tenant_tables)&&Number(p.tables_with_policy)===Number(p.tenant_tables)&&tenantsProtection.rls_enabled&&tenantsProtection.has_policy,isolationPassed=separated&&coverageComplete&&crossTenantVisible===0&&ownUsersVisible===expectedOwnUsers;
     await platformAudit(req,'VIEW','database_isolation_status',{system_role:systemRole.role_name,tenant_role:tenantRole.role_name,separated,isolation_passed:isolationPassed});
-    res.json({status:isolationPassed?'isolated':separated?'separated_not_enforced':'compatibility_mode',system_role:systemRole,tenant_role:tenantRole,paths_separated:separated,tenant_context:first?.id||null,cross_tenant_users_visible:crossTenantVisible,policies:p,next_action:!separated?'Generate a restricted tenant connection, then set TENANT_DATABASE_URL in Render.':crossTenantVisible>0?'Prepare and enforce RLS policies in the next controlled step.':'Tenant isolation is enforced.'});
+    res.json({status:isolationPassed?'isolated':separated?'separated_not_enforced':'compatibility_mode',system_role:systemRole,tenant_role:tenantRole,paths_separated:separated,tenant_context:first?.id||null,own_users_expected:expectedOwnUsers,own_users_visible:ownUsersVisible,cross_tenant_users_visible:crossTenantVisible,coverage_complete:coverageComplete,policies:p,tenants_table:tenantsProtection,next_action:!separated?'Generate a restricted tenant connection, then set TENANT_DATABASE_URL in Render.':!coverageComplete?'Run controlled RLS activation.':ownUsersVisible!==expectedOwnUsers?'RLS is blocking legitimate company records; review policies.':crossTenantVisible>0?'Cross-company records remain visible; review policies.':'Tenant isolation is enforced.'});
   }catch(e){res.status(500).json({error:e.message})}finally{if(tenantClient)tenantClient.release()}
 });
 
@@ -4649,6 +4650,66 @@ app.post('/api/platform/database-isolation/bootstrap-role',requirePlatformAuth,a
     res.setHeader('Cache-Control','no-store');
     res.json({message:`Restricted tenant database role ${roleName} created.`,tenant_role:roleName,tenant_database_url:connection.toString(),warning:'Copy this URL now. It will not be shown again.'});
   }catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message})}finally{client.release()}
+});
+
+app.post('/api/platform/database-isolation/activate',requirePlatformAuth,async(req,res)=>{
+  if(String(req.body.confirmation||'')!=='ENABLE RLS')return res.status(400).json({error:'Type ENABLE RLS to confirm'});
+  if(!DATABASE_PATHS_SEPARATED)return res.status(409).json({error:'Set and verify a separate TENANT_DATABASE_URL before enabling RLS'});
+  const tenantRoleInfo=(await tenantPool.query(`SELECT current_user role_name,r.rolsuper is_superuser,r.rolbypassrls bypasses_rls FROM pg_roles r WHERE r.rolname=current_user`)).rows[0];
+  if(!tenantRoleInfo||tenantRoleInfo.is_superuser||tenantRoleInfo.bypasses_rls||tenantRoleInfo.role_name==='patrolsync_db_user')return res.status(409).json({error:'TENANT_DATABASE_URL is not using a safe restricted role'});
+  const role=tenantRoleInfo.role_name,quotedRole=quotePgIdentifier(role),client=await pool.connect();
+  let tables=[],originallyEnabled=new Set(),tenantsOriginallyEnabled=false;
+  try{
+    const tableRows=await client.query(`SELECT c.relname table_name,c.relrowsecurity rls_enabled FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped WHERE n.nspname='public' AND c.relkind IN('r','p') ORDER BY c.relname`);
+    tables=tableRows.rows.map(x=>x.table_name);originallyEnabled=new Set(tableRows.rows.filter(x=>x.rls_enabled).map(x=>x.table_name));
+    tenantsOriginallyEnabled=Boolean((await client.query(`SELECT c.relrowsecurity enabled FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname='tenants'`)).rows[0]?.enabled);
+    if(!tables.length)throw new Error('No tenant tables were discovered');
+    await client.query('BEGIN');
+    await client.query(`REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM ${quotedRole}`);
+    await client.query(`REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM ${quotedRole}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM ${quotedRole}`);
+    await client.query(`ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM ${quotedRole}`);
+    await client.query(`GRANT USAGE ON SCHEMA public TO ${quotedRole}`);
+    for(const table of tables){
+      const q=quotePgIdentifier(table);
+      await client.query(`DROP POLICY IF EXISTS patrolsync_tenant_access ON public.${q}`);
+      await client.query(`CREATE POLICY patrolsync_tenant_access ON public.${q} AS PERMISSIVE FOR ALL TO ${quotedRole} USING (tenant_id = NULLIF(current_setting('app.current_tenant',true),'')::bigint) WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant',true),'')::bigint)`);
+      await client.query(`ALTER TABLE public.${q} ENABLE ROW LEVEL SECURITY`);
+      await client.query(`ALTER TABLE public.${q} NO FORCE ROW LEVEL SECURITY`);
+      await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON public.${q} TO ${quotedRole}`);
+    }
+    await client.query(`DROP POLICY IF EXISTS patrolsync_tenant_row ON public.tenants`);
+    await client.query(`CREATE POLICY patrolsync_tenant_row ON public.tenants AS PERMISSIVE FOR ALL TO ${quotedRole} USING (id = NULLIF(current_setting('app.current_tenant',true),'')::bigint) WITH CHECK (id = NULLIF(current_setting('app.current_tenant',true),'')::bigint)`);
+    await client.query(`ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY`);
+    await client.query(`ALTER TABLE public.tenants NO FORCE ROW LEVEL SECURITY`);
+    await client.query(`GRANT SELECT ON public.tenants TO ${quotedRole}`);
+    await client.query(`GRANT UPDATE (timezone,emergency_phone,emergency_whatsapp) ON public.tenants TO ${quotedRole}`);
+    const sequences=await client.query(`SELECT DISTINCT ns.nspname schema_name,s.relname sequence_name FROM pg_class s JOIN pg_namespace ns ON ns.oid=s.relnamespace JOIN pg_depend d ON d.objid=s.oid AND d.deptype IN('a','i') JOIN pg_class t ON t.oid=d.refobjid JOIN pg_namespace tn ON tn.oid=t.relnamespace WHERE s.relkind='S' AND ns.nspname='public' AND tn.nspname='public' AND t.relname=ANY($1::text[])`,[tables]);
+    for(const seq of sequences.rows)await client.query(`GRANT USAGE,SELECT ON ${quotePgIdentifier(seq.schema_name)}.${quotePgIdentifier(seq.sequence_name)} TO ${quotedRole}`);
+    await client.query('COMMIT');
+
+    const testTenant=(await pool.query(`SELECT t.id FROM tenants t ORDER BY (SELECT COUNT(*) FROM users u WHERE u.tenant_id=t.id) DESC,t.id LIMIT 1`)).rows[0];
+    if(!testTenant)throw new Error('No subscriber company is available for the post-activation probe');
+    const failures=[];
+    await withTenant(testTenant.id,async restricted=>{
+      for(const table of tables){
+        const q=quotePgIdentifier(table),expected=Number((await pool.query(`SELECT COUNT(*)::int count FROM public.${q} WHERE tenant_id=$1`,[testTenant.id])).rows[0].count),own=Number((await restricted.query(`SELECT COUNT(*)::int count FROM public.${q} WHERE tenant_id=$1`,[testTenant.id])).rows[0].count),cross=Number((await restricted.query(`SELECT COUNT(*)::int count FROM public.${q} WHERE tenant_id<>$1`,[testTenant.id])).rows[0].count);
+        if(own!==expected||cross!==0)failures.push({table,expected_own:expected,visible_own:own,visible_cross:cross});
+      }
+      const tenantOwn=Number((await restricted.query(`SELECT COUNT(*)::int count FROM tenants WHERE id=$1`,[testTenant.id])).rows[0].count),tenantCross=Number((await restricted.query(`SELECT COUNT(*)::int count FROM tenants WHERE id<>$1`,[testTenant.id])).rows[0].count);
+      if(tenantOwn!==1||tenantCross!==0)failures.push({table:'tenants',expected_own:1,visible_own:tenantOwn,visible_cross:tenantCross});
+    });
+    if(failures.length)throw Object.assign(new Error('RLS verification failed; protections were rolled back'),{verificationFailures:failures});
+    await platformAudit(req,'ENABLE_RLS','database_security',{tenant_role:role,tables_protected:tables.length,test_tenant_id:testTenant.id});
+    res.json({message:`Tenant isolation enabled and verified across ${tables.length} tenant tables plus the company table.`,tables_protected:tables.length+1,tenant_role:role});
+  }catch(e){
+    try{await client.query('ROLLBACK')}catch(_){}
+    if(tables.length){
+      try{await client.query('BEGIN');for(const table of tables){const q=quotePgIdentifier(table);await client.query(`DROP POLICY IF EXISTS patrolsync_tenant_access ON public.${q}`);if(!originallyEnabled.has(table))await client.query(`ALTER TABLE public.${q} DISABLE ROW LEVEL SECURITY`)}await client.query(`DROP POLICY IF EXISTS patrolsync_tenant_row ON public.tenants`);if(!tenantsOriginallyEnabled)await client.query(`ALTER TABLE public.tenants DISABLE ROW LEVEL SECURITY`);await client.query('COMMIT')}catch(rollbackError){try{await client.query('ROLLBACK')}catch(_){}console.error('RLS fail-safe rollback failed:',rollbackError.message)}
+    }
+    await platformAudit(req,'RLS_ACTIVATION_FAILED','database_security',{tenant_role:role,error:e.message,failures:e.verificationFailures||[]}).catch(()=>{});
+    res.status(500).json({error:e.message,verification_failures:e.verificationFailures||[]});
+  }finally{client.release()}
 });
 
 function quotePgIdentifier(value){return '"'+String(value).replace(/"/g,'""')+'"'}

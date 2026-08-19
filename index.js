@@ -3139,6 +3139,64 @@ app.get('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>
 app.post('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),cert=String(req.body.cert_name||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!cert)return res.status(400).json({error:'Site and certification name are required'});try{const r=await withTenant(tenantId,client=>client.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name,created_by) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM sites WHERE tenant_id=$1 AND id=$2) ON CONFLICT(tenant_id,site_id,cert_name) DO UPDATE SET cert_name=EXCLUDED.cert_name RETURNING *`,[tenantId,siteId,cert,req.auth.user_id]));if(!r.rowCount)return res.status(404).json({error:'Site not found'});res.status(201).json(r.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
 app.delete('/api/site-guard-requirements/:id',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('DELETE FROM site_guard_requirements WHERE tenant_id=$1 AND id=$2 RETURNING id',[tenantId,req.params.id]));if(!r.rowCount)return res.status(404).json({error:'Requirement not found'});res.json({deleted:true});}catch(err){res.status(500).json({error:err.message});}});
 
+// ------------------------ PREDICTIVE OPERATIONS RISK ------------------------
+
+async function ensureOperationsRiskSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS operations_risk_snapshots(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,
+    score INTEGER NOT NULL,level TEXT NOT NULL,factors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,generated_by INTEGER,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`ALTER TABLE operations_risk_snapshots ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON operations_risk_snapshots`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON operations_risk_snapshots USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS operations_risk_snapshots_site_time ON operations_risk_snapshots(tenant_id,site_id,generated_at DESC)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,DELETE ON operations_risk_snapshots TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE operations_risk_snapshots_id_seq TO "${role}"`);}}
+  catch(err){console.warn('Operations Risk tenant grants skipped:',err.message);}
+  console.log('Predictive Operations Risk schema ready');
+}
+ensureOperationsRiskSchema().catch(err=>console.error('Predictive Operations Risk setup failed:',err.message));
+
+function operationsRiskLevel(score){return score>=75?'critical':score>=50?'high':score>=25?'medium':'low';}
+function buildOperationsRiskSite(row){
+  const factors=[],recommendations=[];let score=0;
+  const add=(code,label,points,count,action)=>{if(!count)return;score+=points;factors.push({code,label,points,count});if(action&&!recommendations.includes(action))recommendations.push(action);};
+  add('active_sos',`${row.active_sos} active SOS alert${Number(row.active_sos)===1?'':'s'}`,Math.min(40,Number(row.active_sos)*40),Number(row.active_sos),'Respond to and resolve the active SOS alert immediately.');
+  add('lone_worker',`${row.lone_worker_alerts} unresolved lone-worker alert${Number(row.lone_worker_alerts)===1?'':'s'}`,Math.min(30,Number(row.lone_worker_alerts)*20),Number(row.lone_worker_alerts),'Contact the affected lone worker and complete the escalation procedure.');
+  add('critical_incidents',`${row.critical_incidents} open critical incident${Number(row.critical_incidents)===1?'':'s'}`,Math.min(30,Number(row.critical_incidents)*20),Number(row.critical_incidents),'Assign an owner and response deadline to every critical incident.');
+  add('other_incidents',`${row.other_incidents} other open incident${Number(row.other_incidents)===1?'':'s'}`,Math.min(20,Number(row.other_incidents)*6),Number(row.other_incidents),'Review unresolved incidents and close or escalate stale cases.');
+  add('patrol_alerts',`${row.patrol_alerts} unresolved patrol exception${Number(row.patrol_alerts)===1?'':'s'}`,Math.min(25,Number(row.patrol_alerts)*10),Number(row.patrol_alerts),'Review missed or late patrol activity and document corrective action.');
+  add('coverage_gaps',`${row.coverage_gaps} near-term coverage risk${Number(row.coverage_gaps)===1?'':'s'}`,Math.min(25,Number(row.coverage_gaps)*12),Number(row.coverage_gaps),'Open Coverage Autopilot and secure confirmed replacement coverage.');
+  add('expiring_certs',`${row.expiring_certs} assigned guard certification${Number(row.expiring_certs)===1?'':'s'} expiring within 30 days`,Math.min(15,Number(row.expiring_certs)*5),Number(row.expiring_certs),'Renew expiring certifications or schedule a qualified replacement.');
+  if(Number(row.scans_7d)===0){score+=10;factors.push({code:'no_recent_scans',label:'No checkpoint scans recorded during the last 7 days',points:10,count:1});recommendations.push('Confirm the patrol schedule and checkpoint scanning process for this site.');}
+  score=Math.max(0,Math.min(100,Math.round(score)));
+  if(!recommendations.length)recommendations.push('Continue normal monitoring; no immediate preventive action is required.');
+  return{site_id:Number(row.site_id),site_name:row.site_name,score,level:operationsRiskLevel(score),factors,recommendations,signals:{active_sos:Number(row.active_sos),lone_worker_alerts:Number(row.lone_worker_alerts),critical_incidents:Number(row.critical_incidents),other_incidents:Number(row.other_incidents),patrol_alerts:Number(row.patrol_alerts),coverage_gaps:Number(row.coverage_gaps),expiring_certs:Number(row.expiring_certs),scans_7d:Number(row.scans_7d)}};
+}
+
+app.get('/api/operations-risk',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const save=String(req.query.save||'0')==='1';
+  try{const data=await withTenant(tenantId,async client=>{
+    const rows=(await client.query(`SELECT s.id site_id,s.name site_name,
+      (SELECT COUNT(*)::int FROM sos_alerts x WHERE x.tenant_id=s.tenant_id AND x.site_id=s.id AND x.status='active') active_sos,
+      (SELECT COUNT(*)::int FROM lone_worker_alerts x WHERE x.tenant_id=s.tenant_id AND x.site_id=s.id AND x.resolved=FALSE) lone_worker_alerts,
+      (SELECT COUNT(*)::int FROM incidents x WHERE x.tenant_id=s.tenant_id AND x.site_id=s.id AND x.status<>'closed' AND x.severity='critical') critical_incidents,
+      (SELECT COUNT(*)::int FROM incidents x WHERE x.tenant_id=s.tenant_id AND x.site_id=s.id AND x.status<>'closed' AND x.severity<>'critical') other_incidents,
+      (SELECT COUNT(*)::int FROM patrol_alerts x JOIN patrol_runs pr ON pr.id=x.run_id WHERE x.tenant_id=s.tenant_id AND pr.site_id=s.id AND x.status<>'resolved') patrol_alerts,
+      (SELECT COUNT(*)::int FROM shifts x WHERE x.tenant_id=s.tenant_id AND x.site_id=s.id AND x.shift_date BETWEEN CURRENT_DATE AND CURRENT_DATE+7 AND (x.assignment_status='open' OR x.confirmation_status IN('pending','rejected'))) coverage_gaps,
+      (SELECT COUNT(*)::int FROM guard_assignments ga JOIN guard_certifications gc ON gc.tenant_id=ga.tenant_id AND gc.user_id=ga.user_id WHERE ga.tenant_id=s.tenant_id AND ga.site_id=s.id AND gc.expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE+30) expiring_certs,
+      (SELECT COUNT(*)::int FROM patrol_logs pl JOIN checkpoints cp ON cp.id=pl.checkpoint_id WHERE pl.tenant_id=s.tenant_id AND cp.site_id=s.id AND pl.scanned_at>=NOW()-INTERVAL '7 days') scans_7d
+      FROM sites s WHERE s.tenant_id=$1 ORDER BY s.name`,[tenantId])).rows;
+    const sites=rows.map(buildOperationsRiskSite);
+    if(save)for(const site of sites)await client.query(`INSERT INTO operations_risk_snapshots(tenant_id,site_id,score,level,factors,recommendations,generated_by) VALUES($1,$2,$3,$4,$5,$6,$7)`,[tenantId,site.site_id,site.score,site.level,JSON.stringify(site.factors),JSON.stringify(site.recommendations),req.auth.user_id]);
+    const trends=(await client.query(`SELECT DISTINCT ON(site_id,date_trunc('day',generated_at)) site_id,score,level,generated_at FROM operations_risk_snapshots WHERE tenant_id=$1 AND generated_at>=NOW()-INTERVAL '30 days' ORDER BY site_id,date_trunc('day',generated_at) DESC,generated_at DESC`,[tenantId])).rows;
+    const summary={low:0,medium:0,high:0,critical:0};for(const site of sites)summary[site.level]++;
+    return{generated_at:new Date().toISOString(),saved:save,summary,sites:sites.sort((a,b)=>b.score-a.score||a.site_name.localeCompare(b.site_name)),trends};
+  });res.json(data);}catch(err){res.status(500).json({error:err.message});}
+});
+
 // ------------------------ TRUSTPROOF EVIDENCE INTEGRITY ------------------------
 
 function trustProofStable(value){

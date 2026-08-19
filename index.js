@@ -4384,7 +4384,7 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
       }
       const guardResult = await client.query(
         `SELECT id FROM users
-         WHERE id=$1 AND tenant_id=$2 AND role='guard' AND COALESCE(is_active, TRUE)=TRUE`,
+         WHERE id=$1 AND tenant_id=$2 AND role='guard' AND COALESCE(account_active, TRUE)=TRUE`,
         [nextUserId, tenant_id]
       );
       if (!guardResult.rows.length) {

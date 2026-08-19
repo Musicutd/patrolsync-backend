@@ -4368,7 +4368,7 @@ app.get('/api/shifts', requireAuth, async (req, res) => {
 
 app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { tenant_id, site_id, shift_date, start_time, end_time, break_minutes, employment_type, notes } = req.body;
+  const { tenant_id, user_id, site_id, shift_date, start_time, end_time, break_minutes, employment_type, notes } = req.body;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id is required' });
   if (start_time && !TIME_FORMAT_REGEX.test(start_time)) return res.status(400).json({ error: 'start_time must use HH:MM format' });
   if (end_time && !TIME_FORMAT_REGEX.test(end_time)) return res.status(400).json({ error: 'end_time must use HH:MM format' });
@@ -4378,22 +4378,35 @@ app.patch('/api/shifts/:id', requireAuth, requireAdmin, async (req, res) => {
       const currentResult = await client.query('SELECT * FROM shifts WHERE id=$1 AND tenant_id=$2', [id, tenant_id]);
       if (!currentResult.rows.length) throw Object.assign(new Error('Shift not found'), { statusCode: 404 });
       const current = currentResult.rows[0];
+      const nextUserId = user_id === undefined ? Number(current.user_id) : Number(user_id);
+      if (!Number.isInteger(nextUserId) || nextUserId < 1) {
+        throw Object.assign(new Error('A valid assigned guard is required'), { statusCode: 400 });
+      }
+      const guardResult = await client.query(
+        `SELECT id FROM users
+         WHERE id=$1 AND tenant_id=$2 AND role='guard' AND COALESCE(is_active, TRUE)=TRUE`,
+        [nextUserId, tenant_id]
+      );
+      if (!guardResult.rows.length) {
+        throw Object.assign(new Error('The selected guard is unavailable or no longer active'), { statusCode: 400 });
+      }
       const nextDate = shift_date || String(current.shift_date).slice(0,10);
       const nextStart = start_time || current.start_time;
       const nextEnd = end_time || current.end_time;
       const nextBreak = break_minutes === undefined ? current.break_minutes : Number(break_minutes);
-      const analysis = await analyseProposedShifts(client, tenant_id, current.user_id, [DateTime.fromISO(nextDate)], nextStart, nextEnd, nextBreak, Number(id));
+      const analysis = await analyseProposedShifts(client, tenant_id, nextUserId, [DateTime.fromISO(nextDate)], nextStart, nextEnd, nextBreak, Number(id));
       if (analysis.conflicts.length) {
         const err = new Error('Cannot save this shift because it overlaps the guard\'s existing schedule.');
         err.statusCode = 409; err.code = 'SHIFT_CONFLICT'; err.conflicts = analysis.conflicts; throw err;
       }
       if(analysis.availability_conflicts.length){const err=new Error('Cannot save this shift because the guard is unavailable.');err.statusCode=409;err.code='GUARD_UNAVAILABLE';err.availability_conflicts=analysis.availability_conflicts;throw err;}
       const updated = await client.query(
-        `UPDATE shifts SET site_id = COALESCE($1, site_id), shift_date = COALESCE($2, shift_date),
-         start_time = COALESCE($3, start_time), end_time = COALESCE($4, end_time),
-         break_minutes = COALESCE($5, break_minutes), employment_type = COALESCE($6, employment_type), notes = $7
-         WHERE id = $8 AND tenant_id = $9 RETURNING *`,
-        [site_id || null, shift_date || null, start_time || null, end_time || null,
+        `UPDATE shifts SET user_id=$1, site_id=COALESCE($2, site_id), shift_date=COALESCE($3, shift_date),
+         start_time=COALESCE($4, start_time), end_time=COALESCE($5, end_time),
+         break_minutes=COALESCE($6, break_minutes), employment_type=COALESCE($7, employment_type), notes=$8,
+         assignment_status='assigned', confirmation_status='pending', confirmed_at=NULL
+         WHERE id=$9 AND tenant_id=$10 RETURNING *`,
+        [nextUserId, site_id || null, shift_date || null, start_time || null, end_time || null,
          break_minutes === undefined ? null : Number(break_minutes), employmentType, notes ?? null, id, tenant_id]
       );
       return { shift: updated.rows[0], warnings: analysis.warnings };

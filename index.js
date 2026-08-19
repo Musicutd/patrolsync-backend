@@ -3061,6 +3061,84 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
+// ------------------------ COVERAGE AUTOPILOT ------------------------
+
+async function ensureCoverageAutopilotSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS site_guard_requirements(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,cert_name TEXT NOT NULL,
+    created_by INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(tenant_id,site_id,cert_name)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS coverage_autopilot_actions(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,shift_id INTEGER NOT NULL,previous_user_id INTEGER,
+    replacement_user_id INTEGER NOT NULL,recommendation_score INTEGER NOT NULL,reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    approved_by INTEGER NOT NULL,approved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  for(const table of ['site_guard_requirements','coverage_autopilot_actions']){
+    await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+    await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);
+    await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  }
+  await pool.query('CREATE INDEX IF NOT EXISTS coverage_autopilot_actions_tenant ON coverage_autopilot_actions(tenant_id,approved_at DESC)');
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON site_guard_requirements TO "${role}"`);await pool.query(`GRANT SELECT,INSERT ON coverage_autopilot_actions TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE site_guard_requirements_id_seq,coverage_autopilot_actions_id_seq TO "${role}"`);}}
+  catch(err){console.warn('Coverage Autopilot tenant grants skipped:',err.message);}
+  console.log('Coverage Autopilot schema ready');
+}
+ensureCoverageAutopilotSchema().catch(err=>console.error('Coverage Autopilot setup failed:',err.message));
+
+function coverageShiftWindow(shift,zone){const start=DateTime.fromISO(`${String(shift.shift_date).slice(0,10)}T${shift.start_time}`,{zone});let end=DateTime.fromISO(`${String(shift.shift_date).slice(0,10)}T${shift.end_time}`,{zone});if(end<=start)end=end.plus({days:1});return{start,end,hours:Math.max(0,end.diff(start,'hours').hours-Number(shift.break_minutes||0)/60)};}
+function coverageOverlap(a,b,zone){const aw=coverageShiftWindow(a,zone),bw=coverageShiftWindow(b,zone);return aw.start<bw.end&&bw.start<aw.end;}
+function coverageDistanceKm(lat1,lon1,lat2,lon2){if([lat1,lon1,lat2,lon2].some(v=>v===null||v===undefined||!Number.isFinite(Number(v))))return null;const r=6371,toRad=v=>Number(v)*Math.PI/180,dLat=toRad(Number(lat2)-Number(lat1)),dLon=toRad(Number(lon2)-Number(lon1)),a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;return r*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
+
+async function buildCoverageAutopilot(client,tenantId,days=14){
+  const tenant=(await client.query('SELECT timezone FROM tenants WHERE id=$1',[tenantId])).rows[0]||{},zone=tenant.timezone||'UTC',today=DateTime.now().setZone(zone).startOf('day'),endDate=today.plus({days});
+  const [shiftsResult,guardsResult,availabilityResult,leaveResult,certResult,requirementsResult,assignmentsResult,locationsResult]=await Promise.all([
+    client.query(`SELECT sh.*,s.name site_name,s.latitude site_latitude,s.longitude site_longitude,u.email guard_email,COALESCE(u.account_active,TRUE) guard_active FROM shifts sh JOIN sites s ON s.id=sh.site_id LEFT JOIN users u ON u.id=sh.user_id WHERE sh.tenant_id=$1 AND sh.shift_date BETWEEN $2 AND $3 ORDER BY sh.shift_date,sh.start_time`,[tenantId,today.toISODate(),endDate.toISODate()]),
+    client.query(`SELECT id,email,COALESCE(account_active,TRUE) account_active FROM users WHERE tenant_id=$1 AND role='guard'`,[tenantId]),
+    client.query('SELECT * FROM guard_availability WHERE tenant_id=$1',[tenantId]),
+    client.query("SELECT * FROM leave_requests WHERE tenant_id=$1 AND status='approved' AND end_date >= $2 AND start_date <= $3",[tenantId,today.toISODate(),endDate.toISODate()]),
+    client.query('SELECT user_id,LOWER(TRIM(cert_name)) cert_name,expiry_date FROM guard_certifications WHERE tenant_id=$1',[tenantId]),
+    client.query('SELECT * FROM site_guard_requirements WHERE tenant_id=$1 ORDER BY cert_name',[tenantId]),
+    client.query('SELECT user_id,site_id FROM guard_assignments WHERE tenant_id=$1',[tenantId]),
+    client.query('SELECT DISTINCT ON(user_id) user_id,latitude,longitude,updated_at FROM guard_locations WHERE tenant_id=$1 ORDER BY user_id,updated_at DESC',[tenantId])
+  ]);
+  const shifts=shiftsResult.rows,guards=guardsResult.rows.filter(g=>g.account_active!==false),availability=availabilityResult.rows,leaves=leaveResult.rows,certs=certResult.rows,requirements=requirementsResult.rows,assignments=assignmentsResult.rows,locations=locationsResult.rows;
+  const result=[];
+  for(const shift of shifts){
+    const window=coverageShiftWindow(shift,zone),weekStart=window.start.startOf('week'),weekEnd=weekStart.plus({days:7}),required=requirements.filter(r=>Number(r.site_id)===Number(shift.site_id)).map(r=>String(r.cert_name).trim().toLowerCase()),risk=[];
+    const assignedCerts=certs.filter(c=>Number(c.user_id)===Number(shift.user_id)&&DateTime.fromJSDate(new Date(c.expiry_date),{zone}).endOf('day')>=window.start).map(c=>c.cert_name);
+    const assignedLeave=leaves.some(l=>Number(l.user_id)===Number(shift.user_id)&&String(l.start_date).slice(0,10)<=String(shift.shift_date).slice(0,10)&&String(l.end_date).slice(0,10)>=String(shift.shift_date).slice(0,10));
+    const assignedWeekHours=shifts.filter(s=>Number(s.user_id)===Number(shift.user_id)&&coverageShiftWindow(s,zone).start>=weekStart&&coverageShiftWindow(s,zone).start<weekEnd).reduce((n,s)=>n+coverageShiftWindow(s,zone).hours,0);
+    if(shift.assignment_status==='open')risk.push({code:'open',severity:'critical',message:'Shift is open and has no confirmed coverage'});
+    if(shift.guard_active===false)risk.push({code:'inactive',severity:'critical',message:'Assigned guard account is inactive'});
+    if(shift.confirmation_status==='rejected')risk.push({code:'rejected',severity:'critical',message:'Assigned guard rejected this shift'});
+    if(shift.confirmation_status==='pending'&&window.start.diff(DateTime.now().setZone(zone),'hours').hours<=48)risk.push({code:'unconfirmed',severity:'high',message:'Shift starts within 48 hours and is unconfirmed'});
+    if(assignedLeave)risk.push({code:'leave',severity:'critical',message:'Assigned guard has approved leave'});
+    const missing=required.filter(name=>!assignedCerts.includes(name));if(missing.length)risk.push({code:'certification',severity:'critical',message:`Missing required certification: ${missing.join(', ')}`});
+    if(assignedWeekHours>40)risk.push({code:'overtime',severity:'high',message:`Planned week is ${assignedWeekHours.toFixed(1)} hours`});
+    if(!risk.length)continue;
+    const candidates=[];
+    for(const guard of guards){if(Number(guard.id)===Number(shift.user_id))continue;const reasons=[],blocks=[],guardShifts=shifts.filter(s=>Number(s.user_id)===Number(guard.id)&&Number(s.id)!==Number(shift.id));
+      if(guardShifts.some(s=>coverageOverlap(s,shift,zone)))blocks.push('Overlapping shift');
+      if(leaves.some(l=>Number(l.user_id)===Number(guard.id)&&String(l.start_date).slice(0,10)<=String(shift.shift_date).slice(0,10)&&String(l.end_date).slice(0,10)>=String(shift.shift_date).slice(0,10)))blocks.push('Approved leave');
+      const weekday=window.start.weekday%7,av=availability.find(a=>Number(a.user_id)===Number(guard.id)&&Number(a.weekday)===weekday);if(av&&av.is_available===false)blocks.push('Marked unavailable');
+      const guardCerts=certs.filter(c=>Number(c.user_id)===Number(guard.id)&&DateTime.fromJSDate(new Date(c.expiry_date),{zone}).endOf('day')>=window.start).map(c=>c.cert_name),certMissing=required.filter(name=>!guardCerts.includes(name));if(certMissing.length)blocks.push(`Missing certification: ${certMissing.join(', ')}`);
+      const weeklyHours=guardShifts.filter(s=>{const w=coverageShiftWindow(s,zone);return w.start>=weekStart&&w.start<weekEnd}).reduce((n,s)=>n+coverageShiftWindow(s,zone).hours,0),projected=weeklyHours+window.hours;if(projected>48)blocks.push(`Would reach ${projected.toFixed(1)} hours`);
+      if(blocks.length)continue;let score=50;if(assignments.some(a=>Number(a.user_id)===Number(guard.id)&&Number(a.site_id)===Number(shift.site_id))){score+=18;reasons.push('Already assigned to this site');}if(av?.is_available===true){score+=10;reasons.push('Availability confirmed');}if(required.length){score+=12;reasons.push('All required certifications valid');}if(projected<=32){score+=12;reasons.push(`Low projected workload: ${projected.toFixed(1)}h`);}else if(projected<=40){score+=5;reasons.push(`Within 40h threshold: ${projected.toFixed(1)}h`);}else{score-=12;reasons.push(`Overtime risk: ${projected.toFixed(1)}h`);}
+      const loc=locations.find(l=>Number(l.user_id)===Number(guard.id)),distance=loc?coverageDistanceKm(loc.latitude,loc.longitude,shift.site_latitude,shift.site_longitude):null;if(distance!==null){if(distance<=10){score+=10;reasons.push(`${distance.toFixed(1)} km from site`);}else if(distance>40){score-=8;reasons.push(`${distance.toFixed(1)} km from site`);}}
+      candidates.push({user_id:guard.id,email:guard.email,score:Math.max(0,Math.min(100,Math.round(score))),projected_weekly_hours:Number(projected.toFixed(1)),distance_km:distance===null?null:Number(distance.toFixed(1)),reasons});
+    }
+    candidates.sort((a,b)=>b.score-a.score||a.projected_weekly_hours-b.projected_weekly_hours);
+    result.push({shift_id:shift.id,shift_date:String(shift.shift_date).slice(0,10),start_time:shift.start_time,end_time:shift.end_time,site_id:shift.site_id,site_name:shift.site_name,current_user_id:shift.user_id,current_guard_email:shift.guard_email,confirmation_status:shift.confirmation_status,assignment_status:shift.assignment_status,risk,candidates:candidates.slice(0,5)});
+  }
+  return{timezone:zone,days,generated_at:new Date().toISOString(),at_risk_count:result.length,shifts:result};
+}
+
+app.get('/api/coverage-autopilot',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id),days=Math.min(30,Math.max(1,Number(req.query.days||14)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await withTenant(tenantId,client=>buildCoverageAutopilot(client,tenantId,days)));}catch(err){res.status(500).json({error:err.message});}});
+app.post('/api/coverage-autopilot/reassign',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),shiftId=Number(req.body.shift_id),newUserId=Number(req.body.user_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!shiftId||!newUserId)return res.status(400).json({error:'Shift and replacement guard are required'});try{const output=await withTenant(tenantId,async client=>{await client.query('BEGIN');try{const current=await client.query('SELECT * FROM shifts WHERE tenant_id=$1 AND id=$2 FOR UPDATE',[tenantId,shiftId]);if(!current.rowCount)throw Object.assign(new Error('Shift not found'),{statusCode:404});const analysis=await buildCoverageAutopilot(client,tenantId,30),risk=analysis.shifts.find(s=>Number(s.shift_id)===shiftId),candidate=risk?.candidates.find(c=>Number(c.user_id)===newUserId);if(!candidate)throw Object.assign(new Error('Guard is no longer an eligible recommendation. Refresh Coverage Autopilot.'),{statusCode:409});const updated=await client.query(`UPDATE shifts SET user_id=$1,assignment_status='assigned',confirmation_status='pending',confirmed_at=NULL WHERE tenant_id=$2 AND id=$3 RETURNING *`,[newUserId,tenantId,shiftId]);await client.query(`INSERT INTO coverage_autopilot_actions(tenant_id,shift_id,previous_user_id,replacement_user_id,recommendation_score,reasons,approved_by) VALUES($1,$2,$3,$4,$5,$6,$7)`,[tenantId,shiftId,current.rows[0].user_id,newUserId,candidate.score,JSON.stringify(candidate.reasons),req.auth.user_id]);await client.query('COMMIT');return{shift:updated.rows[0],candidate};}catch(e){await client.query('ROLLBACK');throw e;}});res.json(output);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+app.get('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('SELECT r.*,s.name site_name FROM site_guard_requirements r JOIN sites s ON s.id=r.site_id WHERE r.tenant_id=$1 ORDER BY s.name,r.cert_name',[tenantId]));res.json(r.rows);}catch(err){res.status(500).json({error:err.message});}});
+app.post('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),cert=String(req.body.cert_name||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!cert)return res.status(400).json({error:'Site and certification name are required'});try{const r=await withTenant(tenantId,client=>client.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name,created_by) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM sites WHERE tenant_id=$1 AND id=$2) ON CONFLICT(tenant_id,site_id,cert_name) DO UPDATE SET cert_name=EXCLUDED.cert_name RETURNING *`,[tenantId,siteId,cert,req.auth.user_id]));if(!r.rowCount)return res.status(404).json({error:'Site not found'});res.status(201).json(r.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
+app.delete('/api/site-guard-requirements/:id',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('DELETE FROM site_guard_requirements WHERE tenant_id=$1 AND id=$2 RETURNING id',[tenantId,req.params.id]));if(!r.rowCount)return res.status(404).json({error:'Requirement not found'});res.json({deleted:true});}catch(err){res.status(500).json({error:err.message});}});
+
 // ------------------------ TRUSTPROOF EVIDENCE INTEGRITY ------------------------
 
 function trustProofStable(value){

@@ -3122,10 +3122,12 @@ async function trustProofSource(client,tenantId,type,id){
   throw Object.assign(new Error('Evidence type must be patrol_scan or incident_photo'),{statusCode:400});
 }
 async function trustProofSeal(client,tenantId,type,id,userId){
+  // Serialize each tenant's ledger without granting UPDATE permission on sealed evidence.
+  await client.query('SELECT pg_advisory_xact_lock($1,$2)',[81427,Number(tenantId)]);
   const existing=await client.query('SELECT * FROM evidence_integrity_records WHERE tenant_id=$1 AND evidence_type=$2 AND evidence_id=$3',[tenantId,type,String(id)]);
   if(existing.rowCount)return existing.rows[0];
   const source=await trustProofSource(client,tenantId,type,id);
-  const previous=await client.query('SELECT chain_hash FROM evidence_integrity_records WHERE tenant_id=$1 ORDER BY id DESC LIMIT 1 FOR UPDATE',[tenantId]);
+  const previous=await client.query('SELECT chain_hash FROM evidence_integrity_records WHERE tenant_id=$1 ORDER BY id DESC LIMIT 1',[tenantId]);
   const previousHash=previous.rows[0]?.chain_hash||null,sealedAt=new Date().toISOString();
   const chainHash=trustProofHash({tenant_id:Number(tenantId),evidence_type:type,evidence_id:String(id),source_hash:source.sourceHash,previous_chain_hash:previousHash,sealed_at:sealedAt});
   const inserted=await client.query(`INSERT INTO evidence_integrity_records(tenant_id,evidence_type,evidence_id,source_hash,previous_chain_hash,chain_hash,snapshot,sealed_by,sealed_at)

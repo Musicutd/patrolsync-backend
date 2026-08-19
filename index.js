@@ -3061,9 +3061,108 @@ app.get('/api/patrol-logs', requireAuth, async (req, res) => {
   }
 });
 
+// ------------------------ TRUSTPROOF EVIDENCE INTEGRITY ------------------------
+
+function trustProofStable(value){
+  if(Array.isArray(value))return value.map(trustProofStable);
+  if(value&&typeof value==='object'&&!(value instanceof Date))return Object.keys(value).sort().reduce((out,key)=>{out[key]=trustProofStable(value[key]);return out;},{});
+  if(value instanceof Date)return value.toISOString();
+  return value===undefined?null:value;
+}
+function trustProofHash(value){return crypto.createHash('sha256').update(typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(trustProofStable(value))).digest('hex');}
+
+async function ensureTrustProofSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS evidence_integrity_records(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,evidence_type TEXT NOT NULL,evidence_id TEXT NOT NULL,
+    source_hash CHAR(64) NOT NULL,previous_chain_hash CHAR(64),chain_hash CHAR(64) NOT NULL,
+    snapshot JSONB NOT NULL,sealed_by INTEGER,sealed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,evidence_type,evidence_id)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS evidence_integrity_tenant_time ON evidence_integrity_records(tenant_id,sealed_at DESC)`);
+  await pool.query(`ALTER TABLE evidence_integrity_records ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON evidence_integrity_records`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON evidence_integrity_records USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{
+    const tenantRole=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');
+    if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(tenantRole)){
+      await pool.query(`GRANT SELECT,INSERT ON evidence_integrity_records TO "${tenantRole}"`);
+      await pool.query(`GRANT USAGE,SELECT ON SEQUENCE evidence_integrity_records_id_seq TO "${tenantRole}"`);
+    }
+  }catch(err){console.warn('TrustProof tenant-role grant skipped:',err.message);}
+  console.log('TrustProof evidence integrity ledger ready');
+}
+ensureTrustProofSchema().catch(err=>console.error('TrustProof schema setup failed:',err.message));
+
+async function trustProofPhotoBytes(row){
+  if(row.storage_provider==='object_storage'&&row.storage_key){const response=await objectStorageRequest('GET',row.storage_key);return Buffer.from(await response.arrayBuffer());}
+  if(row.photo_data)return parseImageDataUrl(row.photo_data).buffer;
+  throw Object.assign(new Error('Photo bytes are unavailable'),{statusCode:404});
+}
+async function trustProofSource(client,tenantId,type,id){
+  if(type==='patrol_scan'){
+    const result=await client.query(`SELECT pl.id,pl.tenant_id,pl.user_id,pl.checkpoint_id,pl.scanned_at,pl.latitude,pl.longitude,
+      pl.patrol_run_id,pl.accuracy_m,pl.distance_m,pl.location_status,pl.device_scanned_at,pl.received_at,
+      c.name AS checkpoint_name,c.site_id,s.name AS site_name,u.email AS guard_email,
+      rs.position,rs.checkpoint_note,rs.instruction_confirmed
+      FROM patrol_logs pl JOIN checkpoints c ON c.id=pl.checkpoint_id JOIN sites s ON s.id=c.site_id
+      JOIN users u ON u.id=pl.user_id LEFT JOIN patrol_run_scans rs ON rs.patrol_log_id=pl.id
+      WHERE pl.tenant_id=$1 AND pl.id=$2`,[tenantId,id]);
+    if(!result.rowCount)throw Object.assign(new Error('Patrol scan evidence not found'),{statusCode:404});
+    const snapshot=trustProofStable(result.rows[0]);return{snapshot,sourceHash:trustProofHash(snapshot)};
+  }
+  if(type==='incident_photo'){
+    const result=await client.query(`SELECT ip.id,ip.tenant_id,ip.incident_id,ip.storage_provider,ip.storage_key,ip.content_type,
+      ip.size_bytes,ip.checksum_sha256,ip.created_at,i.reference_code,i.site_id,i.user_id
+      FROM incident_photos ip JOIN incidents i ON i.id=ip.incident_id AND i.tenant_id=ip.tenant_id
+      WHERE ip.tenant_id=$1 AND ip.id=$2`,[tenantId,id]);
+    if(!result.rowCount)throw Object.assign(new Error('Incident photo evidence not found'),{statusCode:404});
+    const row=result.rows[0],bytes=await trustProofPhotoBytes(row),binaryHash=trustProofHash(bytes);
+    const snapshot=trustProofStable({...row,binary_sha256:binaryHash});return{snapshot,sourceHash:trustProofHash(snapshot),binaryHash};
+  }
+  throw Object.assign(new Error('Evidence type must be patrol_scan or incident_photo'),{statusCode:400});
+}
+async function trustProofSeal(client,tenantId,type,id,userId){
+  const existing=await client.query('SELECT * FROM evidence_integrity_records WHERE tenant_id=$1 AND evidence_type=$2 AND evidence_id=$3',[tenantId,type,String(id)]);
+  if(existing.rowCount)return existing.rows[0];
+  const source=await trustProofSource(client,tenantId,type,id);
+  const previous=await client.query('SELECT chain_hash FROM evidence_integrity_records WHERE tenant_id=$1 ORDER BY id DESC LIMIT 1 FOR UPDATE',[tenantId]);
+  const previousHash=previous.rows[0]?.chain_hash||null,sealedAt=new Date().toISOString();
+  const chainHash=trustProofHash({tenant_id:Number(tenantId),evidence_type:type,evidence_id:String(id),source_hash:source.sourceHash,previous_chain_hash:previousHash,sealed_at:sealedAt});
+  const inserted=await client.query(`INSERT INTO evidence_integrity_records(tenant_id,evidence_type,evidence_id,source_hash,previous_chain_hash,chain_hash,snapshot,sealed_by,sealed_at)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[tenantId,type,String(id),source.sourceHash,previousHash,chainHash,source.snapshot,userId||null,sealedAt]);
+  return inserted.rows[0];
+}
+async function trustProofVerify(client,tenantId,record){
+  const source=await trustProofSource(client,tenantId,record.evidence_type,record.evidence_id);
+  const expectedChain=trustProofHash({tenant_id:Number(tenantId),evidence_type:record.evidence_type,evidence_id:String(record.evidence_id),source_hash:record.source_hash,previous_chain_hash:record.previous_chain_hash||null,sealed_at:new Date(record.sealed_at).toISOString()});
+  const sourceValid=source.sourceHash===record.source_hash,chainValid=expectedChain===record.chain_hash;
+  let linkValid=true;
+  if(record.previous_chain_hash){const previous=await client.query('SELECT chain_hash FROM evidence_integrity_records WHERE tenant_id=$1 AND id<$2 ORDER BY id DESC LIMIT 1',[tenantId,record.id]);linkValid=previous.rows[0]?.chain_hash===record.previous_chain_hash;}
+  return{record_id:record.id,evidence_type:record.evidence_type,evidence_id:record.evidence_id,status:sourceValid&&chainValid&&linkValid?'verified':'tampered',source_valid:sourceValid,chain_valid:chainValid,link_valid:linkValid,source_hash:record.source_hash,chain_hash:record.chain_hash,sealed_at:record.sealed_at,sealed_by:record.sealed_by};
+}
+
+app.get('/api/trustproof',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,client=>client.query(`SELECT e.*,u.email AS sealed_by_email FROM evidence_integrity_records e LEFT JOIN users u ON u.id=e.sealed_by AND u.tenant_id=e.tenant_id WHERE e.tenant_id=$1 ORDER BY e.id DESC LIMIT 500`,[tenantId]));res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}});
+app.post('/api/trustproof/seal',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),type=String(req.body.evidence_type||''),id=String(req.body.evidence_id||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!id)return res.status(400).json({error:'Evidence ID is required'});try{const record=await withTenant(tenantId,async client=>{await client.query('BEGIN');try{const sealed=await trustProofSeal(client,tenantId,type,id,req.auth.user_id);await client.query('COMMIT');return sealed;}catch(e){await client.query('ROLLBACK');throw e;}});res.status(201).json(record);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+app.post('/api/trustproof/seal-batch',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),type=String(req.body.evidence_type||'patrol_scan'),limit=Math.min(50,Math.max(1,Number(req.body.limit||20)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!['patrol_scan','incident_photo'].includes(type))return res.status(400).json({error:'Invalid evidence type'});try{const output=await withTenant(tenantId,async client=>{const sourceTable=type==='patrol_scan'?'patrol_logs':'incident_photos',rows=await client.query(`SELECT s.id FROM ${sourceTable} s WHERE s.tenant_id=$1 AND NOT EXISTS(SELECT 1 FROM evidence_integrity_records e WHERE e.tenant_id=$1 AND e.evidence_type=$2 AND e.evidence_id=s.id::text) ORDER BY s.id LIMIT $3`,[tenantId,type,limit]);let sealed=0,failed=[];for(const row of rows.rows){try{await client.query('BEGIN');await trustProofSeal(client,tenantId,type,row.id,req.auth.user_id);await client.query('COMMIT');sealed++;}catch(e){await client.query('ROLLBACK');failed.push({id:row.id,error:e.message});}}return{sealed,failed,remaining_unknown:rows.rowCount===limit};});res.json(output);}catch(err){res.status(500).json({error:err.message});}});
+app.post('/api/trustproof/:id/verify',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const verified=await withTenant(tenantId,async client=>{const found=await client.query('SELECT * FROM evidence_integrity_records WHERE tenant_id=$1 AND id=$2',[tenantId,req.params.id]);if(!found.rowCount)throw Object.assign(new Error('TrustProof record not found'),{statusCode:404});return trustProofVerify(client,tenantId,found.rows[0]);});res.json(verified);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
+app.get('/api/trustproof/summary/status',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const summary=await withTenant(tenantId,async client=>{const counts=await client.query(`SELECT evidence_type,COUNT(*)::int AS sealed FROM evidence_integrity_records WHERE tenant_id=$1 GROUP BY evidence_type`,[tenantId]);const patrol=await client.query(`SELECT COUNT(*)::int total,COUNT(e.id)::int sealed FROM patrol_logs p LEFT JOIN evidence_integrity_records e ON e.tenant_id=p.tenant_id AND e.evidence_type='patrol_scan' AND e.evidence_id=p.id::text WHERE p.tenant_id=$1`,[tenantId]);const photos=await client.query(`SELECT COUNT(*)::int total,COUNT(e.id)::int sealed FROM incident_photos p LEFT JOIN evidence_integrity_records e ON e.tenant_id=p.tenant_id AND e.evidence_type='incident_photo' AND e.evidence_id=p.id::text WHERE p.tenant_id=$1`,[tenantId]);return{by_type:counts.rows,patrol_scans:patrol.rows[0],incident_photos:photos.rows[0]};});res.json(summary);}catch(err){res.status(500).json({error:err.message});}});
+
+async function runTrustProofSweep(){
+  const tenants=await pool.query('SELECT id FROM tenants WHERE COALESCE(account_active,TRUE)=TRUE ORDER BY id');
+  for(const tenant of tenants.rows){
+    await withTenant(tenant.id,async client=>{
+      for(const [type,table] of [['patrol_scan','patrol_logs'],['incident_photo','incident_photos']]){
+        const pending=await client.query(`SELECT s.id FROM ${table} s WHERE s.tenant_id=$1 AND NOT EXISTS(SELECT 1 FROM evidence_integrity_records e WHERE e.tenant_id=$1 AND e.evidence_type=$2 AND e.evidence_id=s.id::text) ORDER BY s.id LIMIT 25`,[tenant.id,type]);
+        for(const row of pending.rows){try{await client.query('BEGIN');await trustProofSeal(client,tenant.id,type,row.id,null);await client.query('COMMIT');}catch(err){await client.query('ROLLBACK');console.error(`TrustProof ${type} ${row.id} seal failed:`,err.message);}}
+      }
+    });
+  }
+}
+scheduleBackgroundJob('trustproof_evidence_sealing',60*1000,90000,runTrustProofSweep);
+
 app.get('/api/patrol-evidence',requireAuth,requireAdmin,async(req,res)=>{
   const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
-  try{const result=await withTenant(tenantId,client=>{const params=[tenantId];let where='pl.tenant_id=$1';if(req.query.site_id){params.push(req.query.site_id);where+=` AND c.site_id=$${params.length}`;}if(req.query.location_status){params.push(req.query.location_status);where+=` AND pl.location_status=$${params.length}`;}if(req.query.from_date){params.push(req.query.from_date);where+=` AND pl.scanned_at >= $${params.length}::date`;}if(req.query.to_date){params.push(req.query.to_date);where+=` AND pl.scanned_at < ($${params.length}::date+INTERVAL '1 day')`;}return client.query(`SELECT pl.id,pl.scanned_at,pl.received_at,pl.device_scanned_at,pl.latitude,pl.longitude,pl.accuracy_m,pl.distance_m,pl.location_status,pl.patrol_run_id,c.name AS checkpoint_name,s.name AS site_name,u.email AS guard_email,r.name AS route_name,rs.checkpoint_note,rs.instruction_confirmed FROM patrol_logs pl JOIN checkpoints c ON c.id=pl.checkpoint_id JOIN sites s ON s.id=c.site_id JOIN users u ON u.id=pl.user_id LEFT JOIN patrol_runs pr ON pr.id=pl.patrol_run_id LEFT JOIN patrol_routes r ON r.id=pr.route_id LEFT JOIN patrol_run_scans rs ON rs.patrol_log_id=pl.id WHERE ${where} ORDER BY pl.scanned_at DESC LIMIT 1000`,params)});res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}
+  try{const result=await withTenant(tenantId,client=>{const params=[tenantId];let where='pl.tenant_id=$1';if(req.query.site_id){params.push(req.query.site_id);where+=` AND c.site_id=$${params.length}`;}if(req.query.location_status){params.push(req.query.location_status);where+=` AND pl.location_status=$${params.length}`;}if(req.query.from_date){params.push(req.query.from_date);where+=` AND pl.scanned_at >= $${params.length}::date`;}if(req.query.to_date){params.push(req.query.to_date);where+=` AND pl.scanned_at < ($${params.length}::date+INTERVAL '1 day')`;}return client.query(`SELECT pl.id,pl.scanned_at,pl.received_at,pl.device_scanned_at,pl.latitude,pl.longitude,pl.accuracy_m,pl.distance_m,pl.location_status,pl.patrol_run_id,c.name AS checkpoint_name,s.name AS site_name,u.email AS guard_email,r.name AS route_name,rs.checkpoint_note,rs.instruction_confirmed,e.id AS trustproof_id,e.source_hash AS trustproof_source_hash,e.chain_hash AS trustproof_chain_hash,e.sealed_at AS trustproof_sealed_at FROM patrol_logs pl JOIN checkpoints c ON c.id=pl.checkpoint_id JOIN sites s ON s.id=c.site_id JOIN users u ON u.id=pl.user_id LEFT JOIN patrol_runs pr ON pr.id=pl.patrol_run_id LEFT JOIN patrol_routes r ON r.id=pr.route_id LEFT JOIN patrol_run_scans rs ON rs.patrol_log_id=pl.id LEFT JOIN evidence_integrity_records e ON e.tenant_id=pl.tenant_id AND e.evidence_type='patrol_scan' AND e.evidence_id=pl.id::text WHERE ${where} ORDER BY pl.scanned_at DESC LIMIT 1000`,params)});res.json(result.rows);}catch(err){res.status(500).json({error:err.message});}
 });
 
 app.get('/api/patrol-compliance', requireAuth, async (req, res) => {

@@ -3094,7 +3094,7 @@ async function ensureTrustProofSchema(){
 ensureTrustProofSchema().catch(err=>console.error('TrustProof schema setup failed:',err.message));
 
 async function trustProofPhotoBytes(row){
-  if(row.storage_provider==='object_storage'&&row.storage_key){const response=await objectStorageRequest('GET',row.storage_key);return Buffer.from(await response.arrayBuffer());}
+  if(['s3','object_storage'].includes(String(row.storage_provider||'').toLowerCase())&&row.storage_key){const response=await objectStorageRequest('GET',row.storage_key);return Buffer.from(await response.arrayBuffer());}
   if(row.photo_data)return parseImageDataUrl(row.photo_data).buffer;
   throw Object.assign(new Error('Photo bytes are unavailable'),{statusCode:404});
 }

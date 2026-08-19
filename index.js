@@ -3197,6 +3197,34 @@ app.get('/api/operations-risk',requireAuth,requireAdmin,async(req,res)=>{
   });res.json(data);}catch(err){res.status(500).json({error:err.message});}
 });
 
+app.get('/api/intelligence-readiness',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const started=Date.now(),checks=[],add=(key,label,critical,passed,message,details={})=>checks.push({key,label,critical,passed:Boolean(passed),status:passed?'pass':critical?'fail':'warning',message,details});
+    const tables=['evidence_integrity_records','site_guard_requirements','coverage_autopilot_actions','operations_risk_snapshots'];
+    const tableRows=(await pool.query(`SELECT c.relname table_name,c.relrowsecurity rls_enabled,EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname='public' AND p.tablename=c.relname) has_policy FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY($1::text[])`,[tables])).rows;
+    add('phase8_tables','Phase 8 database structures',true,tableRows.length===tables.length,`${tableRows.length}/${tables.length} required tables available`,{tables:tableRows});
+    const protectedCount=tableRows.filter(x=>x.rls_enabled&&x.has_policy).length;add('phase8_rls','Tenant RLS protection',true,protectedCount===tables.length,`${protectedCount}/${tables.length} Phase 8 tables have RLS and a tenant policy`);
+    const tenantRole=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');let permissionRows=[];if(tenantRole)permissionRows=(await pool.query(`SELECT t table_name,has_table_privilege($1,t,'SELECT') can_select,has_table_privilege($1,t,'INSERT') can_insert FROM unnest($2::text[]) t`,[tenantRole,tables])).rows;
+    add('tenant_permissions','Restricted tenant-role permissions',true,permissionRows.length===tables.length&&permissionRows.every(x=>x.can_select&&x.can_insert),permissionRows.length?`${permissionRows.filter(x=>x.can_select&&x.can_insert).length}/${tables.length} tables grant required restricted-role access`:'Restricted tenant role could not be inspected',{permissions:permissionRows});
+    const tenantChecks=await withTenant(tenantId,async client=>{
+      const evidence=(await client.query(`SELECT (SELECT COUNT(*) FROM patrol_logs WHERE tenant_id=$1)::int+(SELECT COUNT(*) FROM incident_photos WHERE tenant_id=$1)::int total,(SELECT COUNT(*) FROM evidence_integrity_records WHERE tenant_id=$1)::int sealed`,[tenantId])).rows[0];
+      const riskSnapshots=Number((await client.query(`SELECT COUNT(*)::int count FROM operations_risk_snapshots WHERE tenant_id=$1`,[tenantId])).rows[0].count);
+      const coverage=await buildCoverageAutopilot(client,tenantId,14);
+      const actions=Number((await client.query(`SELECT COUNT(*)::int count FROM coverage_autopilot_actions WHERE tenant_id=$1`,[tenantId])).rows[0].count);
+      return{evidence,riskSnapshots,coverage,actions};
+    });
+    const evidenceTotal=Number(tenantChecks.evidence.total),evidenceSealed=Number(tenantChecks.evidence.sealed);add('trustproof_coverage','TrustProof sealing coverage',true,evidenceTotal===evidenceSealed,`${evidenceSealed}/${evidenceTotal} eligible evidence records sealed`,tenantChecks.evidence);
+    add('coverage_engine','Coverage Autopilot engine',true,Boolean(tenantChecks.coverage?.generated_at),`Analysis completed for a 14-day window; ${tenantChecks.coverage.at_risk_count} shift(s) require attention`,{at_risk_shifts:tenantChecks.coverage.at_risk_count});
+    add('coverage_audit','Coverage decision audit trail',false,true,tenantChecks.actions?`${tenantChecks.actions} approved reassignment action(s) recorded`:'Audit table ready; no Autopilot reassignments approved yet',{actions:tenantChecks.actions});
+    add('risk_history','Operations Risk trend history',true,tenantChecks.riskSnapshots>0,tenantChecks.riskSnapshots?`${tenantChecks.riskSnapshots} saved site risk snapshot(s) available`:'Run and save an Operations Risk analysis to establish the baseline');
+    const jobs=(await pool.query(`SELECT COUNT(*) FILTER(WHERE status='failed' AND started_at>=NOW()-INTERVAL '24 hours')::int failed_24h,COUNT(*) FILTER(WHERE status='running' AND started_at<NOW()-INTERVAL '10 minutes')::int stuck,MAX(started_at) FILTER(WHERE job_name='trustproof_evidence_sealing' AND status='succeeded') last_sealing_success FROM platform_job_runs`)).rows[0];
+    add('intelligence_jobs','Intelligence background-job health',true,Number(jobs.failed_24h)===0&&Number(jobs.stuck)===0&&Boolean(jobs.last_sealing_success),`Failed in 24h: ${jobs.failed_24h}; stuck: ${jobs.stuck}; last TrustProof sweep: ${jobs.last_sealing_success?new Date(jobs.last_sealing_success).toISOString():'never'}`,jobs);
+    add('admin_boundary','Subscriber administrator access boundary',true,req.auth.role==='admin','Endpoint is restricted to authenticated subscriber administrators');
+    const criticalFailures=checks.filter(x=>x.critical&&!x.passed).length,warnings=checks.filter(x=>!x.critical&&!x.passed).length;
+    res.json({status:criticalFailures?'action_required':warnings?'ready_with_warnings':'ready',generated_at:new Date(),duration_ms:Date.now()-started,summary:{passed:checks.filter(x=>x.passed).length,warnings,failures:criticalFailures,total:checks.length},checks});
+  }catch(err){res.status(500).json({error:err.message});}
+});
+
 // ------------------------ TRUSTPROOF EVIDENCE INTEGRITY ------------------------
 
 function trustProofStable(value){

@@ -282,19 +282,32 @@ async function checkPlanLimit(client, tenantId, resource) {
   const limits = PLAN_LIMITS[plan] || PLAN_LIMITS.starter;
   const max = limits[resource];
 
-  if (max === Infinity || max === undefined) return { allowed: true, plan, max, current: null };
-
   let countQuery;
   if (resource === 'locations') countQuery = 'SELECT COUNT(*) FROM sites WHERE tenant_id = $1';
   else if (resource === 'checkpoints') countQuery = 'SELECT COUNT(*) FROM checkpoints WHERE tenant_id = $1';
   else if (resource === 'guards') countQuery = "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND role = 'guard'";
   else if (resource === 'client_accounts') countQuery = 'SELECT COUNT(*) FROM client_users WHERE tenant_id = $1';
-  else return { allowed: true, plan, max, current: null };
+  else return { allowed: true, plan, max, current: null, decision_source:'legacy' };
 
   const countRes = await client.query(countQuery, [tenantId]);
   const current = parseInt(countRes.rows[0].count, 10);
 
-  return { allowed: current < max, plan, max, current };
+  const legacyDecision={ allowed:max===Infinity||max===undefined||current<max, plan, max, current, decision_source:'legacy' };
+  try {
+    if(ENTITLEMENT_ENGINE_MODE!=='pilot'&&ENTITLEMENT_ENGINE_MODE!=='enforce')return legacyDecision;
+    const featureCode=LEGACY_RESOURCE_FEATURE[resource];
+    if(!featureCode)return legacyDecision;
+    const globalEnforcement=ENTITLEMENT_ENGINE_MODE==='enforce';
+    const pilotResult=globalEnforcement?{rows:[{enabled:true}]}:await client.query(`SELECT COALESCE(ft.enabled,f.enabled_globally,FALSE) enabled FROM feature_flags f LEFT JOIN feature_flag_tenants ft ON ft.flag_id=f.id AND ft.tenant_id=$1 WHERE f.code='entitlement_engine_enforcement'`,[tenantId]);
+    if(!pilotResult.rows[0]?.enabled)return legacyDecision;
+    const entitlement=await resolveTenantEntitlement(tenantId,featureCode,client);
+    if(!entitlement)return legacyDecision;
+    const entitlementMax=entitlement.hard_limit==null?null:Number(entitlement.hard_limit);
+    return{allowed:Boolean(entitlement.enabled&&['active','trialing'].includes(entitlement.subscription_status)&&(entitlementMax==null||current<entitlementMax)),plan:entitlement.plan_code,max:entitlementMax,current,decision_source:'entitlement',plan_version:entitlement.plan_version};
+  }catch(error){
+    console.error('Entitlement decision fallback:',error.message);
+    return legacyDecision;
+  }
 }
 
 // ------------------------ EXPANSION STAGE 1A: ENTITLEMENTS FOUNDATION ------------------------
@@ -426,6 +439,20 @@ app.get('/api/platform/entitlements/usage/:id',requirePlatformAuth,async(req,res
   const metered=(await pool.query(`SELECT f.code,f.name,f.unit,COALESCE(SUM(u.quantity),0)::numeric quantity,MAX(u.occurred_at) last_event_at FROM feature_catalog f LEFT JOIN usage_events u ON u.feature_id=f.id AND u.tenant_id=$1 AND u.occurred_at>=date_trunc('month',NOW()) WHERE f.metered=TRUE GROUP BY f.id ORDER BY f.category,f.code`,[tenantId])).rows;
   await platformAudit(req,'VIEW','tenant_usage',{tenant_id:tenantId});
   res.json({tenant,period:{start:new Date(new Date().getFullYear(),new Date().getMonth(),1),end:new Date(new Date().getFullYear(),new Date().getMonth()+1,1)},capacity,metered});
+}catch(e){res.status(e.status||500).json({error:e.message})}});
+
+// ------------------------ EXPANSION STAGE 1C: CONTROLLED PILOT ------------------------
+app.get('/api/platform/entitlements/pilot-status',requirePlatformAuth,async(req,res)=>{try{
+  await requireEntitlementSchema();
+  const rows=(await pool.query(`SELECT t.id tenant_id,t.name tenant_name,COALESCE(ft.enabled,FALSE) pilot_enabled,ft.reason,ft.updated_at FROM tenants t CROSS JOIN feature_flags f LEFT JOIN feature_flag_tenants ft ON ft.tenant_id=t.id AND ft.flag_id=f.id WHERE f.code='entitlement_engine_enforcement' ORDER BY t.id`)).rows;
+  res.json({mode:ENTITLEMENT_ENGINE_MODE,enforcement_active:ENTITLEMENT_ENGINE_MODE==='pilot'||ENTITLEMENT_ENGINE_MODE==='enforce',global_enforcement:ENTITLEMENT_ENGINE_MODE==='enforce',tenants:rows});
+}catch(e){res.status(e.status||500).json({error:e.message})}});
+app.put('/api/platform/entitlements/pilot-tenants/:id',requirePlatformAuth,async(req,res)=>{const tenantId=Number(req.params.id),enabled=req.body?.enabled===true,reason=String(req.body?.reason||'Internal entitlement pilot').trim().slice(0,500);if(!Number.isInteger(tenantId)||tenantId<1)return res.status(400).json({error:'Invalid company ID'});try{
+  await requireEntitlementSchema();
+  const tenant=(await pool.query(`SELECT id,name FROM tenants WHERE id=$1`,[tenantId])).rows[0];if(!tenant)return res.status(404).json({error:'Subscriber company not found'});
+  await pool.query(`INSERT INTO feature_flag_tenants(tenant_id,flag_id,enabled,reason,updated_at) SELECT $1,id,$2,$3,NOW() FROM feature_flags WHERE code='entitlement_engine_enforcement' ON CONFLICT(tenant_id,flag_id) DO UPDATE SET enabled=EXCLUDED.enabled,reason=EXCLUDED.reason,updated_at=NOW()`,[tenantId,enabled,reason]);
+  await platformAudit(req,enabled?'ENABLE_PILOT':'DISABLE_PILOT','entitlement_engine',{tenant_id:tenantId,tenant_name:tenant.name,mode:ENTITLEMENT_ENGINE_MODE,reason});
+  res.json({message:`Entitlement pilot ${enabled?'enabled':'disabled'} for ${tenant.name}.`,tenant_id:tenantId,pilot_enabled:enabled,mode:ENTITLEMENT_ENGINE_MODE,enforcement_active:enabled&&(ENTITLEMENT_ENGINE_MODE==='pilot'||ENTITLEMENT_ENGINE_MODE==='enforce')});
 }catch(e){res.status(e.status||500).json({error:e.message})}});
 
 // ------------------------ SCHEMA HELPERS ------------------------

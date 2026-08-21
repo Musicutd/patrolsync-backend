@@ -389,6 +389,45 @@ app.get('/api/subscription/entitlements',requireAuth,async(req,res)=>{try{await 
 app.get('/api/platform/entitlements/catalog',requirePlatformAuth,async(req,res)=>{try{await entitlementSchemaReady;const[plans,features]=await Promise.all([pool.query(`SELECT p.*,COALESCE(jsonb_agg(jsonb_build_object('code',f.code,'enabled',pf.enabled,'included_quantity',pf.included_quantity,'hard_limit',pf.hard_limit) ORDER BY f.code) FILTER(WHERE f.id IS NOT NULL),'[]'::jsonb) features FROM plan_catalog p LEFT JOIN plan_features pf ON pf.plan_id=p.id LEFT JOIN feature_catalog f ON f.id=pf.feature_id GROUP BY p.id ORDER BY p.version,p.public_price_monthly NULLS LAST`),pool.query(`SELECT * FROM feature_catalog ORDER BY category,code`)]);res.json({mode:ENTITLEMENT_ENGINE_MODE,plans:plans.rows,features:features.rows})}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/platform/entitlements/tenants/:id',requirePlatformAuth,async(req,res)=>{const tenantId=Number(req.params.id);if(!Number.isInteger(tenantId)||tenantId<1)return res.status(400).json({error:'Invalid company ID'});try{await entitlementSchemaReady;const rows=await pool.query(`SELECT t.id tenant_id,t.name tenant_name,t.plan legacy_plan,p.code plan_code,p.name plan_name,p.version plan_version,ts.status subscription_status,f.code feature_code,f.category,f.unit,COALESCE(o.enabled,pf.enabled,FALSE) enabled,COALESCE(o.included_quantity,pf.included_quantity) included_quantity,COALESCE(o.included_quantity,pf.hard_limit) hard_limit,o.reason override_reason,o.expires_at FROM tenants t LEFT JOIN tenant_subscriptions ts ON ts.tenant_id=t.id LEFT JOIN plan_catalog p ON p.id=ts.plan_id CROSS JOIN feature_catalog f LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=t.id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE t.id=$1 ORDER BY f.category,f.code`,[tenantId]);if(!rows.rowCount)return res.status(404).json({error:'Subscriber company not found'});await platformAudit(req,'VIEW','tenant_entitlements',{tenant_id:tenantId});res.json({mode:ENTITLEMENT_ENGINE_MODE,tenant:{id:tenantId,name:rows.rows[0].tenant_name,legacy_plan:rows.rows[0].legacy_plan},subscription:{code:rows.rows[0].plan_code,name:rows.rows[0].plan_name,version:rows.rows[0].plan_version,status:rows.rows[0].subscription_status},features:rows.rows.map(r=>({code:r.feature_code,category:r.category,unit:r.unit,enabled:r.enabled,included_quantity:r.included_quantity,hard_limit:r.hard_limit,override_reason:r.override_reason,expires_at:r.expires_at}))})}catch(e){res.status(500).json({error:e.message})}});
 
+// ------------------------ EXPANSION STAGE 1B: SHADOW VERIFICATION ------------------------
+const LEGACY_RESOURCE_FEATURE={locations:'sites',checkpoints:'checkpoints',guards:'active_guards',client_accounts:'client_users'};
+async function currentCapacityUsage(tenantId,client=pool){
+  const result=await client.query(`SELECT
+    (SELECT COUNT(*)::int FROM sites WHERE tenant_id=$1) sites,
+    (SELECT COUNT(*)::int FROM checkpoints WHERE tenant_id=$1) checkpoints,
+    (SELECT COUNT(*)::int FROM users WHERE tenant_id=$1 AND role='guard') active_guards,
+    (SELECT COUNT(*)::int FROM client_users WHERE tenant_id=$1) client_users`,[tenantId]);
+  return result.rows[0];
+}
+app.get('/api/platform/entitlements/shadow-report',requirePlatformAuth,async(req,res)=>{try{
+  await requireEntitlementSchema();
+  const tenants=(await pool.query(`SELECT id,name,COALESCE(NULLIF(plan,''),'starter') legacy_plan FROM tenants ORDER BY id`)).rows;
+  const decisions=[];
+  for(const tenant of tenants){
+    const usage=await currentCapacityUsage(tenant.id);
+    const legacyLimits=PLAN_LIMITS[tenant.legacy_plan]||PLAN_LIMITS.starter;
+    for(const [legacyResource,featureCode] of Object.entries(LEGACY_RESOURCE_FEATURE)){
+      const legacyMax=legacyLimits[legacyResource],current=Number(usage[featureCode]||0);
+      const legacyAllowed=legacyMax===Infinity||legacyMax===undefined||current<legacyMax;
+      const entitlement=await resolveTenantEntitlement(tenant.id,featureCode);
+      const newLimit=entitlement?.hard_limit==null?null:Number(entitlement.hard_limit);
+      const newAllowed=Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)&&(newLimit==null||current<newLimit));
+      decisions.push({tenant_id:tenant.id,tenant_name:tenant.name,legacy_plan:tenant.legacy_plan,feature_code:featureCode,current,legacy_limit:Number.isFinite(legacyMax)?legacyMax:null,new_limit:newLimit,legacy_allowed:legacyAllowed,new_allowed:newAllowed,match:legacyAllowed===newAllowed,subscription_version:entitlement?.plan_version||null});
+    }
+  }
+  const mismatches=decisions.filter(x=>!x.match);
+  await platformAudit(req,'VERIFY','entitlement_shadow_report',{tenants:tenants.length,decisions:decisions.length,mismatches:mismatches.length});
+  res.json({mode:ENTITLEMENT_ENGINE_MODE,generated_at:new Date(),summary:{tenants:tenants.length,decisions:decisions.length,matches:decisions.length-mismatches.length,mismatches:mismatches.length,ready_for_pilot:mismatches.length===0},decisions});
+}catch(e){res.status(e.status||500).json({error:e.message})}});
+app.get('/api/platform/entitlements/usage/:id',requirePlatformAuth,async(req,res)=>{const tenantId=Number(req.params.id);if(!Number.isInteger(tenantId)||tenantId<1)return res.status(400).json({error:'Invalid company ID'});try{
+  await requireEntitlementSchema();
+  const tenant=(await pool.query(`SELECT id,name FROM tenants WHERE id=$1`,[tenantId])).rows[0];if(!tenant)return res.status(404).json({error:'Subscriber company not found'});
+  const capacity=await currentCapacityUsage(tenantId);
+  const metered=(await pool.query(`SELECT f.code,f.name,f.unit,COALESCE(SUM(u.quantity),0)::numeric quantity,MAX(u.occurred_at) last_event_at FROM feature_catalog f LEFT JOIN usage_events u ON u.feature_id=f.id AND u.tenant_id=$1 AND u.occurred_at>=date_trunc('month',NOW()) WHERE f.metered=TRUE GROUP BY f.id ORDER BY f.category,f.code`,[tenantId])).rows;
+  await platformAudit(req,'VIEW','tenant_usage',{tenant_id:tenantId});
+  res.json({tenant,period:{start:new Date(new Date().getFullYear(),new Date().getMonth(),1),end:new Date(new Date().getFullYear(),new Date().getMonth()+1,1)},capacity,metered});
+}catch(e){res.status(e.status||500).json({error:e.message})}});
+
 // ------------------------ SCHEMA HELPERS ------------------------
 
 async function ensureIncidentsTable() {

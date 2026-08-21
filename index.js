@@ -297,6 +297,98 @@ async function checkPlanLimit(client, tenantId, resource) {
   return { allowed: current < max, plan, max, current };
 }
 
+// ------------------------ EXPANSION STAGE 1A: ENTITLEMENTS FOUNDATION ------------------------
+
+const ENTITLEMENT_ENGINE_MODE=String(process.env.ENTITLEMENT_ENGINE_MODE||'observe').toLowerCase();
+const EXPANSION_PLAN_VERSION='2026.1';
+const LEGACY_PLAN_VERSION='legacy-2026';
+const EXPANSION_PLAN_SEED=[
+  {code:'starter',name:'Starter',price:49,guards:5,sites:2,checkpoints:25,admins:2,clients:3,storage:5},
+  {code:'growth',name:'Growth',price:99,guards:15,sites:5,checkpoints:100,admins:5,clients:10,storage:25},
+  {code:'pro',name:'Pro',price:199,guards:40,sites:15,checkpoints:400,admins:12,clients:30,storage:100},
+  {code:'command',name:'Command',price:399,guards:100,sites:50,checkpoints:1500,admins:30,clients:100,storage:500},
+  {code:'enterprise',name:'Enterprise',price:699,guards:null,sites:null,checkpoints:null,admins:null,clients:null,storage:null}
+];
+const LEGACY_PLAN_SEED=Object.entries(PLAN_LIMITS).map(([code,limits])=>({code,name:`Legacy ${code}`,price:limits.monthly_price,guards:Number.isFinite(limits.guards)?limits.guards:null,sites:Number.isFinite(limits.locations)?limits.locations:null,checkpoints:Number.isFinite(limits.checkpoints)?limits.checkpoints:null,admins:null,clients:Number.isFinite(limits.client_accounts)?limits.client_accounts:null,storage:null}));
+const FEATURE_SEED=[
+  ['active_guards','capacity','count'],['sites','capacity','count'],['checkpoints','capacity','count'],['admin_users','capacity','count'],['client_users','capacity','count'],['document_storage_gb','capacity','gb'],
+  ['qr_checkpoints','patrol','boolean'],['nfc_checkpoints','patrol','boolean'],['offline_patrol','patrol','boolean'],['dispatch','operations','boolean'],['compliance','workforce','boolean'],['trustproof','assurance','boolean'],['coverage_autopilot','intelligence','boolean'],['operations_risk','intelligence','boolean'],
+  ['proofscore','assurance','boolean'],['contract_ops','commercial','boolean'],['sla_predictor','intelligence','boolean'],['service_credit_autopilot','commercial','boolean'],['incident_reconstruction','incidents','boolean'],['external_trustproof_verify','assurance','boolean'],['client_retention_radar','commercial','boolean'],['site_risk_digital_twin','intelligence','boolean'],['crisis_mode','incidents','boolean'],['smart_handover','workforce','boolean'],['ai_chat','ai','requests']
+];
+const PLAN_BOOLEAN_FEATURES={
+  starter:['qr_checkpoints'],
+  growth:['qr_checkpoints','nfc_checkpoints','offline_patrol'],
+  pro:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','trustproof','coverage_autopilot','operations_risk'],
+  command:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','trustproof','coverage_autopilot','operations_risk','proofscore','contract_ops','sla_predictor','service_credit_autopilot','incident_reconstruction','external_trustproof_verify','client_retention_radar','site_risk_digital_twin','crisis_mode','smart_handover'],
+  enterprise:FEATURE_SEED.filter(([,category,unit])=>unit==='boolean'&&category!=='capacity').map(([code])=>code)
+};
+function quotedRoleFromTenantUrl(){try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');return /^[A-Za-z_][A-Za-z0-9_]*$/.test(role)?`"${role}"`:null}catch(_){return null}}
+async function ensureEntitlementSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS plan_catalog(id BIGSERIAL PRIMARY KEY,code TEXT NOT NULL,name TEXT NOT NULL,version TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',public_price_monthly NUMERIC(12,2),currency TEXT NOT NULL DEFAULT 'EUR',is_public BOOLEAN NOT NULL DEFAULT FALSE,metadata JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(code,version))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS feature_catalog(id BIGSERIAL PRIMARY KEY,code TEXT NOT NULL UNIQUE,name TEXT NOT NULL,category TEXT NOT NULL,unit TEXT NOT NULL DEFAULT 'boolean',metered BOOLEAN NOT NULL DEFAULT FALSE,status TEXT NOT NULL DEFAULT 'active',metadata JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS plan_features(id BIGSERIAL PRIMARY KEY,plan_id BIGINT NOT NULL REFERENCES plan_catalog(id) ON DELETE CASCADE,feature_id BIGINT NOT NULL REFERENCES feature_catalog(id) ON DELETE CASCADE,enabled BOOLEAN NOT NULL DEFAULT FALSE,included_quantity NUMERIC,soft_limit NUMERIC,hard_limit NUMERIC,metadata JSONB NOT NULL DEFAULT '{}'::jsonb,UNIQUE(plan_id,feature_id))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS tenant_subscriptions(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL UNIQUE,plan_id BIGINT NOT NULL REFERENCES plan_catalog(id),status TEXT NOT NULL DEFAULT 'active',period_start TIMESTAMPTZ,period_end TIMESTAMPTZ,trial_end TIMESTAMPTZ,billing_provider TEXT,billing_provider_ref TEXT,migration_source TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS tenant_entitlement_overrides(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,feature_id BIGINT NOT NULL REFERENCES feature_catalog(id),enabled BOOLEAN,included_quantity NUMERIC,reason TEXT NOT NULL,expires_at TIMESTAMPTZ,approved_by BIGINT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(tenant_id,feature_id))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS usage_events(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,feature_id BIGINT NOT NULL REFERENCES feature_catalog(id),quantity NUMERIC NOT NULL CHECK(quantity>=0),occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),source_object_type TEXT,source_object_id TEXT,idempotency_key TEXT NOT NULL,metadata JSONB NOT NULL DEFAULT '{}'::jsonb,UNIQUE(tenant_id,idempotency_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS usage_period_summaries(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,feature_id BIGINT NOT NULL REFERENCES feature_catalog(id),period_start DATE NOT NULL,period_end DATE NOT NULL,quantity NUMERIC NOT NULL DEFAULT 0,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(tenant_id,feature_id,period_start,period_end))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS feature_flags(id BIGSERIAL PRIMARY KEY,code TEXT NOT NULL UNIQUE,description TEXT,enabled_globally BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS feature_flag_tenants(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,flag_id BIGINT NOT NULL REFERENCES feature_flags(id) ON DELETE CASCADE,enabled BOOLEAN NOT NULL DEFAULT FALSE,reason TEXT,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(tenant_id,flag_id))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_feature_time ON usage_events(tenant_id,feature_id,occurred_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_entitlement_overrides_tenant ON tenant_entitlement_overrides(tenant_id,expires_at)`);
+  for(const table of ['tenant_subscriptions','tenant_entitlement_overrides','usage_events','usage_period_summaries','feature_flag_tenants']){
+    await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
+    await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);
+    await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  }
+  const tenantRole=quotedRoleFromTenantUrl();
+  if(tenantRole){
+    for(const table of ['tenant_subscriptions','tenant_entitlement_overrides','usage_events','usage_period_summaries','feature_flag_tenants'])await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO ${tenantRole}`);
+    for(const table of ['plan_catalog','feature_catalog','plan_features','feature_flags'])await pool.query(`GRANT SELECT ON ${table} TO ${tenantRole}`);
+    await pool.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${tenantRole}`);
+  }
+  for(const [code,category,unit] of FEATURE_SEED)await pool.query(`INSERT INTO feature_catalog(code,name,category,unit,metered) VALUES($1,$2,$3,$4,$5) ON CONFLICT(code) DO UPDATE SET category=EXCLUDED.category,unit=EXCLUDED.unit,metered=EXCLUDED.metered`,[code,code.split('_').map(x=>x[0].toUpperCase()+x.slice(1)).join(' '),category,unit,unit!=='boolean']);
+  for(const plan of [...LEGACY_PLAN_SEED,...EXPANSION_PLAN_SEED]){
+    const version=LEGACY_PLAN_SEED.includes(plan)?LEGACY_PLAN_VERSION:EXPANSION_PLAN_VERSION,isPublic=version===EXPANSION_PLAN_VERSION;
+    const planId=(await pool.query(`INSERT INTO plan_catalog(code,name,version,public_price_monthly,is_public,metadata) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(code,version) DO UPDATE SET name=EXCLUDED.name,public_price_monthly=EXCLUDED.public_price_monthly,is_public=EXCLUDED.is_public,metadata=EXCLUDED.metadata,updated_at=NOW() RETURNING id`,[plan.code,plan.name,version,plan.price,isPublic,JSON.stringify({source:version===EXPANSION_PLAN_VERSION?'expansion_pack':'legacy_compatibility'})])).rows[0].id;
+    const limits={active_guards:plan.guards,sites:plan.sites,checkpoints:plan.checkpoints,admin_users:plan.admins,client_users:plan.clients,document_storage_gb:plan.storage};
+    for(const [featureCode,limit] of Object.entries(limits))if(limit!==undefined){await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled,included_quantity,hard_limit) SELECT $1,id,TRUE,$3,$3 FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE,included_quantity=EXCLUDED.included_quantity,hard_limit=EXCLUDED.hard_limit`,[planId,featureCode,limit]);}
+    const booleans=version===EXPANSION_PLAN_VERSION?(PLAN_BOOLEAN_FEATURES[plan.code]||[]):['qr_checkpoints'];
+    for(const featureCode of booleans)await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled) SELECT $1,id,TRUE FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE`,[planId,featureCode]);
+  }
+  await pool.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id,status,period_start,period_end,migration_source) SELECT t.id,p.id,COALESCE(NULLIF(t.subscription_status,''),'active'),date_trunc('month',NOW()),date_trunc('month',NOW())+INTERVAL '1 month','legacy_plan_backfill' FROM tenants t JOIN plan_catalog p ON p.code=COALESCE(NULLIF(t.plan,''),'starter') AND p.version=$1 ON CONFLICT(tenant_id) DO NOTHING`,[LEGACY_PLAN_VERSION]);
+  await pool.query(`INSERT INTO feature_flags(code,description,enabled_globally) VALUES('entitlement_engine_enforcement','Enforce database-backed plan entitlements',FALSE),('expansion_stage_1','Expansion Stage 1 subscriber experience',FALSE) ON CONFLICT(code) DO NOTHING`);
+  console.log(`Expansion entitlement schema ready in ${ENTITLEMENT_ENGINE_MODE} mode`);
+}
+let entitlementSchemaError=null;
+const entitlementSchemaReady=ensureEntitlementSchema().catch(err=>{
+  entitlementSchemaError=err;
+  console.error('Entitlement schema setup failed (observe mode remains non-blocking):',err.message);
+  return null;
+});
+async function requireEntitlementSchema(){
+  await entitlementSchemaReady;
+  if(entitlementSchemaError){
+    const error=new Error('Entitlement diagnostics are temporarily unavailable');
+    error.status=503;
+    throw error;
+  }
+}
+
+async function resolveTenantEntitlement(tenantId,featureCode,client=pool){
+  const result=await client.query(`SELECT ts.tenant_id,ts.status subscription_status,p.code plan_code,p.name plan_name,p.version plan_version,f.code feature_code,f.unit,COALESCE(o.enabled,pf.enabled,FALSE) enabled,COALESCE(o.included_quantity,pf.included_quantity) included_quantity,pf.soft_limit,COALESCE(o.included_quantity,pf.hard_limit) hard_limit,o.reason override_reason,o.expires_at override_expires_at FROM tenant_subscriptions ts JOIN plan_catalog p ON p.id=ts.plan_id JOIN feature_catalog f ON f.code=$2 LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=ts.tenant_id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE ts.tenant_id=$1`,[tenantId,featureCode]);
+  return result.rows[0]||null;
+}
+async function canUseFeature(tenantId,featureCode,client=pool){const entitlement=await resolveTenantEntitlement(tenantId,featureCode,client);return{allowed:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),mode:ENTITLEMENT_ENGINE_MODE,entitlement};}
+async function recordUsageEvent({tenantId,featureCode,quantity=1,idempotencyKey,sourceObjectType=null,sourceObjectId=null,metadata={}}){
+  if(!idempotencyKey)throw new Error('Usage idempotency key is required');
+  const result=await withTenant(tenantId,client=>client.query(`INSERT INTO usage_events(tenant_id,feature_id,quantity,idempotency_key,source_object_type,source_object_id,metadata) SELECT $1,id,$3,$4,$5,$6,$7::jsonb FROM feature_catalog WHERE code=$2 ON CONFLICT(tenant_id,idempotency_key) DO NOTHING RETURNING id`,[tenantId,featureCode,quantity,idempotencyKey,sourceObjectType,sourceObjectId,JSON.stringify(metadata)]));
+  return{recorded:Boolean(result.rowCount),id:result.rows[0]?.id||null};
+}
+
+app.get('/api/subscription/entitlements',requireAuth,async(req,res)=>{try{await entitlementSchemaReady;const rows=await withTenant(req.auth.tenant_id,client=>client.query(`SELECT p.code plan_code,p.name plan_name,p.version plan_version,ts.status subscription_status,f.code feature_code,f.name feature_name,f.category,f.unit,COALESCE(o.enabled,pf.enabled,FALSE) enabled,COALESCE(o.included_quantity,pf.included_quantity) included_quantity,COALESCE(o.included_quantity,pf.hard_limit) hard_limit,o.reason override_reason FROM tenant_subscriptions ts JOIN plan_catalog p ON p.id=ts.plan_id CROSS JOIN feature_catalog f LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=ts.tenant_id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE ts.tenant_id=$1 ORDER BY f.category,f.code`,[req.auth.tenant_id]));res.json({mode:ENTITLEMENT_ENGINE_MODE,plan:rows.rows[0]?{code:rows.rows[0].plan_code,name:rows.rows[0].plan_name,version:rows.rows[0].plan_version,status:rows.rows[0].subscription_status}:null,features:rows.rows.map(({plan_code,plan_name,plan_version,subscription_status,...feature})=>feature)})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/platform/entitlements/catalog',requirePlatformAuth,async(req,res)=>{try{await entitlementSchemaReady;const[plans,features]=await Promise.all([pool.query(`SELECT p.*,COALESCE(jsonb_agg(jsonb_build_object('code',f.code,'enabled',pf.enabled,'included_quantity',pf.included_quantity,'hard_limit',pf.hard_limit) ORDER BY f.code) FILTER(WHERE f.id IS NOT NULL),'[]'::jsonb) features FROM plan_catalog p LEFT JOIN plan_features pf ON pf.plan_id=p.id LEFT JOIN feature_catalog f ON f.id=pf.feature_id GROUP BY p.id ORDER BY p.version,p.public_price_monthly NULLS LAST`),pool.query(`SELECT * FROM feature_catalog ORDER BY category,code`)]);res.json({mode:ENTITLEMENT_ENGINE_MODE,plans:plans.rows,features:features.rows})}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/platform/entitlements/tenants/:id',requirePlatformAuth,async(req,res)=>{const tenantId=Number(req.params.id);if(!Number.isInteger(tenantId)||tenantId<1)return res.status(400).json({error:'Invalid company ID'});try{await entitlementSchemaReady;const rows=await pool.query(`SELECT t.id tenant_id,t.name tenant_name,t.plan legacy_plan,p.code plan_code,p.name plan_name,p.version plan_version,ts.status subscription_status,f.code feature_code,f.category,f.unit,COALESCE(o.enabled,pf.enabled,FALSE) enabled,COALESCE(o.included_quantity,pf.included_quantity) included_quantity,COALESCE(o.included_quantity,pf.hard_limit) hard_limit,o.reason override_reason,o.expires_at FROM tenants t LEFT JOIN tenant_subscriptions ts ON ts.tenant_id=t.id LEFT JOIN plan_catalog p ON p.id=ts.plan_id CROSS JOIN feature_catalog f LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=t.id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE t.id=$1 ORDER BY f.category,f.code`,[tenantId]);if(!rows.rowCount)return res.status(404).json({error:'Subscriber company not found'});await platformAudit(req,'VIEW','tenant_entitlements',{tenant_id:tenantId});res.json({mode:ENTITLEMENT_ENGINE_MODE,tenant:{id:tenantId,name:rows.rows[0].tenant_name,legacy_plan:rows.rows[0].legacy_plan},subscription:{code:rows.rows[0].plan_code,name:rows.rows[0].plan_name,version:rows.rows[0].plan_version,status:rows.rows[0].subscription_status},features:rows.rows.map(r=>({code:r.feature_code,category:r.category,unit:r.unit,enabled:r.enabled,included_quantity:r.included_quantity,hard_limit:r.hard_limit,override_reason:r.override_reason,expires_at:r.expires_at}))})}catch(e){res.status(500).json({error:e.message})}});
+
 // ------------------------ SCHEMA HELPERS ------------------------
 
 async function ensureIncidentsTable() {

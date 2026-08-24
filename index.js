@@ -778,6 +778,8 @@ async function ensureCommunicationNotificationsTables() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_comm_notifications_tenant_created ON communication_notifications(tenant_id,created_at DESC)`);
+  await pool.query(`ALTER TABLE communication_notifications ADD COLUMN IF NOT EXISTS source_key TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_comm_notifications_tenant_source ON communication_notifications(tenant_id,source_key) WHERE source_key IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_comm_notification_receipts_user ON communication_notification_receipts(tenant_id,user_id)`);
   console.log('Communication notification tables ready');
 }
@@ -3337,6 +3339,9 @@ async function ensureCoverageAutopilotSchema(){
     replacement_user_id INTEGER NOT NULL,recommendation_score INTEGER NOT NULL,reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
     approved_by INTEGER NOT NULL,approved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query(`ALTER TABLE site_guard_requirements ADD COLUMN IF NOT EXISTS reminder_days INTEGER NOT NULL DEFAULT 30`);
+  await pool.query(`ALTER TABLE site_guard_requirements ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE site_guard_requirements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
   for(const table of ['site_guard_requirements','coverage_autopilot_actions']){
     await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
     await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);
@@ -3399,8 +3404,8 @@ async function buildCoverageAutopilot(client,tenantId,days=14){
 
 app.get('/api/coverage-autopilot',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id),days=Math.min(30,Math.max(1,Number(req.query.days||14)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await withTenant(tenantId,client=>buildCoverageAutopilot(client,tenantId,days)));}catch(err){res.status(500).json({error:err.message});}});
 app.post('/api/coverage-autopilot/reassign',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),shiftId=Number(req.body.shift_id),newUserId=Number(req.body.user_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!shiftId||!newUserId)return res.status(400).json({error:'Shift and replacement guard are required'});try{const output=await withTenant(tenantId,async client=>{await client.query('BEGIN');try{const current=await client.query('SELECT * FROM shifts WHERE tenant_id=$1 AND id=$2 FOR UPDATE',[tenantId,shiftId]);if(!current.rowCount)throw Object.assign(new Error('Shift not found'),{statusCode:404});const analysis=await buildCoverageAutopilot(client,tenantId,30),risk=analysis.shifts.find(s=>Number(s.shift_id)===shiftId),candidate=risk?.candidates.find(c=>Number(c.user_id)===newUserId);if(!candidate)throw Object.assign(new Error('Guard is no longer an eligible recommendation. Refresh Coverage Autopilot.'),{statusCode:409});const updated=await client.query(`UPDATE shifts SET user_id=$1,assignment_status='assigned',confirmation_status='pending',confirmed_at=NULL WHERE tenant_id=$2 AND id=$3 RETURNING *`,[newUserId,tenantId,shiftId]);await client.query(`INSERT INTO coverage_autopilot_actions(tenant_id,shift_id,previous_user_id,replacement_user_id,recommendation_score,reasons,approved_by) VALUES($1,$2,$3,$4,$5,$6,$7)`,[tenantId,shiftId,current.rows[0].user_id,newUserId,candidate.score,JSON.stringify(candidate.reasons),req.auth.user_id]);await client.query('COMMIT');return{shift:updated.rows[0],candidate};}catch(e){await client.query('ROLLBACK');throw e;}});res.json(output);}catch(err){res.status(err.statusCode||500).json({error:err.message});}});
-app.get('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('SELECT r.*,s.name site_name FROM site_guard_requirements r JOIN sites s ON s.id=r.site_id WHERE r.tenant_id=$1 ORDER BY s.name,r.cert_name',[tenantId]));res.json(r.rows);}catch(err){res.status(500).json({error:err.message});}});
-app.post('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),cert=String(req.body.cert_name||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!cert)return res.status(400).json({error:'Site and certification name are required'});try{const r=await withTenant(tenantId,client=>client.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name,created_by) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM sites WHERE tenant_id=$1 AND id=$2) ON CONFLICT(tenant_id,site_id,cert_name) DO UPDATE SET cert_name=EXCLUDED.cert_name RETURNING *`,[tenantId,siteId,cert,req.auth.user_id]));if(!r.rowCount)return res.status(404).json({error:'Site not found'});res.status(201).json(r.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
+app.get('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('SELECT r.*,s.name site_name FROM site_guard_requirements r JOIN sites s ON s.id=r.site_id WHERE r.tenant_id=$1 AND ($2::boolean OR r.active=TRUE) ORDER BY s.name,r.cert_name',[tenantId,req.query.include_inactive==='true']));res.json(r.rows);}catch(err){res.status(500).json({error:err.message});}});
+app.post('/api/site-guard-requirements',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),cert=String(req.body.cert_name||'').trim(),days=Math.min(365,Math.max(1,Number(req.body.reminder_days||30)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!cert)return res.status(400).json({error:'Site and certification name are required'});try{const r=await withTenant(tenantId,client=>client.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name,reminder_days,active,created_by) SELECT $1,$2,$3,$4,TRUE,$5 WHERE EXISTS(SELECT 1 FROM sites WHERE tenant_id=$1 AND id=$2) ON CONFLICT(tenant_id,site_id,cert_name) DO UPDATE SET reminder_days=EXCLUDED.reminder_days,active=TRUE,updated_at=NOW() RETURNING *`,[tenantId,siteId,cert,days,req.auth.user_id]));if(!r.rowCount)return res.status(404).json({error:'Site not found'});res.status(201).json(r.rows[0]);}catch(err){res.status(500).json({error:err.message});}});
 app.delete('/api/site-guard-requirements/:id',requireAuth,requireAdmin,async(req,res)=>{const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(tenantId,client=>client.query('DELETE FROM site_guard_requirements WHERE tenant_id=$1 AND id=$2 RETURNING id',[tenantId,req.params.id]));if(!r.rowCount)return res.status(404).json({error:'Requirement not found'});res.json({deleted:true});}catch(err){res.status(500).json({error:err.message});}});
 
 // ------------------------ PREDICTIVE OPERATIONS RISK ------------------------
@@ -4980,6 +4985,54 @@ app.patch('/api/certifications/:id/restore', requireAuth, requireAdmin, async (r
   const id=Number(req.params.id),tenantId=Number(req.body.tenant_id);if(!Number.isInteger(id)||!Number.isInteger(tenantId))return res.status(400).json({error:'Valid certificate and tenant are required'});
   try{const result=await withTenant(tenantId,client=>client.query(`UPDATE guard_certifications SET archived_at=NULL,archived_by_user_id=NULL WHERE id=$1 AND tenant_id=$2 AND archived_at IS NOT NULL AND replaced_by_id IS NULL RETURNING *`,[id,tenantId]));if(!result.rowCount)return res.status(409).json({error:'Certificate cannot be restored because it is active, missing, or has already been replaced'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
 });
+
+async function buildCertificationCompliance(client, tenantId) {
+  const [requirementsResult, assignmentsResult, guardsResult, certificationsResult] = await Promise.all([
+    client.query(`SELECT r.*,s.name AS site_name FROM site_guard_requirements r JOIN sites s ON s.id=r.site_id WHERE r.tenant_id=$1 AND r.active=TRUE ORDER BY s.name,r.cert_name`,[tenantId]),
+    client.query(`SELECT DISTINCT tenant_id,site_id,user_id FROM guard_assignments WHERE tenant_id=$1`,[tenantId]),
+    client.query(`SELECT id,email FROM users WHERE tenant_id=$1 AND role='guard' AND COALESCE(account_active,TRUE)=TRUE`,[tenantId]),
+    client.query(`SELECT id,user_id,cert_name,cert_number,issue_date,expiry_date FROM guard_certifications WHERE tenant_id=$1 AND archived_at IS NULL ORDER BY expiry_date DESC`,[tenantId])
+  ]);
+  const guardsById=new Map(guardsResult.rows.map(g=>[Number(g.id),g])), certs=certificationsResult.rows;
+  const today=DateTime.now().startOf('day'), rows=[];
+  for(const requirement of requirementsResult.rows){
+    const assigned=assignmentsResult.rows.filter(a=>Number(a.site_id)===Number(requirement.site_id));
+    for(const assignment of assigned){
+      const guard=guardsById.get(Number(assignment.user_id));if(!guard)continue;
+      const name=String(requirement.cert_name||'').trim().toLowerCase();
+      const matching=certs.filter(c=>Number(c.user_id)===Number(guard.id)&&String(c.cert_name||'').trim().toLowerCase()===name);
+      const certificate=matching[0]||null;
+      let status='missing',daysRemaining=null;
+      if(certificate){const expiry=DateTime.fromJSDate(new Date(certificate.expiry_date)).startOf('day');daysRemaining=Math.round(expiry.diff(today,'days').days);status=daysRemaining<0?'expired':daysRemaining<=Number(requirement.reminder_days||30)?'expiring_soon':'compliant';}
+      rows.push({requirement_id:requirement.id,site_id:requirement.site_id,site_name:requirement.site_name,cert_name:requirement.cert_name,reminder_days:requirement.reminder_days,user_id:guard.id,guard_email:guard.email,status,days_remaining:daysRemaining,certificate});
+    }
+  }
+  const summary={total:rows.length,compliant:rows.filter(x=>x.status==='compliant').length,missing:rows.filter(x=>x.status==='missing').length,expired:rows.filter(x=>x.status==='expired').length,expiring_soon:rows.filter(x=>x.status==='expiring_soon').length};
+  return{summary,rows,generated_at:new Date().toISOString()};
+}
+
+async function sweepCertificationComplianceForTenant(tenantId) {
+  return withTenant(tenantId,async client=>{
+    const report=await buildCertificationCompliance(client,tenantId), activeKeys=[];
+    for(const issue of report.rows.filter(x=>x.status!=='compliant')){
+      const sourceKey=`cert-compliance:${issue.requirement_id}:${issue.user_id}`, title=issue.status==='missing'?`Missing certificate: ${issue.cert_name}`:issue.status==='expired'?`Expired certificate: ${issue.cert_name}`:`Certificate expiring: ${issue.cert_name}`;
+      const message=issue.status==='missing'?`${issue.guard_email} has no active ${issue.cert_name} certificate for ${issue.site_name}.`:issue.status==='expired'?`${issue.guard_email}'s ${issue.cert_name} certificate for ${issue.site_name} expired ${Math.abs(issue.days_remaining)} day(s) ago.`:`${issue.guard_email}'s ${issue.cert_name} certificate for ${issue.site_name} expires in ${issue.days_remaining} day(s).`;
+      activeKeys.push(sourceKey);
+      await client.query(`INSERT INTO communication_notifications(tenant_id,title,message,category,priority,audience,action_url,requires_acknowledgement,source_key,expires_at)
+        VALUES($1,$2,$3,'certification',$4,'admins','certificate_register.html',FALSE,$5,NULL)
+        ON CONFLICT(tenant_id,source_key) WHERE source_key IS NOT NULL DO UPDATE SET title=EXCLUDED.title,message=EXCLUDED.message,priority=EXCLUDED.priority,expires_at=NULL`,[tenantId,title,message,issue.status==='expiring_soon'?'normal':'high',sourceKey]);
+    }
+    if(activeKeys.length)await client.query(`UPDATE communication_notifications SET expires_at=NOW() WHERE tenant_id=$1 AND source_key LIKE 'cert-compliance:%' AND NOT(source_key=ANY($2::text[])) AND expires_at IS NULL`,[tenantId,activeKeys]);
+    else await client.query(`UPDATE communication_notifications SET expires_at=NOW() WHERE tenant_id=$1 AND source_key LIKE 'cert-compliance:%' AND expires_at IS NULL`,[tenantId]);
+    return report;
+  });
+}
+
+async function runCertificationComplianceSweep(){try{const tenants=await pool.query('SELECT id FROM tenants WHERE COALESCE(account_active,TRUE)=TRUE');for(const tenant of tenants.rows)await sweepCertificationComplianceForTenant(Number(tenant.id));}catch(err){console.error('Certification compliance sweep failed:',err.message)}}
+scheduleBackgroundJob('certification_compliance_sweep',15*60*1000,45000,runCertificationComplianceSweep);
+
+app.get('/api/certification-compliance',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await withTenant(tenantId,client=>buildCertificationCompliance(client,tenantId)))}catch(err){res.status(500).json({error:err.message})}});
+app.post('/api/certification-compliance/run',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await sweepCertificationComplianceForTenant(tenantId))}catch(err){res.status(500).json({error:err.message})}});
 
 // ------------------------ PHASE 4: NOTIFICATIONS & ESCALATIONS ------------------------
 

@@ -238,7 +238,7 @@ async function requireAuth(req, res, next) {
   }
 }
 
-function permissionForPath(path=''){const rules=[['/api/dispatch','dispatch'],['/api/lone-worker','safety'],['/api/attendance','attendance'],['/api/timesheet','attendance'],['/api/shift','scheduling'],['/api/patrol','patrols'],['/api/checkpoint','patrols'],['/api/incident','incidents'],['/api/training','training'],['/api/certification','training'],['/api/assets','assets'],['/api/asset-custody','assets'],['/api/inspection','quality'],['/api/corrective','quality'],['/api/invoice','finance'],['/api/analytics','analytics'],['/api/service-contract','clients'],['/api/client-report','clients'],['/api/client-users','clients'],['/api/team-','communications'],['/api/communication-notifications','communications']];const found=rules.find(([prefix])=>path.startsWith(prefix));return found?found[1]:'administration';}
+function permissionForPath(path=''){const rules=[['/api/dispatch','dispatch'],['/api/lone-worker','safety'],['/api/visitors','safety'],['/api/attendance','attendance'],['/api/timesheet','attendance'],['/api/shift','scheduling'],['/api/patrol','patrols'],['/api/checkpoint','patrols'],['/api/incident','incidents'],['/api/training','training'],['/api/certification','training'],['/api/assets','assets'],['/api/asset-custody','assets'],['/api/inspection','quality'],['/api/corrective','quality'],['/api/invoice','finance'],['/api/analytics','analytics'],['/api/service-contract','clients'],['/api/client-report','clients'],['/api/client-users','clients'],['/api/team-','communications'],['/api/communication-notifications','communications']];const found=rules.find(([prefix])=>path.startsWith(prefix));return found?found[1]:'administration';}
 async function requireAdmin(req,res,next){if(!req.auth)return res.status(403).json({error:'Admin access required'});if(req.auth.role==='admin')return next();if(req.auth.role!=='staff')return res.status(403).json({error:'Admin access required'});try{const r=await pool.query(`SELECT permissions,account_active FROM users WHERE id=$1 AND tenant_id=$2 AND role='staff'`,[req.auth.user_id,req.auth.tenant_id]);if(!r.rowCount||r.rows[0].account_active===false)return res.status(403).json({error:'Staff account disabled'});const permissions=r.rows[0].permissions||[];if(req.method==='GET'&&['/api/users','/api/sites'].includes(req.path)){req.auth.permissions=permissions;return next();}const needed=permissionForPath(req.path);if(needed==='administration'||!permissions.includes(needed))return res.status(403).json({error:`Permission required: ${needed}`});req.auth.permissions=permissions;next()}catch(e){res.status(500).json({error:'Could not verify staff permissions'});}}
 function requireOwnerAdmin(req,res,next){if(!req.auth||req.auth.role!=='admin')return res.status(403).json({error:'Company administrator access required'});next();}
 async function requirePlatformAuth(req,res,next){const header=req.headers.authorization;if(!header?.startsWith('Bearer '))return res.status(401).json({error:'Platform authentication required'});try{const payload=jwt.verify(header.slice(7),PLATFORM_JWT_SECRET,{audience:'patrolsync-platform',issuer:'patrolsync'});if(payload.role!=='platform_admin'||!payload.session_id)throw new Error('Invalid platform role');const found=await pool.query(`SELECT a.id,a.email,a.display_name,a.active,s.revoked_at,s.expires_at FROM platform_admins a JOIN platform_auth_sessions s ON s.platform_admin_id=a.id AND s.id=$2 WHERE a.id=$1`,[payload.platform_admin_id,payload.session_id]);if(!found.rowCount||!found.rows[0].active||found.rows[0].revoked_at||new Date(found.rows[0].expires_at)<=new Date())return res.status(401).json({error:'Platform session expired or revoked'});req.platformAdmin=found.rows[0];req.platformSessionId=payload.session_id;pool.query(`UPDATE platform_auth_sessions SET last_seen_at=NOW() WHERE id=$1 AND last_seen_at<NOW()-INTERVAL '5 minutes'`,[payload.session_id]).catch(()=>{});next()}catch(e){res.status(401).json({error:'Invalid or expired platform session'})}}
@@ -325,14 +325,14 @@ const EXPANSION_PLAN_SEED=[
 const LEGACY_PLAN_SEED=Object.entries(PLAN_LIMITS).map(([code,limits])=>({code,name:`Legacy ${code}`,price:limits.monthly_price,guards:Number.isFinite(limits.guards)?limits.guards:null,sites:Number.isFinite(limits.locations)?limits.locations:null,checkpoints:Number.isFinite(limits.checkpoints)?limits.checkpoints:null,admins:null,clients:Number.isFinite(limits.client_accounts)?limits.client_accounts:null,storage:null}));
 const FEATURE_SEED=[
   ['active_guards','capacity','count'],['sites','capacity','count'],['checkpoints','capacity','count'],['admin_users','capacity','count'],['client_users','capacity','count'],['document_storage_gb','capacity','gb'],
-  ['qr_checkpoints','patrol','boolean'],['nfc_checkpoints','patrol','boolean'],['offline_patrol','patrol','boolean'],['dispatch','operations','boolean'],['compliance','workforce','boolean'],['trustproof','assurance','boolean'],['coverage_autopilot','intelligence','boolean'],['operations_risk','intelligence','boolean'],
+  ['qr_checkpoints','patrol','boolean'],['nfc_checkpoints','patrol','boolean'],['offline_patrol','patrol','boolean'],['dispatch','operations','boolean'],['compliance','workforce','boolean'],['visitor_management','operations','boolean'],['trustproof','assurance','boolean'],['coverage_autopilot','intelligence','boolean'],['operations_risk','intelligence','boolean'],
   ['proofscore','assurance','boolean'],['contract_ops','commercial','boolean'],['sla_predictor','intelligence','boolean'],['service_credit_autopilot','commercial','boolean'],['incident_reconstruction','incidents','boolean'],['external_trustproof_verify','assurance','boolean'],['client_retention_radar','commercial','boolean'],['site_risk_digital_twin','intelligence','boolean'],['crisis_mode','incidents','boolean'],['smart_handover','workforce','boolean'],['ai_chat','ai','requests']
 ];
 const PLAN_BOOLEAN_FEATURES={
   starter:['qr_checkpoints'],
   growth:['qr_checkpoints','nfc_checkpoints','offline_patrol'],
-  pro:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','trustproof','coverage_autopilot','operations_risk'],
-  command:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','trustproof','coverage_autopilot','operations_risk','proofscore','contract_ops','sla_predictor','service_credit_autopilot','incident_reconstruction','external_trustproof_verify','client_retention_radar','site_risk_digital_twin','crisis_mode','smart_handover'],
+  pro:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','visitor_management','trustproof','coverage_autopilot','operations_risk'],
+  command:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','visitor_management','trustproof','coverage_autopilot','operations_risk','proofscore','contract_ops','sla_predictor','service_credit_autopilot','incident_reconstruction','external_trustproof_verify','client_retention_radar','site_risk_digital_twin','crisis_mode','smart_handover'],
   enterprise:FEATURE_SEED.filter(([,category,unit])=>unit==='boolean'&&category!=='capacity').map(([code])=>code)
 };
 function quotedRoleFromTenantUrl(){try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');return /^[A-Za-z_][A-Za-z0-9_]*$/.test(role)?`"${role}"`:null}catch(_){return null}}
@@ -5614,6 +5614,68 @@ app.get('/api/field-reliability/readiness',requireAuth,requireAdmin,async(req,re
     const failures=checks.filter(x=>!x.passed),ready=failures.length===0;
     res.json({ready,status:ready?'stage_2_ready':'action_required',generated_at:new Date(),duration_ms:Date.now()-started,summary:{passed:checks.filter(x=>x.passed).length,failures:failures.length,total:checks.length},activity:{patrol_scans:result.scans,offline_incidents:result.offline_incidents,incident_photos:result.photos,nfc_registered:result.nfc_registered},checks});
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
+});
+
+// ------------------------ EXPANSION STAGE 3A: VISITOR MANAGEMENT ------------------------
+async function ensureVisitorManagementSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS visitor_records(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,
+    full_name TEXT NOT NULL,organization TEXT,purpose TEXT NOT NULL,host_name TEXT,
+    phone TEXT,email TEXT,badge_code TEXT,vehicle_registration TEXT,
+    status TEXT NOT NULL DEFAULT 'expected' CHECK(status IN('expected','on_site','checked_out','cancelled')),
+    expected_at TIMESTAMPTZ,checked_in_at TIMESTAMPTZ,checked_out_at TIMESTAMPTZ,
+    emergency_notes TEXT,notes TEXT,created_by INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_visitor_records_tenant_status ON visitor_records(tenant_id,status,expected_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_visitor_records_site_active ON visitor_records(tenant_id,site_id,checked_in_at DESC) WHERE status='on_site'`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_visitor_active_badge ON visitor_records(tenant_id,badge_code) WHERE status='on_site' AND badge_code IS NOT NULL`);
+  await pool.query(`ALTER TABLE visitor_records ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON visitor_records`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON visitor_records USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  const tenantRole=quotedRoleFromTenantUrl();
+  if(tenantRole){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON visitor_records TO ${tenantRole}`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE visitor_records_id_seq TO ${tenantRole}`)}
+  console.log('Visitor management schema ready');
+}
+ensureVisitorManagementSchema().catch(err=>console.error('Visitor management setup failed:',err.message));
+
+function visitorTenant(req,value){const requested=Number(value||req.auth.tenant_id);return Number(req.auth.tenant_id)===requested?requested:null}
+function visitorText(value,max=300){return String(value||'').trim().slice(0,max)||null}
+
+app.get('/api/visitors',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const status=String(req.query.status||'active'),siteId=Number(req.query.site_id||0),search=visitorText(req.query.search,120);
+  try{const result=await withTenant(tenantId,client=>{const params=[tenantId];let where='v.tenant_id=$1';if(status==='active')where+=` AND v.status IN('expected','on_site')`;else if(['expected','on_site','checked_out','cancelled'].includes(status)){params.push(status);where+=` AND v.status=$${params.length}`}if(siteId){params.push(siteId);where+=` AND v.site_id=$${params.length}`}if(search){params.push('%'+search.toLowerCase()+'%');where+=` AND (LOWER(v.full_name) LIKE $${params.length} OR LOWER(COALESCE(v.organization,'')) LIKE $${params.length} OR LOWER(COALESCE(v.badge_code,'')) LIKE $${params.length})`}return client.query(`SELECT v.*,s.name site_name,u.email created_by_email FROM visitor_records v JOIN sites s ON s.id=v.site_id AND s.tenant_id=v.tenant_id LEFT JOIN users u ON u.id=v.created_by AND u.tenant_id=v.tenant_id WHERE ${where} ORDER BY CASE v.status WHEN 'on_site' THEN 0 WHEN 'expected' THEN 1 ELSE 2 END,COALESCE(v.checked_in_at,v.expected_at,v.created_at) DESC LIMIT 500`,params)});res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}
+});
+
+app.get('/api/visitors/summary',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`SELECT COUNT(*) FILTER(WHERE status='on_site')::int on_site,COUNT(*) FILTER(WHERE status='expected' AND expected_at::date=CURRENT_DATE)::int expected_today,COUNT(*) FILTER(WHERE status='checked_out' AND checked_out_at::date=CURRENT_DATE)::int checked_out_today,COUNT(DISTINCT site_id) FILTER(WHERE status='on_site')::int occupied_sites FROM visitor_records WHERE tenant_id=$1`,[tenantId]));res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
+});
+
+app.get('/api/visitors/emergency-register',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`SELECT v.id,v.full_name,v.organization,v.purpose,v.host_name,v.phone,v.badge_code,v.vehicle_registration,v.checked_in_at,v.emergency_notes,s.id site_id,s.name site_name,s.address site_address FROM visitor_records v JOIN sites s ON s.id=v.site_id AND s.tenant_id=v.tenant_id WHERE v.tenant_id=$1 AND v.status='on_site' ORDER BY s.name,v.checked_in_at`,[tenantId]));res.json({generated_at:new Date(),count:result.rowCount,visitors:result.rows})}catch(err){res.status(500).json({error:err.message})}
+});
+
+app.post('/api/visitors',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.body.tenant_id),siteId=Number(req.body.site_id),fullName=visitorText(req.body.full_name,160),purpose=visitorText(req.body.purpose,300);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!fullName||!purpose)return res.status(400).json({error:'Site, visitor name, and purpose are required'});
+  const preRegister=Boolean(req.body.pre_register),expected=req.body.expected_at?new Date(req.body.expected_at):null;if(expected&&Number.isNaN(expected.getTime()))return res.status(400).json({error:'Expected arrival must be a valid date'});
+  try{const result=await withTenant(tenantId,async client=>{const site=await client.query('SELECT id FROM sites WHERE tenant_id=$1 AND id=$2',[tenantId,siteId]);if(!site.rowCount)throw Object.assign(new Error('Site not found'),{statusCode:404});return client.query(`INSERT INTO visitor_records(tenant_id,site_id,full_name,organization,purpose,host_name,phone,email,badge_code,vehicle_registration,status,expected_at,checked_in_at,emergency_notes,notes,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,CASE WHEN $11='on_site' THEN NOW() END,$13,$14,$15) RETURNING *`,[tenantId,siteId,fullName,visitorText(req.body.organization,160),purpose,visitorText(req.body.host_name,160),visitorText(req.body.phone,80),visitorText(req.body.email,160)?.toLowerCase()||null,visitorText(req.body.badge_code,80),visitorText(req.body.vehicle_registration,80)?.toUpperCase()||null,preRegister?'expected':'on_site',expected?.toISOString()||null,visitorText(req.body.emergency_notes,500),visitorText(req.body.notes,1000),req.auth.user_id])});res.status(201).json(result.rows[0])}catch(err){res.status(err.statusCode||500).json({error:err.code==='23505'?'That badge is already assigned to a visitor currently on site':err.message})}
+});
+
+app.patch('/api/visitors/:id/check-in',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.body.tenant_id),badge=visitorText(req.body.badge_code,80);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`UPDATE visitor_records SET status='on_site',checked_in_at=NOW(),checked_out_at=NULL,badge_code=COALESCE($1,badge_code),updated_at=NOW() WHERE tenant_id=$2 AND id=$3 AND status='expected' RETURNING *`,[badge,tenantId,req.params.id]));if(!result.rowCount)return res.status(409).json({error:'Only an expected visitor can be checked in'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.code==='23505'?'That badge is already in use':err.message})}
+});
+
+app.patch('/api/visitors/:id/check-out',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`UPDATE visitor_records SET status='checked_out',checked_out_at=NOW(),updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status='on_site' RETURNING *`,[tenantId,req.params.id]));if(!result.rowCount)return res.status(409).json({error:'Only a visitor currently on site can be checked out'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
+});
+
+app.patch('/api/visitors/:id/cancel',requireAuth,requireAdmin,async(req,res)=>{
+  const tenantId=visitorTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{const result=await withTenant(tenantId,client=>client.query(`UPDATE visitor_records SET status='cancelled',updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status='expected' RETURNING *`,[tenantId,req.params.id]));if(!result.rowCount)return res.status(409).json({error:'Only an expected visit can be cancelled'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
 });
 
 // ------------------------ SERVER START ------------------------

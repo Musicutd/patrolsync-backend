@@ -961,12 +961,19 @@ async function ensurePatrolRoutesTables() {
 ensurePatrolRoutesTables();
 
 async function ensurePatrolEvidenceColumns() {
+  await pool.query(`ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS nfc_tag_uid TEXT`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS patrol_run_id BIGINT`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS accuracy_m DOUBLE PRECISION`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS distance_m DOUBLE PRECISION`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS location_status TEXT NOT NULL DEFAULT 'unavailable'`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS device_scanned_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS client_scan_id TEXT`);
+  await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS scan_method TEXT NOT NULL DEFAULT 'qr'`);
+  await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS device_id TEXT`);
+  await pool.query(`ALTER TABLE patrol_logs ADD COLUMN IF NOT EXISTS offline_captured BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_checkpoints_tenant_nfc_tag ON checkpoints(tenant_id,nfc_tag_uid) WHERE nfc_tag_uid IS NOT NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_patrol_logs_tenant_client_scan ON patrol_logs(tenant_id,client_scan_id) WHERE client_scan_id IS NOT NULL`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_patrol_logs_evidence ON patrol_logs(tenant_id,location_status,scanned_at DESC)`);
   console.log('Patrol scan evidence columns ready');
 }
@@ -2656,6 +2663,7 @@ app.patch('/api/sites/:id/geofence', requireAuth, requireAdmin, async (req, res)
 
 app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, name, qr_code, latitude, longitude, building, floor } = req.body;
+  const nfcTagUid = String(req.body.nfc_tag_uid || '').trim().toUpperCase().replace(/[^A-Z0-9:_-]/g, '') || null;
   if (!tenant_id || !site_id || !name || !qr_code) {
     return res.status(400).json({ error: 'tenant_id, site_id, name, and qr_code are required' });
   }
@@ -2668,14 +2676,14 @@ app.post('/api/checkpoints', requireAuth, requireAdmin, async (req, res) => {
         throw err;
       }
       return client.query(
-        'INSERT INTO checkpoints (tenant_id, site_id, name, qr_code, latitude, longitude, building, floor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-        [tenant_id, site_id, name, qr_code, latitude || null, longitude || null, building || null, floor || null]
+        'INSERT INTO checkpoints (tenant_id, site_id, name, qr_code, latitude, longitude, building, floor, nfc_tag_uid) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+        [tenant_id, site_id, name, qr_code, latitude || null, longitude || null, building || null, floor || null, nfcTagUid]
       );
     });
     res.status(201).json(result.rows[0]);
   } catch (err) {
     if (err.code === '23505') {
-      return res.status(409).json({ error: 'A checkpoint with this QR code already exists' });
+      return res.status(409).json({ error: 'A checkpoint with this QR code or NFC tag already exists' });
     }
     res.status(err.statusCode || 500).json({ error: err.message });
   }
@@ -2697,19 +2705,23 @@ app.get('/api/checkpoints', requireAuth, async (req, res) => {
 });
 
 app.get('/api/checkpoints/lookup', requireAuth, async (req, res) => {
-  const { tenant_id, qr_code } = req.query;
-  if (!tenant_id || !qr_code) return res.status(400).json({ error: 'tenant_id and qr_code query params are required' });
+  const { tenant_id, qr_code, nfc_tag_uid } = req.query;
+  const lookupMethod = nfc_tag_uid ? 'nfc' : 'qr';
+  const lookupValue = lookupMethod === 'nfc'
+    ? String(nfc_tag_uid || '').trim().toUpperCase().replace(/[^A-Z0-9:_-]/g, '')
+    : String(qr_code || '').trim();
+  if (!tenant_id || !lookupValue) return res.status(400).json({ error: 'tenant_id and a QR code or NFC tag are required' });
   try {
     const result = await withTenant(tenant_id, (client) =>
       client.query(
         `SELECT c.*, s.name as site_name FROM checkpoints c
          JOIN sites s ON s.id = c.site_id
-         WHERE c.tenant_id = $1 AND c.qr_code = $2`,
-        [tenant_id, qr_code]
+         WHERE c.tenant_id = $1 AND ${lookupMethod === 'nfc' ? 'c.nfc_tag_uid' : 'c.qr_code'} = $2`,
+        [tenant_id, lookupValue]
       )
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'No checkpoint matches this QR code' });
+      return res.status(404).json({ error: 'No checkpoint matches this ' + (lookupMethod === 'nfc' ? 'NFC tag' : 'QR code') });
     }
     res.json(result.rows[0]);
   } catch (err) {
@@ -2734,6 +2746,23 @@ app.get('/api/qr-image', (req, res) => {
     res.set('Cache-Control', 'public, max-age=3600');
     res.send(buffer);
   });
+});
+
+app.patch('/api/checkpoints/:id/nfc', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.body.tenant_id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  const nfcTagUid = String(req.body.nfc_tag_uid || '').trim().toUpperCase().replace(/[^A-Z0-9:_-]/g, '') || null;
+  try {
+    const result = await withTenant(tenantId, client => client.query(
+      'UPDATE checkpoints SET nfc_tag_uid=$1 WHERE id=$2 AND tenant_id=$3 RETURNING *',
+      [nfcTagUid, req.params.id, tenantId]
+    ));
+    if (!result.rows.length) return res.status(404).json({ error: 'Checkpoint not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'This NFC tag is already assigned to another checkpoint' });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/api/checkpoints/:id', requireAuth, requireAdmin, async (req, res) => {
@@ -3196,12 +3225,18 @@ app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, r
 
 app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude, accuracy, scanned_at, device_scanned_at, patrol_run_id, checkpoint_note, instruction_confirmed } = req.body;
+  const clientScanId = String(req.body.client_scan_id || '').trim() || null;
+  const scanMethod = String(req.body.scan_method || 'qr').trim().toLowerCase();
+  const deviceId = String(req.body.device_id || '').trim() || null;
+  const offlineCaptured = Boolean(req.body.offline_captured);
   if (!tenant_id || !checkpoint_id || !user_id) {
     return res.status(400).json({ error: 'tenant_id, checkpoint_id, and user_id are required' });
   }
   const tenantId=attendanceTenant(req,tenant_id);
   if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
   if(req.auth.role!=='admin'&&Number(user_id)!==req.auth.user_id)return res.status(403).json({error:'Guards can only submit their own scans'});
+  if (!['qr', 'nfc'].includes(scanMethod)) return res.status(400).json({ error: 'scan_method must be qr or nfc' });
+  if (clientScanId && clientScanId.length > 120) return res.status(400).json({ error: 'client_scan_id is too long' });
 
   let scannedAtValue = null;
   if (scanned_at) {
@@ -3218,6 +3253,7 @@ app.post('/api/patrol-logs', requireAuth, async (req, res) => {
   if(patrol_run_id){
     const client=await pool.connect();
     try{await client.query('BEGIN');await client.query(`SET LOCAL app.current_tenant='${tenantId}'`);
+      if(clientScanId){const existing=await client.query('SELECT * FROM patrol_logs WHERE tenant_id=$1 AND client_scan_id=$2',[tenantId,clientScanId]);if(existing.rows.length){await client.query('COMMIT');return res.status(200).json({...existing.rows[0],duplicate:true,idempotent:true});}}
       const runResult=await client.query(`SELECT pr.*,r.strict_order FROM patrol_runs pr JOIN patrol_routes r ON r.id=pr.route_id WHERE pr.id=$1 AND pr.tenant_id=$2 FOR UPDATE`,[patrol_run_id,tenantId]);
       if(!runResult.rows.length)throw Object.assign(new Error('Scheduled patrol not found'),{statusCode:404});const run=runResult.rows[0];
       if(req.auth.role!=='admin'&&Number(run.user_id)!==req.auth.user_id)throw Object.assign(new Error('This patrol is assigned to another guard'),{statusCode:403});
@@ -3233,7 +3269,7 @@ app.post('/api/patrol-logs', requireAuth, async (req, res) => {
       const already=await client.query('SELECT 1 FROM patrol_run_scans WHERE run_id=$1 AND checkpoint_id=$2',[patrol_run_id,checkpoint_id]);
       if(already.rows.length)throw Object.assign(new Error('This checkpoint has already been scanned for this patrol'),{statusCode:409});
       if(run.strict_order){const next=await client.query(`SELECT rc.position,c.name FROM patrol_route_checkpoints rc JOIN checkpoints c ON c.id=rc.checkpoint_id WHERE rc.route_id=$1 AND NOT EXISTS(SELECT 1 FROM patrol_run_scans rs WHERE rs.run_id=$2 AND rs.checkpoint_id=rc.checkpoint_id) ORDER BY rc.position LIMIT 1`,[run.route_id,patrol_run_id]);if(next.rows.length&&Number(next.rows[0].position)!==Number(position))throw Object.assign(new Error('Wrong checkpoint order. Scan next: '+next.rows[0].name),{statusCode:409});}
-      const log=await client.query(`INSERT INTO patrol_logs (tenant_id,checkpoint_id,user_id,latitude,longitude,scanned_at,patrol_run_id,accuracy_m,distance_m,location_status,device_scanned_at) VALUES ($1,$2,$3,$4,$5,COALESCE($6::timestamptz,NOW()),$7,$8,$9,$10,$11) RETURNING *`,[tenantId,checkpoint_id,user_id,latitude||null,longitude||null,scannedAtValue,patrol_run_id,evidence.accuracy,evidence.distance,evidence.status,device_scanned_at||scannedAtValue]);
+      const log=await client.query(`INSERT INTO patrol_logs (tenant_id,checkpoint_id,user_id,latitude,longitude,scanned_at,patrol_run_id,accuracy_m,distance_m,location_status,device_scanned_at,client_scan_id,scan_method,device_id,offline_captured) VALUES ($1,$2,$3,$4,$5,COALESCE($6::timestamptz,NOW()),$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,[tenantId,checkpoint_id,user_id,latitude||null,longitude||null,scannedAtValue,patrol_run_id,evidence.accuracy,evidence.distance,evidence.status,device_scanned_at||scannedAtValue,clientScanId,scanMethod,deviceId,offlineCaptured]);
       await client.query('INSERT INTO patrol_run_scans (tenant_id,run_id,checkpoint_id,patrol_log_id,position,scanned_at,checkpoint_note,instruction_confirmed) VALUES ($1,$2,$3,$4,$5,COALESCE($6::timestamptz,NOW()),$7,$8)',[tenantId,patrol_run_id,checkpoint_id,log.rows[0].id,position,scannedAtValue,String(checkpoint_note||'').trim()||null,Boolean(instruction_confirmed)]);
       const counts=await client.query(`SELECT (SELECT COUNT(*) FROM patrol_route_checkpoints WHERE route_id=$1)::int total,(SELECT COUNT(*) FROM patrol_run_scans WHERE run_id=$2)::int scanned`,[run.route_id,patrol_run_id]);const complete=counts.rows[0].scanned>=counts.rows[0].total;
       if(complete)await client.query("UPDATE patrol_runs SET status='completed',completed_at=NOW() WHERE id=$1",[patrol_run_id]);
@@ -3246,9 +3282,13 @@ app.post('/api/patrol-logs', requireAuth, async (req, res) => {
       const siteResult=await client.query(`SELECT s.latitude,s.longitude,s.geofence_enabled,s.geofence_radius_m FROM checkpoints c JOIN sites s ON s.id=c.site_id WHERE c.id=$1 AND c.tenant_id=$2`,[checkpoint_id,tenantId]);
       if(!siteResult.rows.length)throw Object.assign(new Error('Checkpoint not found'),{statusCode:404});
       const evidence=patrolScanEvidence(siteResult.rows[0],latitude,longitude,accuracy);
-      return client.query(`INSERT INTO patrol_logs (tenant_id,checkpoint_id,user_id,latitude,longitude,scanned_at,accuracy_m,distance_m,location_status,device_scanned_at) VALUES ($1,$2,$3,$4,$5,COALESCE($6::timestamptz,NOW()),$7,$8,$9,$10) RETURNING *`,[tenantId,checkpoint_id,user_id,latitude||null,longitude||null,scannedAtValue,evidence.accuracy,evidence.distance,evidence.status,device_scanned_at||scannedAtValue]);
+      const inserted=await client.query(`INSERT INTO patrol_logs (tenant_id,checkpoint_id,user_id,latitude,longitude,scanned_at,accuracy_m,distance_m,location_status,device_scanned_at,client_scan_id,scan_method,device_id,offline_captured) VALUES ($1,$2,$3,$4,$5,COALESCE($6::timestamptz,NOW()),$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (tenant_id,client_scan_id) WHERE client_scan_id IS NOT NULL DO NOTHING RETURNING *`,[tenantId,checkpoint_id,user_id,latitude||null,longitude||null,scannedAtValue,evidence.accuracy,evidence.distance,evidence.status,device_scanned_at||scannedAtValue,clientScanId,scanMethod,deviceId,offlineCaptured]);
+      if(inserted.rows.length)return inserted;
+      const existing=await client.query('SELECT * FROM patrol_logs WHERE tenant_id=$1 AND client_scan_id=$2',[tenantId,clientScanId]);
+      existing.idempotent=true;
+      return existing;
     });
-    res.status(201).json(result.rows[0]);
+    res.status(result.idempotent ? 200 : 201).json({...result.rows[0],duplicate:Boolean(result.idempotent),idempotent:Boolean(result.idempotent)});
   } catch (err) {
     res.status(err.statusCode||500).json({ error: err.message });
   }

@@ -5860,6 +5860,64 @@ app.get('/api/compliance-readiness',requireAuth,requireAdmin,async(req,res)=>{
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
 });
 
+// ------------------------ STAGE 5.1: PROOFSCORE CLIENT ASSURANCE ------------------------
+async function ensureProofScoreSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS proofscore_snapshots(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,
+    period_start DATE NOT NULL,period_end DATE NOT NULL,score NUMERIC(5,2),grade TEXT NOT NULL,
+    components JSONB NOT NULL DEFAULT '[]'::jsonb,recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,
+    calculated_by_user_id INTEGER,calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,site_id,period_start,period_end)
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS proofscore_snapshots_tenant_site_time ON proofscore_snapshots(tenant_id,site_id,calculated_at DESC)`);
+  await pool.query(`ALTER TABLE proofscore_snapshots ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON proofscore_snapshots`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON proofscore_snapshots USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,UPDATE ON proofscore_snapshots TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE proofscore_snapshots_id_seq TO "${role}"`);}}catch(err){console.warn('ProofScore tenant-role grant skipped:',err.message)}
+  console.log('ProofScore assurance schema ready');
+}
+ensureProofScoreSchema().catch(err=>console.error('ProofScore schema setup failed:',err.message));
+
+function proofScoreComponent(key,label,weight,numerator,denominator,explanation){
+  const total=Number(denominator||0),achieved=Number(numerator||0),applicable=total>0;
+  return{key,label,weight,applicable,numerator:achieved,denominator:total,score:applicable?Math.max(0,Math.min(100,Math.round(achieved/total*10000)/100)):null,explanation};
+}
+function proofScoreGrade(score){if(score===null)return'UNRATED';if(score>=90)return'A';if(score>=80)return'B';if(score>=70)return'C';if(score>=60)return'D';return'E'}
+async function buildProofScore(client,tenantId,fromDate,toDate,siteId){
+  const params=[tenantId,fromDate,toDate];let siteFilter='';if(siteId){params.push(Number(siteId));siteFilter=` AND s.id=$${params.length}`}
+  const base=(await client.query(`SELECT s.id site_id,s.name site_name,
+    (SELECT COUNT(*)::int FROM patrol_runs p WHERE p.tenant_id=s.tenant_id AND p.site_id=s.id AND p.status<>'cancelled' AND p.scheduled_start::date BETWEEN $2::date AND $3::date AND p.scheduled_end<=NOW()) patrol_total,
+    (SELECT COUNT(*)::int FROM patrol_runs p WHERE p.tenant_id=s.tenant_id AND p.site_id=s.id AND p.status='completed' AND p.scheduled_start::date BETWEEN $2::date AND $3::date AND p.scheduled_end<=NOW()) patrol_completed,
+    (SELECT COUNT(*)::int FROM patrol_logs p JOIN checkpoints c ON c.id=p.checkpoint_id WHERE p.tenant_id=s.tenant_id AND c.site_id=s.id AND p.scanned_at::date BETWEEN $2::date AND $3::date) evidence_total,
+    (SELECT COUNT(*)::int FROM patrol_logs p JOIN checkpoints c ON c.id=p.checkpoint_id JOIN evidence_integrity_records e ON e.tenant_id=p.tenant_id AND e.evidence_type='patrol_scan' AND e.evidence_id=p.id::text WHERE p.tenant_id=s.tenant_id AND c.site_id=s.id AND p.scanned_at::date BETWEEN $2::date AND $3::date) evidence_sealed,
+    (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=s.tenant_id AND i.site_id=s.id AND i.reported_at::date BETWEEN $2::date AND $3::date) incident_total,
+    (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=s.tenant_id AND i.site_id=s.id AND i.reported_at::date BETWEEN $2::date AND $3::date AND i.acknowledged_at IS NOT NULL AND i.acknowledged_at<=i.reported_at+COALESCE((SELECT sc.sla_incident_ack_minutes FROM service_contracts sc WHERE sc.tenant_id=s.tenant_id AND sc.site_id=s.id AND sc.status='active' ORDER BY sc.id DESC LIMIT 1),15)*INTERVAL '1 minute') incident_ack_met,
+    (SELECT COUNT(*)::int FROM shifts sh WHERE sh.tenant_id=s.tenant_id AND sh.site_id=s.id AND sh.shift_date BETWEEN $2::date AND $3::date) shift_total,
+    (SELECT COUNT(*)::int FROM shifts sh WHERE sh.tenant_id=s.tenant_id AND sh.site_id=s.id AND sh.shift_date BETWEEN $2::date AND $3::date AND sh.assignment_status='assigned') shift_covered
+    FROM sites s WHERE s.tenant_id=$1${siteFilter} ORDER BY s.name`,params)).rows;
+  const [certification,competency]=await Promise.all([buildCertificationCompliance(client,tenantId),buildCompetencyMatrix(client,tenantId)]);
+  const sites=base.map(row=>{
+    const certRows=certification.rows.filter(x=>Number(x.site_id)===Number(row.site_id)),trainingRows=competency.rows.filter(x=>Number(x.site_id)===Number(row.site_id));
+    const components=[
+      proofScoreComponent('patrol','Patrol completion',25,row.patrol_completed,row.patrol_total,'Completed patrol rounds that were due in the selected period.'),
+      proofScoreComponent('evidence','TrustProof evidence',20,row.evidence_sealed,row.evidence_total,'Checkpoint scans sealed in the append-only evidence ledger.'),
+      proofScoreComponent('incident','Incident acknowledgement',15,row.incident_ack_met,row.incident_total,'Incidents acknowledged within the active contract target, or 15 minutes when no target exists.'),
+      proofScoreComponent('coverage','Shift coverage',15,row.shift_covered,row.shift_total,'Scheduled shifts with an assigned guard.'),
+      proofScoreComponent('certification','Certificate readiness',15,certRows.filter(x=>x.status==='compliant').length,certRows.length,'Assigned guards compliant with site certificate requirements.'),
+      proofScoreComponent('competency','Mandatory competency',10,trainingRows.filter(x=>x.status==='compliant').length,trainingRows.length,'Assigned guards compliant with mandatory site training requirements.')
+    ];
+    const measured=components.filter(x=>x.applicable),weight=measured.reduce((n,x)=>n+x.weight,0),score=weight?Math.round(measured.reduce((n,x)=>n+x.score*x.weight,0)/weight*100)/100:null;
+    const recommendations=components.filter(x=>x.applicable&&x.score<90).sort((a,b)=>a.score-b.score).map(x=>`Improve ${x.label.toLowerCase()} (${x.score}%).`);
+    return{site_id:Number(row.site_id),site_name:row.site_name,score,grade:proofScoreGrade(score),measured_weight:weight,components,recommendations};
+  });
+  const rated=sites.filter(x=>x.score!==null),overall=rated.length?Math.round(rated.reduce((n,x)=>n+x.score,0)/rated.length*100)/100:null;
+  return{period_start:fromDate,period_end:toDate,generated_at:new Date().toISOString(),summary:{overall_score:overall,grade:proofScoreGrade(overall),sites:sites.length,rated_sites:rated.length,sites_below_80:rated.filter(x=>x.score<80).length},sites};
+}
+
+app.get('/api/proofscore',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id),to=String(req.query.to_date||DateTime.now().toISODate()),from=String(req.query.from_date||DateTime.now().minus({days:29}).toISODate());if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!DateTime.fromISO(from).isValid||!DateTime.fromISO(to).isValid||from>to)return res.status(400).json({error:'Valid date range required'});try{res.json(await withTenant(tenantId,c=>buildProofScore(c,tenantId,from,to,req.query.site_id||null)))}catch(err){res.status(500).json({error:err.message})}});
+app.post('/api/proofscore/snapshots',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),from=String(req.body.from_date||''),to=String(req.body.to_date||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!DateTime.fromISO(from).isValid||!DateTime.fromISO(to).isValid||from>to)return res.status(400).json({error:'Valid date range required'});try{const report=await withTenant(tenantId,async c=>{const data=await buildProofScore(c,tenantId,from,to,req.body.site_id||null);for(const site of data.sites)await c.query(`INSERT INTO proofscore_snapshots(tenant_id,site_id,period_start,period_end,score,grade,components,recommendations,calculated_by_user_id,calculated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) ON CONFLICT(tenant_id,site_id,period_start,period_end) DO UPDATE SET score=EXCLUDED.score,grade=EXCLUDED.grade,components=EXCLUDED.components,recommendations=EXCLUDED.recommendations,calculated_by_user_id=EXCLUDED.calculated_by_user_id,calculated_at=NOW()`,[tenantId,site.site_id,from,to,site.score,site.grade,JSON.stringify(site.components),JSON.stringify(site.recommendations),req.auth.user_id]);return data});res.status(201).json({...report,saved:true})}catch(err){res.status(500).json({error:err.message})}});
+app.get('/api/proofscore/history',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,c=>{const p=[tenantId];let q=`SELECT p.*,s.name site_name,u.email calculated_by_email FROM proofscore_snapshots p JOIN sites s ON s.id=p.site_id LEFT JOIN users u ON u.id=p.calculated_by_user_id AND u.tenant_id=p.tenant_id WHERE p.tenant_id=$1`;if(req.query.site_id){p.push(Number(req.query.site_id));q+=` AND p.site_id=$${p.length}`}q+=' ORDER BY p.calculated_at DESC LIMIT 250';return c.query(q,p)});res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

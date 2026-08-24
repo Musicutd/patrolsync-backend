@@ -335,6 +335,13 @@ const PLAN_BOOLEAN_FEATURES={
   command:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','visitor_management','trustproof','coverage_autopilot','operations_risk','proofscore','contract_ops','sla_predictor','service_credit_autopilot','incident_reconstruction','external_trustproof_verify','client_retention_radar','site_risk_digital_twin','crisis_mode','smart_handover'],
   enterprise:FEATURE_SEED.filter(([,category,unit])=>unit==='boolean'&&category!=='capacity').map(([code])=>code)
 };
+const LEGACY_PLAN_BOOLEAN_FEATURES={
+  starter:['qr_checkpoints'],
+  medium:['qr_checkpoints','nfc_checkpoints','offline_patrol'],
+  pro:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','visitor_management'],
+  diamond:['qr_checkpoints','nfc_checkpoints','offline_patrol','dispatch','compliance','visitor_management','trustproof','coverage_autopilot','operations_risk'],
+  enterprise:FEATURE_SEED.filter(([,category,unit])=>unit==='boolean'&&category!=='capacity').map(([code])=>code)
+};
 function quotedRoleFromTenantUrl(){try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');return /^[A-Za-z_][A-Za-z0-9_]*$/.test(role)?`"${role}"`:null}catch(_){return null}}
 async function ensureEntitlementSchema(){
   await pool.query(`CREATE TABLE IF NOT EXISTS plan_catalog(id BIGSERIAL PRIMARY KEY,code TEXT NOT NULL,name TEXT NOT NULL,version TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',public_price_monthly NUMERIC(12,2),currency TEXT NOT NULL DEFAULT 'EUR',is_public BOOLEAN NOT NULL DEFAULT FALSE,metadata JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(code,version))`);
@@ -365,7 +372,7 @@ async function ensureEntitlementSchema(){
     const planId=(await pool.query(`INSERT INTO plan_catalog(code,name,version,public_price_monthly,is_public,metadata) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(code,version) DO UPDATE SET name=EXCLUDED.name,public_price_monthly=EXCLUDED.public_price_monthly,is_public=EXCLUDED.is_public,metadata=EXCLUDED.metadata,updated_at=NOW() RETURNING id`,[plan.code,plan.name,version,plan.price,isPublic,JSON.stringify({source:version===EXPANSION_PLAN_VERSION?'expansion_pack':'legacy_compatibility'})])).rows[0].id;
     const limits={active_guards:plan.guards,sites:plan.sites,checkpoints:plan.checkpoints,admin_users:plan.admins,client_users:plan.clients,document_storage_gb:plan.storage};
     for(const [featureCode,limit] of Object.entries(limits))if(limit!==undefined){await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled,included_quantity,hard_limit) SELECT $1,id,TRUE,$3,$3 FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE,included_quantity=EXCLUDED.included_quantity,hard_limit=EXCLUDED.hard_limit`,[planId,featureCode,limit]);}
-    const booleans=version===EXPANSION_PLAN_VERSION?(PLAN_BOOLEAN_FEATURES[plan.code]||[]):['qr_checkpoints'];
+    const booleans=version===EXPANSION_PLAN_VERSION?(PLAN_BOOLEAN_FEATURES[plan.code]||[]):(LEGACY_PLAN_BOOLEAN_FEATURES[plan.code]||['qr_checkpoints']);
     for(const featureCode of booleans)await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled) SELECT $1,id,TRUE FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE`,[planId,featureCode]);
   }
   await pool.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id,status,period_start,period_end,migration_source) SELECT t.id,p.id,COALESCE(NULLIF(t.subscription_status,''),'active'),date_trunc('month',NOW()),date_trunc('month',NOW())+INTERVAL '1 month','legacy_plan_backfill' FROM tenants t JOIN plan_catalog p ON p.code=COALESCE(NULLIF(t.plan,''),'starter') AND p.version=$1 ON CONFLICT(tenant_id) DO NOTHING`,[LEGACY_PLAN_VERSION]);
@@ -5676,6 +5683,47 @@ app.patch('/api/visitors/:id/check-out',requireAuth,requireAdmin,async(req,res)=
 app.patch('/api/visitors/:id/cancel',requireAuth,requireAdmin,async(req,res)=>{
   const tenantId=visitorTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
   try{const result=await withTenant(tenantId,client=>client.query(`UPDATE visitor_records SET status='cancelled',updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status='expected' RETURNING *`,[tenantId,req.params.id]));if(!result.rowCount)return res.status(409).json({error:'Only an expected visit can be cancelled'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
+});
+
+// ------------------------ EXPANSION STAGE 3B: WORKFORCE READINESS GATE ------------------------
+app.get('/api/workforce-readiness',requireAuth,requireAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=visitorTenant(req,req.query.tenant_id),checks=[];
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const add=(code,label,passed,message,critical=true,details={})=>checks.push({code,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+  try{
+    const required=['visitor_records','guard_certifications','training_materials','training_assignments','managed_assets','asset_custody','handover_logs'];
+    const structures=(await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name=ANY($1::text[])`,[required])).rows.map(x=>x.table_name);
+    add('structures','Stage 3 database structures',required.every(x=>structures.includes(x)),`${structures.length}/${required.length} required tables available`,true,{missing:required.filter(x=>!structures.includes(x))});
+    const rls=(await pool.query(`SELECT c.relname table_name,c.relrowsecurity enabled,EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname) protected FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY($1::text[])`,[required])).rows;
+    add('rls','Tenant RLS protection',rls.length===required.length&&rls.every(x=>x.enabled&&x.protected),`${rls.filter(x=>x.enabled&&x.protected).length}/${required.length} tables have RLS and a tenant policy`,true,{tables:rls});
+    const tenantRoleRaw=(()=>{try{return decodeURIComponent(new URL(tenantDatabaseUrl).username||'')}catch(_){return''}})();
+    let grants=[];if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(tenantRoleRaw)){grants=(await pool.query(`SELECT t table_name,has_table_privilege($1,'public.'||t,'SELECT') can_read FROM unnest($2::text[]) t`,[tenantRoleRaw,required])).rows}
+    add('grants','Restricted tenant-role access',grants.length===required.length&&grants.every(x=>x.can_read),grants.length?`${grants.filter(x=>x.can_read).length}/${required.length} tables readable through the restricted role`:'Restricted tenant role could not be identified',true,{tables:grants});
+    const data=await withTenant(tenantId,async client=>{
+      const [visitorState,badges,visitorSites,certs,training,custody,handovers,emergency,entitlement]=await Promise.all([
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE checked_in_at IS NULL OR checked_out_at IS NOT NULL)::int invalid FROM visitor_records WHERE tenant_id=$1 AND status='on_site'`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int count FROM(SELECT badge_code FROM visitor_records WHERE tenant_id=$1 AND status='on_site' AND badge_code IS NOT NULL GROUP BY badge_code HAVING COUNT(*)>1)x`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int count FROM visitor_records v LEFT JOIN sites s ON s.id=v.site_id AND s.tenant_id=v.tenant_id WHERE v.tenant_id=$1 AND s.id IS NULL`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE expiry_date<CURRENT_DATE)::int expired,COUNT(*) FILTER(WHERE expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE+30)::int expiring FROM guard_certifications WHERE tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE mandatory AND status<>'completed' AND due_at<NOW())::int overdue FROM training_assignments WHERE tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int open,COUNT(*) FILTER(WHERE a.id IS NULL OR u.id IS NULL OR COALESCE(u.account_active,TRUE)=FALSE)::int invalid FROM asset_custody c LEFT JOIN managed_assets a ON a.id=c.asset_id AND a.tenant_id=c.tenant_id LEFT JOIN users u ON u.id=c.user_id AND u.tenant_id=c.tenant_id WHERE c.tenant_id=$1 AND c.status<>'returned'`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE s.id IS NULL OR f.id IS NULL)::int invalid FROM handover_logs h LEFT JOIN sites s ON s.id=h.site_id AND s.tenant_id=h.tenant_id LEFT JOIN users f ON f.id=h.from_user_id AND f.tenant_id=h.tenant_id WHERE h.tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int count FROM visitor_records WHERE tenant_id=$1 AND status='on_site'`,[tenantId]),
+        client.query(`SELECT COALESCE(o.enabled,pf.enabled,FALSE) enabled,ts.status subscription_status FROM tenant_subscriptions ts JOIN feature_catalog f ON f.code='visitor_management' LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=ts.tenant_id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE ts.tenant_id=$1`,[tenantId])
+      ]);return{visitor_state:visitorState.rows[0],duplicate_badges:Number(badges.rows[0].count),broken_visitor_sites:Number(visitorSites.rows[0].count),certifications:certs.rows[0],training:training.rows[0],custody:custody.rows[0],handovers:handovers.rows[0],emergency_count:Number(emergency.rows[0].count),entitlement:entitlement.rows[0]||null}
+    });
+    add('visitor_state','Visitor check-in integrity',Number(data.visitor_state.invalid)===0,`${data.visitor_state.total} visitor(s) currently on site; ${data.visitor_state.invalid} invalid state(s)`,true,data.visitor_state);
+    add('visitor_badges','Active visitor badge uniqueness',data.duplicate_badges===0,data.duplicate_badges===0?'No badge is assigned to multiple on-site visitors':`${data.duplicate_badges} duplicated active badge(s)`,true,{duplicates:data.duplicate_badges});
+    add('visitor_sites','Visitor site relationships',data.broken_visitor_sites===0,data.broken_visitor_sites===0?'Every visitor references a valid company site':`${data.broken_visitor_sites} visitor record(s) reference a missing site`,true,{broken:data.broken_visitor_sites});
+    add('emergency_register','Emergency on-site register',data.emergency_count===Number(data.visitor_state.total),`${data.emergency_count} current visitor(s) available to the emergency register`,true,{count:data.emergency_count});
+    add('certifications','Guard certification status',Number(data.certifications.expired)===0,`${data.certifications.expired} expired; ${data.certifications.expiring} expire within 30 days`,false,data.certifications);
+    add('training','Mandatory training status',Number(data.training.overdue)===0,`${data.training.overdue} overdue mandatory assignment(s)`,false,data.training);
+    add('custody','Equipment custody integrity',Number(data.custody.invalid)===0,`${data.custody.open} open custody record(s); ${data.custody.invalid} invalid`,true,data.custody);
+    add('handovers','Shift handover relationships',Number(data.handovers.invalid)===0,`${data.handovers.total} handover(s); ${data.handovers.invalid} broken relationship(s)`,true,data.handovers);
+    add('entitlement','Visitor-management entitlement',Boolean(data.entitlement?.enabled&&['active','trialing'].includes(data.entitlement.subscription_status)),data.entitlement?.enabled?`Enabled for ${data.entitlement.subscription_status} subscription`:'Visitor management is not enabled by the effective subscription',true,data.entitlement||{});
+    const failures=checks.filter(x=>x.critical&&!x.passed),warnings=checks.filter(x=>!x.critical&&!x.passed),status=failures.length?'action_required':warnings.length?'ready_with_warnings':'stage_3_ready';
+    res.json({status,ready:failures.length===0,generated_at:new Date(),duration_ms:Date.now()-started,summary:{passed:checks.filter(x=>x.passed).length,warnings:warnings.length,failures:failures.length,total:checks.length},activity:{visitors_on_site:data.emergency_count,expired_certifications:Number(data.certifications.expired),overdue_training:Number(data.training.overdue),open_custody:Number(data.custody.open)},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
 });
 
 // ------------------------ SERVER START ------------------------

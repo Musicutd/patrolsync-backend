@@ -528,7 +528,12 @@ async function ensureIncidentsTable() {
   await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ`);
   await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution TEXT`);
   await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS client_incident_id TEXT`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS device_reported_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS offline_captured BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS device_id TEXT`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_reference ON incidents(tenant_id,reference_code) WHERE reference_code IS NOT NULL`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_incidents_tenant_client_id ON incidents(tenant_id,client_incident_id) WHERE client_incident_id IS NOT NULL`);
   await pool.query(`CREATE TABLE IF NOT EXISTS incident_activities (
     id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
     user_id INTEGER,activity_type TEXT NOT NULL,note TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -3841,11 +3846,17 @@ app.patch('/api/handovers/:id/resolve',requireAuth,requireAdmin,async(req,res)=>
 
 app.post('/api/incidents', requireAuth, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity, category, photos } = req.body;
+  const clientIncidentId=String(req.body.client_incident_id||'').trim()||null;
+  const deviceId=String(req.body.device_id||'').trim()||null;
+  const offlineCaptured=Boolean(req.body.offline_captured);
+  let deviceReportedAt=null;
   const user_id = req.auth.user_id;
   if (!tenant_id || !site_id || !description) {
     return res.status(400).json({ error: 'tenant_id, site_id, and description are required' });
   }
   const tenantId=attendanceTenant(req,tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(clientIncidentId&&clientIncidentId.length>120)return res.status(400).json({error:'client_incident_id is too long'});
+  if(req.body.device_reported_at){const parsed=new Date(req.body.device_reported_at);if(Number.isNaN(parsed.getTime()))return res.status(400).json({error:'device_reported_at must be a valid date'});if(parsed.getTime()>Date.now()+5*60000)return res.status(400).json({error:'device_reported_at cannot be in the future'});deviceReportedAt=parsed.toISOString();}
   const incidentCategory=['security','safety','medical','fire','property','access','conduct','general'].includes(category)?category:'general';
 
   const photoList = Array.isArray(photos) ? photos.slice(0, MAX_PHOTOS_PER_INCIDENT) : [];
@@ -3863,11 +3874,13 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   const uploadedKeys=[];
   try {
     await client.query('BEGIN');
-    await client.query(`SET app.current_tenant = '${tenant_id}'`);
+    await client.query(`SET LOCAL app.current_tenant = '${tenantId}'`);
+
+    if(clientIncidentId){const existing=await client.query(`SELECT i.*,(SELECT COUNT(*)::int FROM incident_photos p WHERE p.tenant_id=i.tenant_id AND p.incident_id=i.id) photo_count FROM incidents i WHERE i.tenant_id=$1 AND i.client_incident_id=$2`,[tenantId,clientIncidentId]);if(existing.rows.length){await client.query('COMMIT');return res.status(200).json({...existing.rows[0],duplicate:true,idempotent:true});}}
 
     const incidentResult = await client.query(
-      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity,category) VALUES ($1, $2, $3, $4, $5, $6,$7) RETURNING *',
-      [tenant_id, site_id, checkpoint_id || null, user_id, description, severity || 'low',incidentCategory]
+      'INSERT INTO incidents (tenant_id, site_id, checkpoint_id, user_id, description, severity,category,client_incident_id,device_reported_at,offline_captured,device_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [tenantId, site_id, checkpoint_id || null, user_id, description, severity || 'low',incidentCategory,clientIncidentId,deviceReportedAt,offlineCaptured,deviceId]
     );
     let incident = incidentResult.rows[0];
     const reference='INC-'+new Date().getUTCFullYear()+'-'+String(incident.id).padStart(6,'0');
@@ -3887,7 +3900,8 @@ app.post('/api/incidents', requireAuth, async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     for(const key of uploadedKeys)await objectStorageRequest('DELETE',key).catch(()=>{});
-    res.status(500).json({ error: err.message });
+    if(err.code==='23505'&&clientIncidentId){const existing=await pool.query(`SELECT i.*,(SELECT COUNT(*)::int FROM incident_photos p WHERE p.tenant_id=i.tenant_id AND p.incident_id=i.id) photo_count FROM incidents i WHERE i.tenant_id=$1 AND i.client_incident_id=$2`,[tenantId,clientIncidentId]);if(existing.rows.length)return res.status(200).json({...existing.rows[0],duplicate:true,idempotent:true});}
+    res.status(err.statusCode||500).json({ error: err.message });
   } finally {
     client.release();
   }

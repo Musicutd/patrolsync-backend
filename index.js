@@ -1123,6 +1123,10 @@ async function ensureGuardCertificationsTable() {
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS issue_date DATE`);
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS expiry_date DATE`);
   await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS archived_by_user_id INTEGER`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS replacement_for_id INTEGER`);
+  await pool.query(`ALTER TABLE guard_certifications ADD COLUMN IF NOT EXISTS replaced_by_id INTEGER`);
 
   const legacyNameColumn = await pool.query(`
     SELECT 1
@@ -4813,6 +4817,7 @@ function computeCertStatus(expiryDate) {
 app.get('/api/certifications', requireAuth, async (req, res) => {
   const { tenant_id: queryTenant } = req.query;
   const { user_id } = req.query;
+  const includeArchived = req.query.include_archived === 'true';
 
   const effectiveTenantId = queryTenant || req.auth.tenant_id;
   if (!effectiveTenantId) {
@@ -4826,18 +4831,18 @@ app.get('/api/certifications', requireAuth, async (req, res) => {
           `SELECT c.*, u.email as guard_email
            FROM guard_certifications c
            JOIN users u ON u.id = c.user_id
-           WHERE c.tenant_id = $1 AND c.user_id = $2
+           WHERE c.tenant_id = $1 AND c.user_id = $2 AND ($3::boolean OR c.archived_at IS NULL)
            ORDER BY c.expiry_date ASC, c.cert_name ASC`,
-          [effectiveTenantId, user_id]
+          [effectiveTenantId, user_id, includeArchived]
         );
       }
       return client.query(
         `SELECT c.*, u.email as guard_email
          FROM guard_certifications c
          JOIN users u ON u.id = c.user_id
-         WHERE c.tenant_id = $1
+         WHERE c.tenant_id = $1 AND ($2::boolean OR c.archived_at IS NULL)
          ORDER BY c.expiry_date ASC, c.cert_name ASC`,
-        [effectiveTenantId]
+        [effectiveTenantId, includeArchived]
       );
     });
     res.json(result.rows.map(cert => ({ ...cert, ...computeCertStatus(cert.expiry_date) })));
@@ -4859,7 +4864,7 @@ app.get('/api/certifications/expiring', requireAuth, requireAdmin, async (req, r
         `SELECT c.*, u.email as guard_email
          FROM guard_certifications c
          JOIN users u ON u.id = c.user_id
-         WHERE c.tenant_id = $1
+         WHERE c.tenant_id = $1 AND c.archived_at IS NULL
          ORDER BY c.expiry_date ASC`,
         [effectiveTenantId]
       )
@@ -4944,17 +4949,36 @@ app.delete('/api/certifications/:id', requireAuth, requireAdmin, async (req, res
   try {
     const result = await withTenant(tenant_id, (client) =>
       client.query(
-        'DELETE FROM guard_certifications WHERE id = $1 AND tenant_id = $2 RETURNING *',
-        [id, tenant_id]
+        `UPDATE guard_certifications SET archived_at=NOW(),archived_by_user_id=$3
+         WHERE id=$1 AND tenant_id=$2 AND archived_at IS NULL RETURNING *`,
+        [id, tenant_id, req.auth.user_id]
       )
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Certification not found' });
     }
-    res.json({ deleted: result.rows[0] });
+    res.json({ archived: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.post('/api/certifications/:id/renew', requireAuth, requireAdmin, async (req, res) => {
+  const id=Number(req.params.id),tenantId=Number(req.body.tenant_id),certName=String(req.body.cert_name||'').trim(),certNumber=String(req.body.cert_number||'').trim(),issueDate=req.body.issue_date||null,expiryDate=req.body.expiry_date||null;
+  if(!Number.isInteger(id)||!Number.isInteger(tenantId)||!certName||!expiryDate)return res.status(400).json({error:'Certificate, tenant, name and new expiry date are required'});
+  if(Number.isNaN(new Date(expiryDate).getTime()))return res.status(400).json({error:'New expiry date must be valid'});
+  try{const renewed=await withTenant(tenantId,async client=>{await client.query('BEGIN');try{
+    const old=(await client.query(`SELECT * FROM guard_certifications WHERE id=$1 AND tenant_id=$2 AND archived_at IS NULL FOR UPDATE`,[id,tenantId])).rows[0];
+    if(!old)throw Object.assign(new Error('Active certificate not found'),{statusCode:404});
+    const next=(await client.query(`INSERT INTO guard_certifications(tenant_id,user_id,cert_name,cert_number,issue_date,expiry_date,replacement_for_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[tenantId,old.user_id,certName,certNumber||null,issueDate,expiryDate,old.id])).rows[0];
+    await client.query(`UPDATE guard_certifications SET archived_at=NOW(),archived_by_user_id=$3,replaced_by_id=$4 WHERE id=$1 AND tenant_id=$2`,[old.id,tenantId,req.auth.user_id,next.id]);
+    await client.query('COMMIT');return{previous_id:old.id,certificate:next};
+  }catch(error){await client.query('ROLLBACK');throw error}});res.status(201).json(renewed)}catch(err){res.status(err.statusCode||500).json({error:err.message})}
+});
+
+app.patch('/api/certifications/:id/restore', requireAuth, requireAdmin, async (req, res) => {
+  const id=Number(req.params.id),tenantId=Number(req.body.tenant_id);if(!Number.isInteger(id)||!Number.isInteger(tenantId))return res.status(400).json({error:'Valid certificate and tenant are required'});
+  try{const result=await withTenant(tenantId,client=>client.query(`UPDATE guard_certifications SET archived_at=NULL,archived_by_user_id=NULL WHERE id=$1 AND tenant_id=$2 AND archived_at IS NOT NULL AND replaced_by_id IS NULL RETURNING *`,[id,tenantId]));if(!result.rowCount)return res.status(409).json({error:'Certificate cannot be restored because it is active, missing, or has already been replaced'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}
 });
 
 // ------------------------ PHASE 4: NOTIFICATIONS & ESCALATIONS ------------------------
@@ -5704,7 +5728,7 @@ app.get('/api/workforce-readiness',requireAuth,requireAdmin,async(req,res)=>{
         client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE checked_in_at IS NULL OR checked_out_at IS NOT NULL)::int invalid FROM visitor_records WHERE tenant_id=$1 AND status='on_site'`,[tenantId]),
         client.query(`SELECT COUNT(*)::int count FROM(SELECT badge_code FROM visitor_records WHERE tenant_id=$1 AND status='on_site' AND badge_code IS NOT NULL GROUP BY badge_code HAVING COUNT(*)>1)x`,[tenantId]),
         client.query(`SELECT COUNT(*)::int count FROM visitor_records v LEFT JOIN sites s ON s.id=v.site_id AND s.tenant_id=v.tenant_id WHERE v.tenant_id=$1 AND s.id IS NULL`,[tenantId]),
-        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE expiry_date<CURRENT_DATE)::int expired,COUNT(*) FILTER(WHERE expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE+30)::int expiring FROM guard_certifications WHERE tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE expiry_date<CURRENT_DATE)::int expired,COUNT(*) FILTER(WHERE expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE+30)::int expiring FROM guard_certifications WHERE tenant_id=$1 AND archived_at IS NULL`,[tenantId]),
         client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE mandatory AND status<>'completed' AND due_at<NOW())::int overdue FROM training_assignments WHERE tenant_id=$1`,[tenantId]),
         client.query(`SELECT COUNT(*)::int open,COUNT(*) FILTER(WHERE a.id IS NULL OR u.id IS NULL OR COALESCE(u.account_active,TRUE)=FALSE)::int invalid FROM asset_custody c LEFT JOIN managed_assets a ON a.id=c.asset_id AND a.tenant_id=c.tenant_id LEFT JOIN users u ON u.id=c.user_id AND u.tenant_id=c.tenant_id WHERE c.tenant_id=$1 AND c.status<>'returned'`,[tenantId]),
         client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE s.id IS NULL OR f.id IS NULL)::int invalid FROM handover_logs h LEFT JOIN sites s ON s.id=h.site_id AND s.tenant_id=h.tenant_id LEFT JOIN users f ON f.id=h.from_user_id AND f.tenant_id=h.tenant_id WHERE h.tenant_id=$1`,[tenantId]),

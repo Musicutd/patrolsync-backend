@@ -5825,6 +5825,41 @@ app.get('/api/workforce-readiness',requireAuth,requireAdmin,async(req,res)=>{
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
 });
 
+// ------------------------ STAGE 4.4: WORKFORCE COMPLIANCE READINESS ------------------------
+app.get('/api/compliance-readiness',requireAuth,requireAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=communicationTenant(req,req.query.tenant_id),checks=[];
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const add=(code,label,passed,message,critical=true,details={})=>checks.push({code,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+  try{
+    const required=['guard_certifications','site_guard_requirements','training_materials','training_assignments','site_training_requirements','communication_notifications'];
+    const structures=(await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name=ANY($1::text[])`,[required])).rows.map(x=>x.table_name);
+    add('structures','Stage 4 database structures',required.every(x=>structures.includes(x)),`${structures.length}/${required.length} required tables available`,true,{missing:required.filter(x=>!structures.includes(x))});
+    const rls=(await pool.query(`SELECT c.relname table_name,c.relrowsecurity enabled,EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname) protected FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY($1::text[])`,[required])).rows;
+    add('rls','Tenant RLS protection',rls.length===required.length&&rls.every(x=>x.enabled&&x.protected),`${rls.filter(x=>x.enabled&&x.protected).length}/${required.length} tables have RLS and a tenant policy`,true,{tables:rls});
+    const tenantRoleRaw=(()=>{try{return decodeURIComponent(new URL(tenantDatabaseUrl).username||'')}catch(_){return''}})();let grants=[];
+    if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(tenantRoleRaw))grants=(await pool.query(`SELECT t table_name,has_table_privilege($1,'public.'||t,'SELECT') can_read,has_table_privilege($1,'public.'||t,'INSERT') can_insert FROM unnest($2::text[]) t`,[tenantRoleRaw,required])).rows;
+    add('grants','Restricted tenant-role permissions',grants.length===required.length&&grants.every(x=>x.can_read&&x.can_insert),grants.length?`${grants.filter(x=>x.can_read&&x.can_insert).length}/${required.length} tables readable and writable through the restricted role`:'Restricted tenant role could not be identified',true,{tables:grants});
+    const data=await withTenant(tenantId,async client=>{const certificates=await buildCertificationCompliance(client,tenantId),competency=await buildCompetencyMatrix(client,tenantId);const [archive,alerts,requirements,trainingRules]=await Promise.all([
+      client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE archived_at IS NOT NULL)::int archived,COUNT(*) FILTER(WHERE replacement_for_id IS NOT NULL)::int renewals FROM guard_certifications WHERE tenant_id=$1`,[tenantId]),
+      client.query(`SELECT COUNT(*)::int active FROM communication_notifications WHERE tenant_id=$1 AND source_key LIKE 'cert-compliance:%' AND(expires_at IS NULL OR expires_at>NOW())`,[tenantId]),
+      client.query(`SELECT COUNT(*)::int total FROM site_guard_requirements WHERE tenant_id=$1 AND active=TRUE`,[tenantId]),
+      client.query(`SELECT COUNT(*)::int total FROM site_training_requirements WHERE tenant_id=$1 AND active=TRUE`,[tenantId])
+    ]);return{certificates,competency,archive:archive.rows[0],active_alerts:Number(alerts.rows[0].active),certificate_rules:Number(requirements.rows[0].total),training_rules:Number(trainingRules.rows[0].total)}});
+    add('certificate_register','Certificate lifecycle register',true,`${data.archive.total} record(s); ${data.archive.archived} archived; ${data.archive.renewals} renewal replacement(s)`,true,data.archive);
+    add('certificate_rules','Certificate requirement configuration',data.certificate_rules>0,`${data.certificate_rules} active site certificate requirement(s)`,false,{count:data.certificate_rules});
+    const certRisk=data.certificates.summary.missing+data.certificates.summary.expired;
+    add('certificate_coverage','Certificate compliance coverage',certRisk===0,`${data.certificates.summary.compliant}/${data.certificates.summary.total} compliant; ${data.certificates.summary.missing} missing; ${data.certificates.summary.expired} expired; ${data.certificates.summary.expiring_soon} expiring`,false,data.certificates.summary);
+    add('certificate_alerts','Automated certificate alerts',data.active_alerts===certRisk+data.certificates.summary.expiring_soon,`${data.active_alerts} active alert(s) for ${certRisk+data.certificates.summary.expiring_soon} current issue(s)`,false,{active_alerts:data.active_alerts,issues:certRisk+data.certificates.summary.expiring_soon});
+    add('competency_rules','Competency rule configuration',data.training_rules>0,`${data.training_rules} active site training rule(s)`,false,{count:data.training_rules});
+    const competencyRisk=data.competency.summary.missing+data.competency.summary.failed+data.competency.summary.overdue;
+    add('competency_coverage','Guard competency coverage',competencyRisk===0,`${data.competency.summary.compliant}/${data.competency.summary.total} compliant; ${data.competency.summary.missing} missing; ${data.competency.summary.failed} failed; ${data.competency.summary.overdue} overdue`,false,data.competency.summary);
+    const job=(await pool.query(`SELECT status,started_at,finished_at,error FROM platform_job_runs WHERE job_name='certification_compliance_sweep' ORDER BY started_at DESC LIMIT 1`)).rows[0]||null;
+    add('automation_job','Compliance automation health',Boolean(job&&job.status==='succeeded'),job?`Last certificate sweep ${job.status} at ${new Date(job.started_at).toISOString()}`:'Certificate sweep has not completed yet',false,job||{});
+    const failures=checks.filter(x=>x.critical&&!x.passed),warnings=checks.filter(x=>!x.critical&&!x.passed),status=failures.length?'action_required':warnings.length?'ready_with_warnings':'stage_4_ready';
+    res.json({status,ready:failures.length===0,generated_at:new Date(),duration_ms:Date.now()-started,summary:{passed:checks.filter(x=>x.passed).length,warnings:warnings.length,failures:failures.length,total:checks.length},activity:{certificate_requirements:data.certificate_rules,training_requirements:data.training_rules,certificate_issues:certRisk+data.certificates.summary.expiring_soon,competency_gaps:competencyRisk},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

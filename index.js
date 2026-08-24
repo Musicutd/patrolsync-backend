@@ -5579,6 +5579,43 @@ app.delete('/api/platform/subscribers/:id',requirePlatformAuth,async(req,res)=>{
   }catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message})}finally{client.release()}
 });
 
+// ------------------------ EXPANSION STAGE 2C: FIELD RELIABILITY GATE ------------------------
+app.get('/api/field-reliability/readiness',requireAuth,requireAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=Number(req.auth.tenant_id),checks=[];
+  const add=(code,label,passed,message,details={})=>checks.push({code,label,passed:Boolean(passed),status:passed?'pass':'fail',message,details});
+  try{
+    const columns=(await pool.query(`SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND ((table_name='checkpoints' AND column_name='nfc_tag_uid') OR (table_name='patrol_logs' AND column_name IN ('client_scan_id','scan_method','device_id','offline_captured','device_scanned_at')) OR (table_name='incidents' AND column_name IN ('client_incident_id','device_id','offline_captured','device_reported_at'))) ORDER BY table_name,column_name`)).rows;
+    const names=new Set(columns.map(x=>`${x.table_name}.${x.column_name}`));
+    const expected=['checkpoints.nfc_tag_uid','patrol_logs.client_scan_id','patrol_logs.scan_method','patrol_logs.device_id','patrol_logs.offline_captured','patrol_logs.device_scanned_at','incidents.client_incident_id','incidents.device_id','incidents.offline_captured','incidents.device_reported_at'];
+    add('capture_schema','Field capture database structures',expected.every(x=>names.has(x)),`${expected.filter(x=>names.has(x)).length}/${expected.length} required capture fields available`,{missing:expected.filter(x=>!names.has(x))});
+
+    const indexRows=(await pool.query(`SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname IN ('uq_checkpoints_tenant_nfc_tag','uq_patrol_logs_tenant_client_scan','uq_incidents_tenant_client_id')`)).rows;
+    add('idempotency_indexes','Database idempotency protection',indexRows.length===3,`${indexRows.length}/3 required unique indexes installed`,{indexes:indexRows.map(x=>x.indexname)});
+
+    const result=await withTenant(tenantId,async client=>{
+      const [scans,scanDuplicates,incidentDuplicates,offlineIncidents,photos,nfc,rls]=await Promise.all([
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE scan_method='qr')::int qr,COUNT(*) FILTER(WHERE scan_method='nfc')::int nfc,COUNT(*) FILTER(WHERE offline_captured)::int offline,COUNT(*) FILTER(WHERE scan_method NOT IN('qr','nfc') OR scan_method IS NULL)::int invalid FROM patrol_logs WHERE tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int count FROM(SELECT client_scan_id FROM patrol_logs WHERE tenant_id=$1 AND client_scan_id IS NOT NULL GROUP BY client_scan_id HAVING COUNT(*)>1)x`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int count FROM(SELECT client_incident_id FROM incidents WHERE tenant_id=$1 AND client_incident_id IS NOT NULL GROUP BY client_incident_id HAVING COUNT(*)>1)x`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE device_reported_at IS NOT NULL AND device_id IS NOT NULL AND client_incident_id IS NOT NULL)::int traceable FROM incidents WHERE tenant_id=$1 AND offline_captured`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE (storage_key IS NOT NULL OR photo_data IS NOT NULL) AND checksum_sha256 IS NOT NULL)::int verifiable FROM incident_photos WHERE tenant_id=$1`,[tenantId]),
+        client.query(`SELECT COUNT(*)::int registered FROM checkpoints WHERE tenant_id=$1 AND nfc_tag_uid IS NOT NULL`,[tenantId]),
+        pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE c.relrowsecurity)::int enabled,COUNT(*) FILTER(WHERE EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname))::int protected FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped WHERE n.nspname='public' AND c.relname IN('checkpoints','patrol_logs','incidents','incident_photos')`)
+      ]);
+      return{scans:scans.rows[0],scan_duplicates:Number(scanDuplicates.rows[0].count),incident_duplicates:Number(incidentDuplicates.rows[0].count),offline_incidents:offlineIncidents.rows[0],photos:photos.rows[0],nfc_registered:Number(nfc.rows[0].registered),rls:rls.rows[0]};
+    });
+    add('scan_methods','QR and NFC evidence parity',Number(result.scans.invalid)===0,`${result.scans.qr} QR scan(s), ${result.scans.nfc} NFC scan(s), ${result.scans.offline} originally captured offline`,result.scans);
+    add('scan_idempotency','Patrol scan retry safety',result.scan_duplicates===0,result.scan_duplicates===0?'No duplicate client scan identities':'Duplicate patrol scan identities require correction',{duplicates:result.scan_duplicates});
+    add('incident_idempotency','Incident retry safety',result.incident_duplicates===0,result.incident_duplicates===0?'No duplicate client incident identities':'Duplicate incident identities require correction',{duplicates:result.incident_duplicates});
+    add('offline_provenance','Offline incident provenance',Number(result.offline_incidents.total)===Number(result.offline_incidents.traceable),`${result.offline_incidents.traceable}/${result.offline_incidents.total} offline incident(s) retain client ID, device and capture time`,result.offline_incidents);
+    add('photo_evidence','Incident photo recoverability',Number(result.photos.total)===Number(result.photos.verifiable),`${result.photos.verifiable}/${result.photos.total} photo(s) have recoverable bytes and a server checksum`,result.photos);
+    add('tenant_protection','Field evidence tenant protection',Number(result.rls.total)===4&&Number(result.rls.enabled)===4&&Number(result.rls.protected)===4,`${result.rls.protected}/4 tenant policies; ${result.rls.enabled}/4 tables with RLS`,result.rls);
+    add('nfc_registration','NFC checkpoint availability',true,`${result.nfc_registered} checkpoint NFC tag(s) registered; QR remains the universal fallback`,{registered:result.nfc_registered,optional:true});
+    const failures=checks.filter(x=>!x.passed),ready=failures.length===0;
+    res.json({ready,status:ready?'stage_2_ready':'action_required',generated_at:new Date(),duration_ms:Date.now()-started,summary:{passed:checks.filter(x=>x.passed).length,failures:failures.length,total:checks.length},activity:{patrol_scans:result.scans,offline_incidents:result.offline_incidents,incident_photos:result.photos,nfc_registered:result.nfc_registered},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

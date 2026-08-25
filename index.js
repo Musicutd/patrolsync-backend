@@ -6012,6 +6012,68 @@ app.get('/api/assurance-readiness',requireAuth,requireAdmin,async(req,res)=>{
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
 });
 
+// ------------------------ STAGE 6.1: PREDICTIVE ASSURANCE ------------------------
+async function ensurePredictiveAssuranceSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS assurance_risk_forecasts(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,contract_id BIGINT,
+    horizon_days INTEGER NOT NULL DEFAULT 14,risk_score NUMERIC(5,2) NOT NULL,
+    breach_probability NUMERIC(5,2) NOT NULL,risk_band TEXT NOT NULL,
+    current_proofscore NUMERIC(5,2),proofscore_change NUMERIC(6,2),
+    signals JSONB NOT NULL DEFAULT '{}'::jsonb,reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recommended_actions JSONB NOT NULL DEFAULT '[]'::jsonb,model_version TEXT NOT NULL DEFAULT 'ps-risk-v1',
+    calculated_by_user_id INTEGER,calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT assurance_risk_band CHECK(risk_band IN('low','medium','high','critical')),
+    CONSTRAINT assurance_risk_score CHECK(risk_score BETWEEN 0 AND 100),
+    CONSTRAINT assurance_breach_probability CHECK(breach_probability BETWEEN 0 AND 100))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS assurance_risk_forecasts_tenant_site_time ON assurance_risk_forecasts(tenant_id,site_id,calculated_at DESC)`);
+  await pool.query(`ALTER TABLE assurance_risk_forecasts ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON assurance_risk_forecasts`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON assurance_risk_forecasts USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON assurance_risk_forecasts TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE assurance_risk_forecasts_id_seq TO "${role}"`)}}catch(err){console.warn('Predictive assurance tenant-role grant skipped:',err.message)}
+  console.log('Predictive assurance schema ready');
+}
+ensurePredictiveAssuranceSchema().catch(err=>console.error('Predictive assurance schema setup failed:',err.message));
+
+function clampRisk(value){return Math.max(0,Math.min(100,Math.round(Number(value||0)*100)/100))}
+function riskBand(score){return score>=75?'critical':score>=50?'high':score>=25?'medium':'low'}
+async function buildPredictiveAssurance(client,tenantId,horizonDays,siteId){
+  const params=[tenantId];let filter='';if(siteId){params.push(Number(siteId));filter=` AND s.id=$${params.length}`}
+  const sites=(await client.query(`SELECT s.id site_id,s.name site_name,sc.id contract_id,sc.reference_code,
+    sc.sla_patrol_completion_pct,sc.sla_incident_ack_minutes,sc.sla_shift_coverage_pct
+    FROM sites s JOIN LATERAL(SELECT c.* FROM service_contracts c WHERE c.tenant_id=s.tenant_id AND c.site_id=s.id AND c.status='active' AND c.start_date<=CURRENT_DATE AND(c.end_date IS NULL OR c.end_date>=CURRENT_DATE) ORDER BY c.id DESC LIMIT 1)sc ON TRUE
+    WHERE s.tenant_id=$1${filter} ORDER BY s.name`,params)).rows;
+  const forecasts=[];
+  for(const site of sites){
+    const snapshots=(await client.query(`SELECT score,grade,components,calculated_at FROM proofscore_snapshots WHERE tenant_id=$1 AND site_id=$2 ORDER BY calculated_at DESC LIMIT 2`,[tenantId,site.site_id])).rows;
+    const latest=snapshots[0]||null,previous=snapshots[1]||null,current=latest?.score==null?null:Number(latest.score),change=current!==null&&previous?.score!=null?Math.round((current-Number(previous.score))*100)/100:null;
+    const signal=(await client.query(`SELECT
+      (SELECT COUNT(*)::int FROM shifts sh WHERE sh.tenant_id=$1 AND sh.site_id=$2 AND sh.shift_date BETWEEN CURRENT_DATE AND CURRENT_DATE+$3::int) future_shifts,
+      (SELECT COUNT(*)::int FROM shifts sh WHERE sh.tenant_id=$1 AND sh.site_id=$2 AND sh.shift_date BETWEEN CURRENT_DATE AND CURRENT_DATE+$3::int AND sh.assignment_status='assigned' AND sh.user_id IS NOT NULL) covered_shifts,
+      (SELECT COUNT(*)::int FROM patrol_runs p WHERE p.tenant_id=$1 AND p.site_id=$2 AND p.status NOT IN('completed','cancelled') AND p.scheduled_end<NOW()) overdue_patrols,
+      (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=$1 AND i.site_id=$2 AND i.acknowledged_at IS NULL) unacknowledged_incidents,
+      (SELECT COUNT(*)::int FROM assurance_improvement_actions a WHERE a.tenant_id=$1 AND a.site_id=$2 AND a.status NOT IN('completed','cancelled') AND a.due_date<CURRENT_DATE) overdue_actions,
+      (SELECT COUNT(*)::int FROM assurance_improvement_actions a WHERE a.tenant_id=$1 AND a.site_id=$2 AND a.status IN('open','in_progress','blocked')) open_actions`,[tenantId,site.site_id,horizonDays])).rows[0];
+    const future=Number(signal.future_shifts),covered=Number(signal.covered_shifts),coverage=future?covered/future*100:100;
+    let risk=current===null?35:Math.max(0,100-current)*0.55;
+    const reasons=[],actions=[];
+    if(current===null){reasons.push('No published ProofScore baseline is available.');actions.push('Publish a current ProofScore snapshot.')}else if(current<80){reasons.push(`Current ProofScore is ${current.toFixed(2)}%, below the 80% assurance target.`);actions.push('Review the lowest ProofScore components and assign corrective actions.')}
+    if(change!==null&&change<0){risk+=Math.min(20,Math.abs(change)*1.5);reasons.push(`ProofScore declined ${Math.abs(change).toFixed(2)} point(s) from the previous published result.`);actions.push('Review the ProofScore trend and address the deteriorating components.')}
+    if(coverage<Number(site.sla_shift_coverage_pct)){risk+=Math.min(25,(Number(site.sla_shift_coverage_pct)-coverage)*1.25);reasons.push(`${covered}/${future} upcoming shifts are covered (${coverage.toFixed(2)}%; target ${Number(site.sla_shift_coverage_pct)}%).`);actions.push('Assign qualified guards to uncovered upcoming shifts.')}
+    if(Number(signal.overdue_patrols)>0){risk+=Math.min(20,Number(signal.overdue_patrols)*5);reasons.push(`${signal.overdue_patrols} patrol run(s) are overdue.`);actions.push('Resolve overdue patrol runs and confirm route coverage.')}
+    if(Number(signal.unacknowledged_incidents)>0){risk+=Math.min(20,Number(signal.unacknowledged_incidents)*3);reasons.push(`${signal.unacknowledged_incidents} incident(s) remain unacknowledged.`);actions.push('Acknowledge and triage outstanding incidents.')}
+    if(Number(signal.overdue_actions)>0){risk+=Math.min(12,Number(signal.overdue_actions)*4);reasons.push(`${signal.overdue_actions} assurance improvement action(s) are overdue.`);actions.push('Update or complete overdue assurance actions.')}
+    const weak=(Array.isArray(latest?.components)?latest.components:[]).filter(x=>x.applicable&&Number(x.score)<80);
+    for(const component of weak){risk+=Math.min(8,(80-Number(component.score))*Number(component.weight||0)/100);reasons.push(`${component.label} is ${Number(component.score).toFixed(2)}%.`)}
+    const score=clampRisk(risk),probability=clampRisk(8+score*.88),band=riskBand(score);
+    forecasts.push({site_id:Number(site.site_id),site_name:site.site_name,contract_id:Number(site.contract_id),reference_code:site.reference_code,horizon_days:horizonDays,risk_score:score,breach_probability:probability,risk_band:band,current_proofscore:current,proofscore_change:change,signals:{future_shifts:future,covered_shifts:covered,coverage_pct:Math.round(coverage*100)/100,overdue_patrols:Number(signal.overdue_patrols),unacknowledged_incidents:Number(signal.unacknowledged_incidents),overdue_actions:Number(signal.overdue_actions),open_actions:Number(signal.open_actions),weak_components:weak.map(x=>({key:x.key,label:x.label,score:Number(x.score),weight:Number(x.weight)}))},reasons:[...new Set(reasons)],recommended_actions:[...new Set(actions)],model_version:'ps-risk-v1'});
+  }
+  return{generated_at:new Date().toISOString(),horizon_days:horizonDays,model:{version:'ps-risk-v1',type:'explainable weighted operational risk',automated_decisions:false},summary:{sites:forecasts.length,critical:forecasts.filter(x=>x.risk_band==='critical').length,high:forecasts.filter(x=>x.risk_band==='high').length,medium:forecasts.filter(x=>x.risk_band==='medium').length,low:forecasts.filter(x=>x.risk_band==='low').length},forecasts};
+}
+
+app.get('/api/predictive-assurance',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id),horizon=Math.max(7,Math.min(60,Number(req.query.horizon_days||14)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await withTenant(tenantId,c=>buildPredictiveAssurance(c,tenantId,horizon,req.query.site_id||null)))}catch(err){res.status(500).json({error:err.message})}});
+app.post('/api/predictive-assurance/run',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),horizon=Math.max(7,Math.min(60,Number(req.body.horizon_days||14)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const report=await withTenant(tenantId,async c=>{const data=await buildPredictiveAssurance(c,tenantId,horizon,req.body.site_id||null);for(const f of data.forecasts)await c.query(`INSERT INTO assurance_risk_forecasts(tenant_id,site_id,contract_id,horizon_days,risk_score,breach_probability,risk_band,current_proofscore,proofscore_change,signals,reasons,recommended_actions,model_version,calculated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,[tenantId,f.site_id,f.contract_id,horizon,f.risk_score,f.breach_probability,f.risk_band,f.current_proofscore,f.proofscore_change,JSON.stringify(f.signals),JSON.stringify(f.reasons),JSON.stringify(f.recommended_actions),f.model_version,req.auth.user_id]);return data});res.status(201).json({...report,saved:true})}catch(err){res.status(500).json({error:err.message})}});
+app.get('/api/predictive-assurance/history',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,c=>{const p=[tenantId];let q=`SELECT f.*,s.name site_name,sc.reference_code,u.email calculated_by_email FROM assurance_risk_forecasts f JOIN sites s ON s.id=f.site_id AND s.tenant_id=f.tenant_id LEFT JOIN service_contracts sc ON sc.id=f.contract_id AND sc.tenant_id=f.tenant_id LEFT JOIN users u ON u.id=f.calculated_by_user_id AND u.tenant_id=f.tenant_id WHERE f.tenant_id=$1`;if(req.query.site_id){p.push(Number(req.query.site_id));q+=` AND f.site_id=$${p.length}`}q+=' ORDER BY f.calculated_at DESC LIMIT 250';return c.query(q,p)});res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

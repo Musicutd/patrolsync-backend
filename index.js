@@ -5918,11 +5918,28 @@ app.get('/api/proofscore',requireAuth,requireAdmin,async(req,res)=>{const tenant
 app.post('/api/proofscore/snapshots',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),from=String(req.body.from_date||''),to=String(req.body.to_date||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!DateTime.fromISO(from).isValid||!DateTime.fromISO(to).isValid||from>to)return res.status(400).json({error:'Valid date range required'});try{const report=await withTenant(tenantId,async c=>{const data=await buildProofScore(c,tenantId,from,to,req.body.site_id||null);for(const site of data.sites)await c.query(`INSERT INTO proofscore_snapshots(tenant_id,site_id,period_start,period_end,score,grade,components,recommendations,calculated_by_user_id,calculated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) ON CONFLICT(tenant_id,site_id,period_start,period_end) DO UPDATE SET score=EXCLUDED.score,grade=EXCLUDED.grade,components=EXCLUDED.components,recommendations=EXCLUDED.recommendations,calculated_by_user_id=EXCLUDED.calculated_by_user_id,calculated_at=NOW()`,[tenantId,site.site_id,from,to,site.score,site.grade,JSON.stringify(site.components),JSON.stringify(site.recommendations),req.auth.user_id]);return data});res.status(201).json({...report,saved:true})}catch(err){res.status(500).json({error:err.message})}});
 app.get('/api/proofscore/history',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,c=>{const p=[tenantId];let q=`SELECT p.*,s.name site_name,u.email calculated_by_email FROM proofscore_snapshots p JOIN sites s ON s.id=p.site_id LEFT JOIN users u ON u.id=p.calculated_by_user_id AND u.tenant_id=p.tenant_id WHERE p.tenant_id=$1`;if(req.query.site_id){p.push(Number(req.query.site_id));q+=` AND p.site_id=$${p.length}`}q+=' ORDER BY p.calculated_at DESC LIMIT 250';return c.query(q,p)});res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}});
 
+function proofScoreDateOnly(value){
+  if(!value)return null;
+  if(value instanceof Date){
+    const parsed=DateTime.fromJSDate(value);
+    return parsed.isValid?parsed.toISODate():null;
+  }
+  const text=String(value).trim();
+  if(/^\d{4}-\d{2}-\d{2}$/.test(text))return text;
+  const iso=DateTime.fromISO(text);
+  if(iso.isValid)return iso.toISODate();
+  const http=DateTime.fromHTTP(text);
+  return http.isValid?http.toISODate():null;
+}
+
 async function clientProofScoreData(client,tenantId,siteId){
   const history=(await client.query(`SELECT p.id,p.period_start,p.period_end,p.score,p.grade,p.components,p.recommendations,p.calculated_at,s.name site_name
     FROM proofscore_snapshots p JOIN sites s ON s.id=p.site_id AND s.tenant_id=p.tenant_id
     WHERE p.tenant_id=$1 AND p.site_id=$2 ORDER BY p.calculated_at DESC LIMIT 24`,[tenantId,siteId])).rows;
-  const latest=history[0]||null,from=latest?String(latest.period_start).slice(0,10):DateTime.now().minus({days:29}).toISODate(),to=latest?String(latest.period_end).slice(0,10):DateTime.now().toISODate();
+  const latest=history[0]||null,
+    from=latest?proofScoreDateOnly(latest.period_start):DateTime.now().minus({days:29}).toISODate(),
+    to=latest?proofScoreDateOnly(latest.period_end):DateTime.now().toISODate();
+  if(!from||!to)throw new Error('Published ProofScore contains an invalid measurement period');
   const evidence=(await client.query(`SELECT
     (SELECT COUNT(*)::int FROM patrol_logs p JOIN checkpoints c ON c.id=p.checkpoint_id WHERE p.tenant_id=$1 AND c.site_id=$2 AND p.scanned_at::date BETWEEN $3::date AND $4::date) patrol_total,
     (SELECT COUNT(*)::int FROM patrol_logs p JOIN checkpoints c ON c.id=p.checkpoint_id JOIN evidence_integrity_records e ON e.tenant_id=p.tenant_id AND e.evidence_type='patrol_scan' AND e.evidence_id=p.id::text WHERE p.tenant_id=$1 AND c.site_id=$2 AND p.scanned_at::date BETWEEN $3::date AND $4::date) patrol_sealed,

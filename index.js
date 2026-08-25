@@ -3993,6 +3993,57 @@ app.delete('/api/incidents/:id/photos', requireAuth, requireAdmin, async (req, r
   }
 });
 
+// ------------------------ STAGE 7.1: INCIDENT RECONSTRUCTION ------------------------
+
+app.get('/api/incident-reconstruction/:id', requireAuth, requireAdmin, async (req, res) => {
+  const tenantId = attendanceTenant(req, req.query.tenant_id);
+  const incidentId = Number(req.params.id);
+  if (!tenantId) return res.status(403).json({ error: 'Tenant access denied' });
+  if (!Number.isInteger(incidentId) || incidentId < 1) return res.status(400).json({ error: 'Invalid incident ID' });
+  try {
+    const payload = await withTenant(tenantId, async client => {
+      const incidentResult = await client.query(`
+        SELECT i.*,s.name site_name,c.name checkpoint_name,reporter.email reporter_email,assignee.email assigned_email
+        FROM incidents i JOIN sites s ON s.id=i.site_id
+        LEFT JOIN checkpoints c ON c.id=i.checkpoint_id
+        LEFT JOIN users reporter ON reporter.id=i.user_id
+        LEFT JOIN users assignee ON assignee.id=i.assigned_to
+        WHERE i.id=$1 AND i.tenant_id=$2`, [incidentId, tenantId]);
+      if (!incidentResult.rowCount) throw Object.assign(new Error('Incident not found'), { statusCode: 404 });
+      const incident = incidentResult.rows[0];
+      const start = new Date(new Date(incident.reported_at).getTime() - 2 * 60 * 60 * 1000);
+      const endBase = incident.resolved_at || incident.updated_at || incident.reported_at;
+      const end = new Date(new Date(endBase).getTime() + 2 * 60 * 60 * 1000);
+      const [activities, photos, patrols, sos, dispatches, locations, audits] = await Promise.all([
+        client.query(`SELECT ia.id,ia.activity_type,ia.note,ia.created_at,u.email actor_email FROM incident_activities ia LEFT JOIN users u ON u.id=ia.user_id WHERE ia.tenant_id=$1 AND ia.incident_id=$2 ORDER BY ia.created_at`, [tenantId, incidentId]),
+        client.query(`SELECT id,storage_provider,content_type,size_bytes,checksum_sha256,created_at FROM incident_photos WHERE tenant_id=$1 AND incident_id=$2 ORDER BY created_at`, [tenantId, incidentId]),
+        client.query(`SELECT pl.id,pl.scanned_at,pl.latitude,pl.longitude,pl.location_status,pl.scan_method,pl.offline_captured,c.name checkpoint_name,u.email actor_email FROM patrol_logs pl JOIN checkpoints c ON c.id=pl.checkpoint_id LEFT JOIN users u ON u.id=pl.user_id WHERE pl.tenant_id=$1 AND c.site_id=$2 AND pl.scanned_at BETWEEN $3 AND $4 ORDER BY pl.scanned_at LIMIT 250`, [tenantId, incident.site_id, start, end]),
+        client.query(`SELECT sa.id,sa.message,sa.status,sa.latitude,sa.longitude,sa.created_at,sa.resolved_at,u.email actor_email FROM sos_alerts sa LEFT JOIN users u ON u.id=sa.user_id WHERE sa.tenant_id=$1 AND sa.site_id=$2 AND sa.created_at BETWEEN $3 AND $4 ORDER BY sa.created_at LIMIT 100`, [tenantId, incident.site_id, start, end]),
+        client.query(`SELECT d.id,d.reference_code,d.title,d.priority,d.status,d.assigned_at,d.accepted_at,d.en_route_at,d.on_site_at,d.completed_at,d.completion_note,u.email guard_email FROM dispatch_jobs d LEFT JOIN users u ON u.id=d.assigned_guard_id WHERE d.tenant_id=$1 AND d.site_id=$2 AND d.created_at BETWEEN $3 AND $4 ORDER BY d.created_at LIMIT 100`, [tenantId, incident.site_id, start, end]),
+        client.query(`SELECT gl.id,gl.user_id,gl.latitude,gl.longitude,gl.recorded_at,u.email actor_email FROM guard_location_history gl LEFT JOIN users u ON u.id=gl.user_id WHERE gl.tenant_id=$1 AND gl.site_id=$2 AND gl.recorded_at BETWEEN $3 AND $4 ORDER BY gl.recorded_at LIMIT 250`, [tenantId, incident.site_id, start, end]),
+        client.query(`SELECT id,action,resource,entity_id,details,user_email,created_at FROM audit_logs WHERE tenant_id=$1 AND created_at BETWEEN $2 AND $3 AND (entity_id=$4 OR details->>'incident_id'=$4 OR resource ILIKE '%incident%') ORDER BY created_at LIMIT 100`, [tenantId, start, end, String(incidentId)])
+      ]);
+      const timeline = [];
+      const add = (at, type, title, detail, actor, sourceId, coordinates) => timeline.push({ at, type, title, detail: detail || '', actor: actor || 'System', source_id: sourceId, coordinates: coordinates || null });
+      add(incident.reported_at, 'incident', 'Incident reported', incident.description, incident.reporter_email, incident.id);
+      if (incident.acknowledged_at) add(incident.acknowledged_at, 'incident', 'Incident acknowledged', '', incident.assigned_email, incident.id);
+      if (incident.resolved_at) add(incident.resolved_at, 'incident', 'Incident resolved', incident.resolution, incident.assigned_email, incident.id);
+      activities.rows.forEach(x => add(x.created_at, 'activity', String(x.activity_type || 'activity').replaceAll('_', ' '), x.note, x.actor_email, x.id));
+      photos.rows.forEach(x => add(x.created_at, 'photo', 'Incident photo captured', `${x.storage_provider || 'database'} · ${x.content_type || 'unknown type'} · ${x.size_bytes || 0} bytes · checksum ${x.checksum_sha256 || 'unavailable'}`, null, x.id));
+      patrols.rows.forEach(x => add(x.scanned_at, 'patrol', `Checkpoint scanned: ${x.checkpoint_name}`, `${x.scan_method || 'QR'} · location ${x.location_status || 'unavailable'}${x.offline_captured ? ' · captured offline' : ''}`, x.actor_email, x.id, x.latitude == null ? null : { latitude: x.latitude, longitude: x.longitude }));
+      sos.rows.forEach(x => { add(x.created_at, 'sos', 'SOS alert raised', x.message || x.status, x.actor_email, x.id, x.latitude == null ? null : { latitude: x.latitude, longitude: x.longitude }); if (x.resolved_at) add(x.resolved_at, 'sos', 'SOS alert resolved', '', x.actor_email, x.id); });
+      dispatches.rows.forEach(x => { [['assigned_at','Dispatch assigned'],['accepted_at','Dispatch accepted'],['en_route_at','Guard en route'],['on_site_at','Guard on site'],['completed_at','Dispatch completed']].forEach(([field,title]) => { if (x[field]) add(x[field], 'dispatch', `${title}: ${x.reference_code}`, x[field === 'completed_at' ? 'completion_note' : 'title'] || x.title, x.guard_email, x.id); }); });
+      locations.rows.forEach(x => add(x.recorded_at, 'location', 'Guard location recorded', `${Number(x.latitude).toFixed(5)}, ${Number(x.longitude).toFixed(5)}`, x.actor_email, x.id, { latitude: x.latitude, longitude: x.longitude }));
+      audits.rows.forEach(x => add(x.created_at, 'audit', `${x.action} ${x.resource}`, JSON.stringify(x.details || {}), x.user_email, x.id));
+      timeline.sort((a, b) => new Date(a.at) - new Date(b.at));
+      return { incident, window: { from: start, to: end }, counts: { activities: activities.rowCount, photos: photos.rowCount, patrol_scans: patrols.rowCount, sos_alerts: sos.rowCount, dispatches: dispatches.rowCount, locations: locations.rowCount, audit_events: audits.rowCount }, timeline };
+    });
+    res.json(payload);
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message });
+  }
+});
+
 // ------------------------ ATTENDANCE / TIME CLOCK ------------------------
 
 function attendanceTenant(req, requestedTenant) {

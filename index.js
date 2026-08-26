@@ -6292,6 +6292,60 @@ app.get('/api/reconstruction-crisis-readiness',requireAuth,requireAdmin,async(re
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId})}
 });
 
+// ------------------------ STAGE 8.1: CLIENT RETENTION RADAR ------------------------
+async function ensureClientRetentionRadarSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS client_retention_snapshots(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,
+    contract_id BIGINT NOT NULL REFERENCES service_contracts(id) ON DELETE CASCADE,
+    horizon_days INTEGER NOT NULL,risk_score NUMERIC(5,2) NOT NULL,risk_band TEXT NOT NULL,
+    signals JSONB NOT NULL DEFAULT '{}'::jsonb,reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    recommended_actions JSONB NOT NULL DEFAULT '[]'::jsonb,model_version TEXT NOT NULL DEFAULT 'PS Retention v1',
+    calculated_by_user_id INTEGER,calculated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT client_retention_score CHECK(risk_score BETWEEN 0 AND 100),
+    CONSTRAINT client_retention_band CHECK(risk_band IN('low','medium','high','critical')))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS client_retention_snapshots_tenant_contract_time ON client_retention_snapshots(tenant_id,contract_id,calculated_at DESC)`);
+  await pool.query(`ALTER TABLE client_retention_snapshots ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON client_retention_snapshots`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON client_retention_snapshots USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON client_retention_snapshots TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE client_retention_snapshots_id_seq TO "${role}"`)}}catch(err){console.warn('Retention Radar tenant-role grant skipped:',err.message)}
+  console.log('Client Retention Radar schema ready');
+}
+ensureClientRetentionRadarSchema().catch(err=>console.error('Client Retention Radar schema setup failed:',err.message));
+
+async function buildClientRetentionRadar(client,tenantId,horizonDays=90,siteId=null){
+  const params=[tenantId];let siteClause='';if(siteId){params.push(Number(siteId));siteClause=` AND sc.site_id=$${params.length}`}
+  params.push(horizonDays);const horizonParam=params.length;
+  const rows=(await client.query(`SELECT sc.id contract_id,sc.site_id,sc.reference_code,sc.client_name,sc.end_date,sc.rate,sc.currency,s.name site_name,
+    GREATEST(0,(sc.end_date-CURRENT_DATE))::int days_to_expiry,cr.status renewal_status,cr.next_follow_up_date,cr.last_contact_at,
+    (SELECT p.score FROM proofscore_snapshots p WHERE p.tenant_id=sc.tenant_id AND p.site_id=sc.site_id ORDER BY p.calculated_at DESC LIMIT 1) proofscore,
+    (SELECT COUNT(*)::int FROM service_tickets st WHERE st.tenant_id=sc.tenant_id AND st.site_id=sc.site_id AND st.status NOT IN('resolved','closed')) open_tickets,
+    (SELECT COUNT(*)::int FROM service_tickets st WHERE st.tenant_id=sc.tenant_id AND st.site_id=sc.site_id AND st.priority IN('high','urgent') AND st.status NOT IN('resolved','closed')) urgent_tickets,
+    (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=sc.tenant_id AND i.site_id=sc.site_id AND i.status NOT IN('resolved','closed')) open_incidents,
+    (SELECT COUNT(*)::int FROM assurance_improvement_actions a WHERE a.tenant_id=sc.tenant_id AND a.site_id=sc.site_id AND a.status NOT IN('completed','cancelled')) open_actions,
+    (SELECT COUNT(*)::int FROM assurance_improvement_actions a WHERE a.tenant_id=sc.tenant_id AND a.site_id=sc.site_id AND a.status NOT IN('completed','cancelled') AND a.due_date<CURRENT_DATE) overdue_actions,
+    (SELECT COUNT(*)::int FROM client_users cu WHERE cu.tenant_id=sc.tenant_id AND cu.site_id=sc.site_id) client_accounts
+    FROM service_contracts sc JOIN sites s ON s.id=sc.site_id AND s.tenant_id=sc.tenant_id LEFT JOIN contract_renewals cr ON cr.contract_id=sc.id AND cr.tenant_id=sc.tenant_id
+    WHERE sc.tenant_id=$1 AND sc.status='active' AND(sc.end_date IS NULL OR sc.end_date<=CURRENT_DATE+$${horizonParam}::int)${siteClause} ORDER BY sc.end_date NULLS LAST,s.name`,params)).rows;
+  const contracts=rows.map(row=>{
+    const score=Number(row.proofscore),hasScore=row.proofscore!==null;let risk=0,reasons=[],actions=[];
+    const days=row.end_date?Number(row.days_to_expiry):null,renewal=String(row.renewal_status||'not_started');
+    if(days!==null){if(days<=30){risk+=30;reasons.push(`Contract expires in ${days} day(s).`)}else if(days<=60){risk+=20;reasons.push(`Contract expires in ${days} days.`)}else if(days<=90){risk+=10;reasons.push(`Contract enters its renewal window in ${days} days.`)}}
+    if(!hasScore){risk+=15;reasons.push('No published ProofScore baseline is available.')}else if(score<60){risk+=30;reasons.push(`ProofScore is ${score.toFixed(2)}%, indicating material assurance weakness.`)}else if(score<80){risk+=20;reasons.push(`ProofScore is ${score.toFixed(2)}%, below the 80% assurance target.`)}
+    const openTickets=Number(row.open_tickets||0),urgent=Number(row.urgent_tickets||0),incidents=Number(row.open_incidents||0),overdue=Number(row.overdue_actions||0);
+    risk+=Math.min(15,openTickets*3)+Math.min(15,urgent*7)+Math.min(10,incidents*2)+Math.min(15,overdue*5);
+    if(openTickets)reasons.push(`${openTickets} client service request(s) remain open.`);if(urgent)reasons.push(`${urgent} high or urgent client request(s) require attention.`);if(incidents)reasons.push(`${incidents} incident(s) remain unresolved.`);if(overdue)reasons.push(`${overdue} assurance action(s) are overdue.`);
+    if(renewal==='not_started'&&days!==null&&days<=90){risk+=10;reasons.push('The renewal workflow has not started.')}if(renewal==='negotiating')risk=Math.max(0,risk-5);
+    risk=Math.max(0,Math.min(100,Math.round(risk*100)/100));const band=risk>=75?'critical':risk>=50?'high':risk>=25?'medium':'low';
+    if(days!==null&&days<=90)actions.push('Assign a renewal owner and confirm the next client contact.');if(!hasScore||score<80)actions.push('Review ProofScore weaknesses and publish client-visible improvement progress.');if(openTickets||urgent)actions.push('Resolve or formally update outstanding client service requests.');if(incidents)actions.push('Close unresolved incident actions with documented evidence.');if(overdue)actions.push('Escalate overdue assurance actions and agree revised deadlines.');if(!actions.length)actions.push('Maintain normal client review cadence and monitor trend movement.');
+    return{contract_id:Number(row.contract_id),site_id:Number(row.site_id),reference_code:row.reference_code,client_name:row.client_name,site_name:row.site_name,end_date:row.end_date,days_to_expiry:days,renewal_status:renewal,risk_score:risk,risk_band:band,signals:{proofscore:hasScore?score:null,open_tickets:openTickets,urgent_tickets:urgent,open_incidents:incidents,open_actions:Number(row.open_actions||0),overdue_actions:overdue,client_accounts:Number(row.client_accounts||0),next_follow_up_date:row.next_follow_up_date,last_contact_at:row.last_contact_at},reasons,recommended_actions:actions,model_version:'PS Retention v1'};
+  });
+  return{generated_at:new Date().toISOString(),horizon_days:horizonDays,summary:{contracts:contracts.length,critical:contracts.filter(x=>x.risk_band==='critical').length,high:contracts.filter(x=>x.risk_band==='high').length,renewals_due:contracts.filter(x=>x.days_to_expiry!==null&&x.days_to_expiry<=90).length},contracts};
+}
+
+app.get('/api/client-retention-radar',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id),horizon=Math.max(30,Math.min(365,Number(req.query.horizon_days||90)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json(await withTenant(tenantId,c=>buildClientRetentionRadar(c,tenantId,horizon,req.query.site_id||null)))}catch(err){res.status(500).json({error:err.message})}});
+app.post('/api/client-retention-radar/run',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),horizon=Math.max(30,Math.min(365,Number(req.body.horizon_days||90)));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const report=await withTenant(tenantId,async c=>{const data=await buildClientRetentionRadar(c,tenantId,horizon,req.body.site_id||null);for(const x of data.contracts)await c.query(`INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,horizon_days,risk_score,risk_band,signals,reasons,recommended_actions,model_version,calculated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,[tenantId,x.site_id,x.contract_id,horizon,x.risk_score,x.risk_band,JSON.stringify(x.signals),JSON.stringify(x.reasons),JSON.stringify(x.recommended_actions),x.model_version,req.auth.user_id]);return data});res.status(201).json({...report,saved:true})}catch(err){res.status(500).json({error:err.message})}});
+app.get('/api/client-retention-radar/history',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,c=>{const p=[tenantId];let q=`SELECT r.*,s.name site_name,sc.reference_code,sc.client_name,u.email calculated_by_email FROM client_retention_snapshots r JOIN sites s ON s.id=r.site_id AND s.tenant_id=r.tenant_id JOIN service_contracts sc ON sc.id=r.contract_id AND sc.tenant_id=r.tenant_id LEFT JOIN users u ON u.id=r.calculated_by_user_id AND u.tenant_id=r.tenant_id WHERE r.tenant_id=$1`;if(req.query.site_id){p.push(Number(req.query.site_id));q+=` AND r.site_id=$${p.length}`}q+=` ORDER BY r.calculated_at DESC LIMIT 250`;return c.query(q,p)});res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

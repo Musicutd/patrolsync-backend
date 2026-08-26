@@ -6428,6 +6428,49 @@ app.get('/api/client-intelligence-readiness',requireAuth,requireAdmin,async(req,
   }catch(err){res.status(500).json({error:err.message})}
 });
 
+// ------------------------ STAGE 9.1: SITE RISK DIGITAL TWIN ------------------------
+async function ensureSiteRiskTwinSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS site_risk_twins(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,site_id INTEGER NOT NULL,
+    profile_name TEXT NOT NULL DEFAULT 'Operational risk model',site_type TEXT NOT NULL DEFAULT 'commercial',
+    occupancy_band TEXT NOT NULL DEFAULT 'medium',public_access BOOLEAN NOT NULL DEFAULT FALSE,
+    overnight_operation BOOLEAN NOT NULL DEFAULT FALSE,lone_work_expected BOOLEAN NOT NULL DEFAULT FALSE,
+    critical_zones JSONB NOT NULL DEFAULT '[]'::jsonb,hazard_factors JSONB NOT NULL DEFAULT '[]'::jsonb,
+    control_notes TEXT,model_version INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'active',
+    updated_by_user_id INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tenant_id,site_id),CONSTRAINT site_risk_twin_occupancy CHECK(occupancy_band IN('low','medium','high')),
+    CONSTRAINT site_risk_twin_status CHECK(status IN('active','review','archived')))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS site_risk_twins_tenant_site ON site_risk_twins(tenant_id,site_id)`);
+  await pool.query(`ALTER TABLE site_risk_twins ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON site_risk_twins`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON site_risk_twins USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON site_risk_twins TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE site_risk_twins_id_seq TO "${role}"`)}}catch(err){console.warn('Site Risk Twin tenant-role grant skipped:',err.message)}
+  console.log('Site Risk Digital Twin schema ready');
+}
+ensureSiteRiskTwinSchema().catch(err=>console.error('Site Risk Digital Twin schema setup failed:',err.message));
+
+async function buildSiteRiskTwins(client,tenantId,siteId=null){
+  const p=[tenantId];let clause='';if(siteId){p.push(Number(siteId));clause=` AND s.id=$${p.length}`}
+  const rows=(await client.query(`SELECT s.id site_id,s.name site_name,s.address,t.id twin_id,t.profile_name,t.site_type,t.occupancy_band,t.public_access,t.overnight_operation,t.lone_work_expected,t.critical_zones,t.hazard_factors,t.control_notes,t.model_version,t.status,t.updated_at,
+    (SELECT COUNT(*)::int FROM checkpoints c WHERE c.tenant_id=s.tenant_id AND c.site_id=s.id) checkpoints,
+    (SELECT COUNT(*)::int FROM guard_assignments ga WHERE ga.tenant_id=s.tenant_id AND ga.site_id=s.id) assigned_guards,
+    (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=s.tenant_id AND i.site_id=s.id AND COALESCE(i.status,'reported') NOT IN('resolved','closed')) open_incidents,
+    (SELECT COUNT(*)::int FROM incidents i WHERE i.tenant_id=s.tenant_id AND i.site_id=s.id AND COALESCE(i.severity,'low') IN('high','critical') AND COALESCE(i.status,'reported') NOT IN('resolved','closed')) severe_incidents,
+    (SELECT COUNT(*)::int FROM patrol_alerts pa JOIN patrol_runs pr ON pr.id=pa.run_id AND pr.tenant_id=pa.tenant_id WHERE pa.tenant_id=s.tenant_id AND pr.site_id=s.id AND COALESCE(pa.status,'open') NOT IN('resolved','dismissed')) patrol_exceptions,
+    (SELECT COUNT(*)::int FROM sos_alerts sa WHERE sa.tenant_id=s.tenant_id AND sa.site_id=s.id AND COALESCE(sa.status,'active') NOT IN('resolved','closed')) active_sos,
+    (SELECT COUNT(*)::int FROM lone_worker_alerts la WHERE la.tenant_id=s.tenant_id AND la.site_id=s.id AND la.resolved=FALSE) lone_worker_alerts,
+    (SELECT COUNT(*)::int FROM visitor_records vr WHERE vr.tenant_id=s.tenant_id AND vr.site_id=s.id AND vr.status='on_site') visitors_on_site,
+    (SELECT ps.score FROM proofscore_snapshots ps WHERE ps.tenant_id=s.tenant_id AND ps.site_id=s.id ORDER BY ps.calculated_at DESC LIMIT 1) proofscore
+    FROM sites s LEFT JOIN site_risk_twins t ON t.tenant_id=s.tenant_id AND t.site_id=s.id WHERE s.tenant_id=$1${clause} ORDER BY s.name`,p)).rows;
+  return rows.map(r=>{const signals={open_incidents:Number(r.open_incidents||0),severe_incidents:Number(r.severe_incidents||0),patrol_exceptions:Number(r.patrol_exceptions||0),active_sos:Number(r.active_sos||0),lone_worker_alerts:Number(r.lone_worker_alerts||0),visitors_on_site:Number(r.visitors_on_site||0),checkpoints:Number(r.checkpoints||0),assigned_guards:Number(r.assigned_guards||0),proofscore:r.proofscore==null?null:Number(r.proofscore)};let score=0,reasons=[];
+    score+=Math.min(25,signals.open_incidents*3)+Math.min(20,signals.severe_incidents*8)+Math.min(20,signals.patrol_exceptions*4)+Math.min(30,signals.active_sos*15)+Math.min(20,signals.lone_worker_alerts*7);
+    if(r.public_access){score+=5;reasons.push('Public access increases exposure.')}if(r.overnight_operation){score+=5;reasons.push('Overnight operations require enhanced controls.')}if(r.lone_work_expected){score+=5;reasons.push('Lone working is expected at this site.')}if(r.occupancy_band==='high')score+=5;
+    if(signals.severe_incidents)reasons.push(`${signals.severe_incidents} unresolved high/critical incident(s).`);if(signals.patrol_exceptions)reasons.push(`${signals.patrol_exceptions} active patrol exception(s).`);if(signals.active_sos)reasons.push(`${signals.active_sos} active SOS alert(s).`);if(signals.lone_worker_alerts)reasons.push(`${signals.lone_worker_alerts} lone-worker alert(s).`);if(signals.proofscore!==null&&signals.proofscore<80){score+=Math.min(20,(80-signals.proofscore)/2);reasons.push(`Published ProofScore is ${signals.proofscore.toFixed(2)}%, below target.`)}if(!signals.checkpoints){score+=10;reasons.push('No checkpoints are configured.')}if(!signals.assigned_guards){score+=10;reasons.push('No guards are assigned to the site.')}score=Math.max(0,Math.min(100,Math.round(score*100)/100));
+    const band=score>=75?'critical':score>=50?'high':score>=25?'medium':'low';if(!reasons.length)reasons.push('No material live risk signal is currently detected.');return{...r,configured:Boolean(r.twin_id),signals,risk_score:score,risk_band:band,reasons,calculated_at:new Date().toISOString()}})
+}
+app.get('/api/site-risk-twins',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{res.json({sites:await withTenant(tenantId,c=>buildSiteRiskTwins(c,tenantId,req.query.site_id||null)),generated_at:new Date().toISOString(),model:'PS Site Twin v1'})}catch(err){res.status(500).json({error:err.message})}});
+app.put('/api/site-risk-twins/:siteId',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),siteId=Number(req.params.siteId),occupancy=String(req.body.occupancy_band||'medium'),status=String(req.body.status||'active');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!siteId||!['low','medium','high'].includes(occupancy)||!['active','review','archived'].includes(status))return res.status(400).json({error:'Valid site, occupancy and status are required'});try{const row=await withTenant(tenantId,async c=>{const site=await c.query(`SELECT id FROM sites WHERE id=$1 AND tenant_id=$2`,[siteId,tenantId]);if(!site.rowCount)throw Error('Site not found');return c.query(`INSERT INTO site_risk_twins(tenant_id,site_id,profile_name,site_type,occupancy_band,public_access,overnight_operation,lone_work_expected,critical_zones,hazard_factors,control_notes,status,updated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(tenant_id,site_id) DO UPDATE SET profile_name=EXCLUDED.profile_name,site_type=EXCLUDED.site_type,occupancy_band=EXCLUDED.occupancy_band,public_access=EXCLUDED.public_access,overnight_operation=EXCLUDED.overnight_operation,lone_work_expected=EXCLUDED.lone_work_expected,critical_zones=EXCLUDED.critical_zones,hazard_factors=EXCLUDED.hazard_factors,control_notes=EXCLUDED.control_notes,status=EXCLUDED.status,model_version=site_risk_twins.model_version+1,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW() RETURNING *`,[tenantId,siteId,String(req.body.profile_name||'Operational risk model').trim(),String(req.body.site_type||'commercial').trim(),occupancy,Boolean(req.body.public_access),Boolean(req.body.overnight_operation),Boolean(req.body.lone_work_expected),JSON.stringify(Array.isArray(req.body.critical_zones)?req.body.critical_zones:[]),JSON.stringify(Array.isArray(req.body.hazard_factors)?req.body.hazard_factors:[]),String(req.body.control_notes||'').trim()||null,status,req.auth.user_id])});res.json(row.rows[0])}catch(err){res.status(err.message==='Site not found'?404:500).json({error:err.message})}});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

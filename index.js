@@ -6778,6 +6778,47 @@ app.post('/api/ai-assistant/chat',requireAuth,requireOwnerAdmin,aiAssistantRateL
   }
 });
 
+// ------------------------ STAGE 11.3: GOVERNED AI READINESS ------------------------
+app.get('/api/ai-assistant/readiness',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=Number(req.auth.tenant_id),checks=[];
+  const add=(code,label,passed,message,critical=true,details={})=>checks.push({code,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+  try{
+    const required=['ai_assistant_audit','ai_assistant_policies'];
+    const structures=(await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name=ANY($1::text[])`,[required])).rows.map(x=>x.table_name);
+    add('structures','Stage 11 governed-AI structures',required.every(x=>structures.includes(x)),`${structures.length}/${required.length} required tables available`,true,{missing:required.filter(x=>!structures.includes(x))});
+    const rls=(await pool.query(`SELECT c.relname table_name,c.relrowsecurity enabled,EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname) protected FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=ANY($1::text[])`,[required])).rows;
+    add('rls','Tenant RLS protection',rls.length===required.length&&rls.every(x=>x.enabled&&x.protected),`${rls.filter(x=>x.enabled&&x.protected).length}/${required.length} tables have RLS and a tenant policy`,true,{tables:rls});
+    const tenantRole=(()=>{try{return decodeURIComponent(new URL(tenantDatabaseUrl).username||'')}catch(_){return''}})();let grants=[];
+    if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(tenantRole))grants=(await pool.query(`SELECT t table_name,has_table_privilege($1,'public.'||t,'SELECT') can_read,has_table_privilege($1,'public.'||t,'INSERT') can_insert,has_table_privilege($1,'public.'||t,'UPDATE') can_update FROM unnest($2::text[]) t`,[tenantRole,required])).rows;
+    const grantsValid=grants.length===2&&grants.every(x=>x.can_read&&x.can_insert&&(x.table_name==='ai_assistant_audit'||x.can_update));
+    add('grants','Restricted tenant-role permissions',grantsValid,grants.length?`${grants.filter(x=>x.can_read&&x.can_insert&&(x.table_name==='ai_assistant_audit'||x.can_update)).length}/2 tables have the required least-privilege access`:'Restricted tenant role could not be identified',true,{tables:grants});
+    add('platform','OpenAI platform configuration',AI_ASSISTANT_ENABLED&&Boolean(OPENAI_API_KEY)&&Boolean(OPENAI_MODEL),AI_ASSISTANT_ENABLED&&OPENAI_API_KEY?`Operations Assistant is configured with ${OPENAI_MODEL}`:'AI_ASSISTANT_ENABLED, OPENAI_API_KEY, or OPENAI_MODEL is missing',true,{enabled:AI_ASSISTANT_ENABLED,key_configured:Boolean(OPENAI_API_KEY),model:OPENAI_MODEL||null});
+    const privacyColumns=(await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='ai_assistant_audit' AND(column_name ILIKE '%question_text%' OR column_name ILIKE '%prompt%' OR column_name ILIKE '%answer%' OR column_name ILIKE '%response_text%' OR column_name ILIKE '%location%' OR column_name ILIKE '%password%')`)).rows.map(x=>x.column_name);
+    add('privacy','Prompt and response privacy boundary',privacyColumns.length===0,privacyColumns.length?`Prohibited raw-content column(s) detected: ${privacyColumns.join(', ')}`:'Audit storage contains hashes and usage metadata, not raw questions or answers',true,{prohibited_columns:privacyColumns});
+    const data=await withTenant(tenantId,async c=>{
+      const policy=await aiTenantPolicy(tenantId,c);
+      const [usage,integrity,diagnostics,today]=await Promise.all([
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE status='completed')::int completed,COUNT(*) FILTER(WHERE status='failed')::int failed,COUNT(*) FILTER(WHERE status='blocked')::int blocked,COUNT(*) FILTER(WHERE status='completed' AND created_at>=NOW()-INTERVAL '30 days')::int recent_completed,COALESCE(SUM(input_tokens) FILTER(WHERE status='completed'),0)::int input_tokens,COALESCE(SUM(output_tokens) FILTER(WHERE status='completed'),0)::int output_tokens,MAX(created_at) FILTER(WHERE status='completed') last_completed_at FROM ai_assistant_audit WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*) FILTER(WHERE question_hash !~ '^[0-9a-f]{64}$')::int invalid_question_hash,COUNT(*) FILTER(WHERE status='completed' AND(response_hash IS NULL OR response_hash !~ '^[0-9a-f]{64}$'))::int invalid_response_hash,COUNT(*) FILTER(WHERE status='completed' AND(COALESCE(input_tokens,0)<=0 OR COALESCE(output_tokens,0)<=0))::int invalid_usage,COUNT(*) FILTER(WHERE status NOT IN('completed','failed','blocked'))::int invalid_status FROM ai_assistant_audit WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*) FILTER(WHERE status='failed' AND(COALESCE(error_code,'')='' OR COALESCE(request_id,'')=''))::int missing_diagnostic,COUNT(*) FILTER(WHERE status='failed')::int failed FROM ai_assistant_audit WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int count FROM ai_assistant_audit WHERE tenant_id=$1 AND created_at>=CURRENT_DATE`,[tenantId])
+      ]);
+      return{policy,usage:usage.rows[0],integrity:integrity.rows[0],diagnostics:diagnostics.rows[0],today:Number(today.rows[0].count)};
+    });
+    const policyValid=typeof data.policy.enabled==='boolean'&&Number(data.policy.daily_request_limit)>=1&&Number(data.policy.daily_request_limit)<=500&&Number(data.policy.max_output_tokens)>=100&&Number(data.policy.max_output_tokens)<=2000;
+    add('policy','Company AI policy controls',policyValid,policyValid?`${data.policy.enabled?'Enabled':'Disabled'} · ${data.policy.daily_request_limit} requests/day · ${data.policy.max_output_tokens} maximum output tokens`:'Company AI limits are missing or outside approved bounds',true,data.policy);
+    add('successful_evidence','Successful assistant evidence',Number(data.usage.recent_completed)>0,Number(data.usage.recent_completed)>0?`${data.usage.recent_completed} successful request(s) in the last 30 days; latest ${new Date(data.usage.last_completed_at).toISOString()}`:'Complete at least one successful governed assistant request',true,data.usage);
+    const integrityValid=Number(data.integrity.invalid_question_hash)===0&&Number(data.integrity.invalid_response_hash)===0&&Number(data.integrity.invalid_usage)===0&&Number(data.integrity.invalid_status)===0;
+    add('audit_integrity','Hash-only usage audit integrity',integrityValid,integrityValid?`${data.usage.total} audit record(s); completed responses have valid hashes and token usage`:'One or more AI audit records has invalid hashes, token usage, or status',true,data.integrity);
+    add('diagnostics','Failure diagnostic accountability',Number(data.diagnostics.missing_diagnostic)===0,`${data.diagnostics.failed} failed request(s); ${data.diagnostics.missing_diagnostic} missing diagnostic code or request ID`,true,data.diagnostics);
+    add('consumption','Bounded company consumption',data.today<=Number(data.policy.daily_request_limit),`${data.today}/${data.policy.daily_request_limit} company requests used today`,true,{today:data.today,daily_limit:Number(data.policy.daily_request_limit)});
+    const advisoryBoundary=AI_MODULE_CATALOGUE.length>0&&AI_ASSISTANT_ENABLED;
+    add('advisory_boundary','Read-only advisory boundary',advisoryBoundary,advisoryBoundary?`${AI_MODULE_CATALOGUE.length} navigation modules available; assistant has no record-change tools or automatic-decision authority`:'Governed advisory catalogue or assistant mode is unavailable',true,{mode:'read_only_advisory',module_count:AI_MODULE_CATALOGUE.length,automatic_actions:0});
+    const failures=checks.filter(x=>x.status==='fail').length,warnings=checks.filter(x=>x.status==='warning').length,passed=checks.filter(x=>x.status==='pass').length;
+    res.json({status:failures?'action_required':warnings?'ready_with_warnings':'stage_11_ready',label:failures?'ACTION REQUIRED':warnings?'READY WITH WARNINGS':'STAGE 11 READY',completed_at:new Date().toISOString(),duration_ms:Date.now()-started,summary:{passed,warnings,failures,total:checks.length},activity:{audit_records:Number(data.usage.total),successful_requests:Number(data.usage.completed),failed_requests:Number(data.usage.failed),tokens:Number(data.usage.input_tokens)+Number(data.usage.output_tokens),requests_today:data.today},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

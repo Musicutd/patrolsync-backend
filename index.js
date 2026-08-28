@@ -56,6 +56,9 @@ if(DATABASE_PATHS_SEPARATED)tenantPool.on('error',err=>console.error(JSON.string
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'patrolsync-dev-secret';
 const PLATFORM_JWT_SECRET = process.env.PLATFORM_JWT_SECRET || JWT_SECRET;
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5-mini').trim();
+const AI_ASSISTANT_ENABLED = String(process.env.AI_ASSISTANT_ENABLED || 'false').toLowerCase() === 'true';
 const FIXED_WINDOW_MINUTES = 30;
 const ALERT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 const LOCATION_HISTORY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
@@ -6655,6 +6658,92 @@ app.get('/api/identity-assurance/readiness',requireAuth,requireAdmin,async(req,r
 app.patch('/api/identity-assurance/devices/:id/status',requireAuth,requireOwnerAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),id=Number(req.params.id),status=String(req.body.status||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!id||!['trusted','revoked'].includes(status))return res.status(400).json({error:'Valid device and status are required'});try{const result=await withTenant(tenantId,c=>c.query(`UPDATE guard_trusted_devices SET status=$3,approved_by_user_id=CASE WHEN $3='trusted' THEN $4 ELSE approved_by_user_id END,approved_at=CASE WHEN $3='trusted' THEN NOW() ELSE approved_at END,revoked_by_user_id=CASE WHEN $3='revoked' THEN $4 ELSE NULL END,revoked_at=CASE WHEN $3='revoked' THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=$1 AND tenant_id=$2 RETURNING id,user_id,device_name,status,approved_at,revoked_at`,[id,tenantId,status,req.auth.user_id]));if(!result.rowCount)return res.status(404).json({error:'Device registration not found'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}});
 app.get('/api/guard/identity-assurance',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.query.tenant_id),deviceId=String(req.query.device_id||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const data=await withTenant(tenantId,async c=>{const settings=await identitySettings(c,tenantId);let device=null;if(deviceId){const hash=identityDeviceHash(tenantId,req.auth.user_id,deviceId);device=(await c.query(`SELECT id,device_name,platform,status,consent_version,consented_at,approved_at,revoked_at,last_seen_at FROM guard_trusted_devices WHERE tenant_id=$1 AND user_id=$2 AND device_hash=$3`,[tenantId,req.auth.user_id,hash])).rows[0]||null;if(device)await c.query(`UPDATE guard_trusted_devices SET last_seen_at=NOW() WHERE id=$1`,[device.id])}return{settings,device}});res.json(data)}catch(err){res.status(500).json({error:err.message})}});
 app.post('/api/guard/identity-assurance/enrol',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.body.tenant_id),deviceId=String(req.body.device_id||''),name=String(req.body.device_name||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(req.body.consent_accepted!==true||deviceId.length<16||!name)return res.status(400).json({error:'Explicit consent, a device identifier, and device name are required'});try{const saved=await withTenant(tenantId,async c=>{const settings=await identitySettings(c,tenantId);if(!settings.enabled)throw Object.assign(new Error('Identity assurance is not enabled by your company'),{statusCode:409});const hash=identityDeviceHash(tenantId,req.auth.user_id,deviceId);return c.query(`INSERT INTO guard_trusted_devices(tenant_id,user_id,device_hash,device_name,platform,user_agent,status,consent_version,consented_at) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,NOW()) ON CONFLICT(tenant_id,user_id,device_hash) DO UPDATE SET device_name=EXCLUDED.device_name,platform=EXCLUDED.platform,user_agent=EXCLUDED.user_agent,status=CASE WHEN guard_trusted_devices.status='revoked' THEN 'pending' ELSE guard_trusted_devices.status END,consent_version=EXCLUDED.consent_version,consented_at=NOW(),revoked_by_user_id=NULL,revoked_at=NULL,last_seen_at=NOW(),updated_at=NOW() RETURNING id,device_name,platform,status,consent_version,consented_at,approved_at`,[tenantId,req.auth.user_id,hash,name,String(req.body.platform||'').slice(0,200)||null,String(req.body.user_agent||'').slice(0,500)||null,settings.consent_version])});res.status(201).json(saved.rows[0])}catch(err){res.status(err.statusCode||500).json({error:err.message})}});
+
+// ------------------------ STAGE 11.1: GOVERNED OPERATIONS ASSISTANT ------------------------
+const AI_MODULE_CATALOGUE = [
+  {label:'Attendance',href:'attendance.html',keywords:'clock in clock out break worked hours attendance'},
+  {label:'Shift Scheduler',href:'shift_scheduler.html',keywords:'shift schedule roster open shift template coverage'},
+  {label:'Incident Cases',href:'incident_management.html',keywords:'incident acknowledge resolve case photo evidence'},
+  {label:'Patrol Runs',href:'patrol_runs.html',keywords:'patrol route run checkpoint scan missed'},
+  {label:'TrustProof Evidence',href:'trustproof.html',keywords:'evidence integrity seal verify chain proof'},
+  {label:'Guard Certifications',href:'certificate_register.html',keywords:'certificate licence license expiry renewal compliance'},
+  {label:'Training & Compliance',href:'training_compliance.html',keywords:'training competency policy assignment compliance'},
+  {label:'ProofScore Assurance',href:'proofscore.html',keywords:'proofscore assurance client score evidence'},
+  {label:'Client Reports',href:'client_reports.html',keywords:'client report pdf delivery schedule'},
+  {label:'Contracts & SLAs',href:'service_contracts.html',keywords:'contract sla target rate billing'},
+  {label:'Billing & Invoices',href:'invoices.html',keywords:'invoice payment bill credit'},
+  {label:'Lone Worker',href:'lone_worker.html',keywords:'lone worker safety check in alert'},
+  {label:'Crisis Mode',href:'crisis_mode.html',keywords:'crisis emergency response commander action'},
+  {label:'Site Risk Digital Twin',href:'site_risk_twin.html',keywords:'site risk exposure hazard digital twin'},
+  {label:'Identity Assurance',href:'identity_assurance.html',keywords:'identity trusted device consent verification'},
+  {label:'Audit Log',href:'audit_log.html',keywords:'audit history changes accountability'},
+  {label:'Operations Analytics',href:'analytics.html',keywords:'analytics trends performance operational'},
+  {label:'Service Tickets',href:'service_tickets.html',keywords:'client request ticket message service'}
+];
+const aiAssistantWindows = new Map();
+function aiAssistantRateLimit(req,res,next){
+  const key=`${req.auth?.tenant_id||'x'}:${req.auth?.user_id||'x'}`,now=Date.now(),windowMs=15*60*1000,limit=30;
+  const recent=(aiAssistantWindows.get(key)||[]).filter(x=>now-x<windowMs);
+  if(recent.length>=limit)return res.status(429).set('Retry-After','900').json({error:'Assistant request limit reached. Try again later.'});
+  recent.push(now);aiAssistantWindows.set(key,recent);next();
+}
+function aiRelevantModules(question){
+  const words=String(question||'').toLowerCase().split(/[^a-z0-9]+/).filter(x=>x.length>2);
+  return AI_MODULE_CATALOGUE.map(module=>({module,score:words.reduce((n,word)=>n+(module.label+' '+module.keywords).toLowerCase().includes(word)?1:0,0)}))
+    .filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,5).map(x=>x.module);
+}
+function responseText(payload){
+  return String(payload?.output_text||payload?.output?.flatMap(item=>item?.content||[]).find(item=>item?.type==='output_text')?.text||'').trim();
+}
+async function ensureAiAssistantSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS ai_assistant_audit(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,
+    question_hash TEXT NOT NULL,response_hash TEXT,matched_modules JSONB NOT NULL DEFAULT '[]'::jsonb,
+    provider TEXT NOT NULL DEFAULT 'openai',model TEXT,status TEXT NOT NULL,error_code TEXT,
+    input_tokens INTEGER,output_tokens INTEGER,request_id TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ai_assistant_audit_status CHECK(status IN('completed','failed','blocked')))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ai_assistant_audit_tenant_time ON ai_assistant_audit(tenant_id,created_at DESC)`);
+  await pool.query(`ALTER TABLE ai_assistant_audit ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ai_assistant_audit`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ai_assistant_audit USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){await pool.query(`GRANT SELECT,INSERT ON ai_assistant_audit TO "${role}"`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE ai_assistant_audit_id_seq TO "${role}"`)}}catch(err){console.warn('AI assistant tenant-role grant skipped:',err.message)}
+  console.log('Governed operations assistant schema ready');
+}
+ensureAiAssistantSchema().catch(err=>console.error('AI assistant schema setup failed:',err.message));
+async function aiCompanyContext(tenantId){
+  return withTenant(tenantId,async c=>{
+    const [sites,guards,openIncidents,openSos,expiring,shifts]=await Promise.all([
+      c.query(`SELECT COUNT(*)::int count FROM sites WHERE tenant_id=$1`,[tenantId]),
+      c.query(`SELECT COUNT(*)::int count FROM users WHERE tenant_id=$1 AND role='guard' AND COALESCE(account_active,TRUE)=TRUE`,[tenantId]),
+      c.query(`SELECT COUNT(*)::int count FROM incidents WHERE tenant_id=$1 AND COALESCE(status,'reported') NOT IN('resolved','closed')`,[tenantId]),
+      c.query(`SELECT COUNT(*)::int count FROM sos_alerts WHERE tenant_id=$1 AND COALESCE(status,'active')='active'`,[tenantId]),
+      c.query(`SELECT COUNT(*)::int count FROM guard_certifications WHERE tenant_id=$1 AND archived_at IS NULL AND expiry_date IS NOT NULL AND expiry_date<=CURRENT_DATE+30`,[tenantId]),
+      c.query(`SELECT COUNT(*)::int count FROM shifts WHERE tenant_id=$1 AND shift_date BETWEEN CURRENT_DATE AND CURRENT_DATE+14`,[tenantId])
+    ]);
+    return{sites:sites.rows[0].count,active_guards:guards.rows[0].count,open_incidents:openIncidents.rows[0].count,active_sos_alerts:openSos.rows[0].count,certificates_expired_or_due_30_days:expiring.rows[0].count,shifts_next_14_days:shifts.rows[0].count};
+  });
+}
+app.get('/api/ai-assistant/status',requireAuth,requireOwnerAdmin,(req,res)=>res.json({enabled:AI_ASSISTANT_ENABLED&&Boolean(OPENAI_API_KEY),model:AI_ASSISTANT_ENABLED&&OPENAI_API_KEY?OPENAI_MODEL:null,mode:'read_only_advisory',privacy:'aggregate_context_only'}));
+app.post('/api/ai-assistant/chat',requireAuth,requireOwnerAdmin,aiAssistantRateLimit,async(req,res)=>{
+  const tenantId=Number(req.auth.tenant_id),question=String(req.body.question||'').trim();
+  if(!AI_ASSISTANT_ENABLED||!OPENAI_API_KEY)return res.status(503).json({error:'The operations assistant is not configured. Add OPENAI_API_KEY and set AI_ASSISTANT_ENABLED=true.'});
+  if(question.length<3||question.length>1200)return res.status(400).json({error:'Enter a question between 3 and 1,200 characters.'});
+  const matched=aiRelevantModules(question),questionHash=crypto.createHash('sha256').update(question).digest('hex');
+  try{
+    const context=await aiCompanyContext(tenantId),catalogue=AI_MODULE_CATALOGUE.map(x=>`${x.label}: ${x.href}`).join('\n');
+    const instructions=`You are PatrolSync Operations Assistant for an authenticated subscriber company administrator. Be concise, practical, and transparent. Use only the supplied aggregate company context and module catalogue. You are read-only: never claim to perform an action or change a record. Never rank, score, discipline, hire, dismiss, schedule, or reassign an individual guard. Never infer sensitive personal traits. Never provide precise guard locations, passwords, tokens, or private personal records. For emergencies or active SOS alerts, tell the administrator to use Crisis Mode/SOS Monitor and follow local emergency procedures; do not make emergency decisions. Distinguish facts from suggestions. If information is unavailable, say so. End with up to three relevant PatrolSync module names when useful.`;
+    const input=`Aggregate company context (counts only):\n${JSON.stringify(context)}\n\nAvailable PatrolSync modules:\n${catalogue}\n\nAdministrator question:\n${question}`;
+    const apiResponse=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{'Authorization':`Bearer ${OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:OPENAI_MODEL,instructions,input,max_output_tokens:700,store:false,safety_identifier:crypto.createHash('sha256').update(`${tenantId}:${req.auth.user_id}`).digest('hex')})});
+    const payload=await apiResponse.json().catch(()=>({}));
+    if(!apiResponse.ok)throw Object.assign(new Error(payload?.error?.message||'AI provider request failed'),{code:payload?.error?.code||`http_${apiResponse.status}`,statusCode:502});
+    const answer=responseText(payload);if(!answer)throw Object.assign(new Error('The assistant returned an empty response'),{code:'empty_response',statusCode:502});
+    await withTenant(tenantId,c=>c.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,response_hash,matched_modules,model,status,input_tokens,output_tokens,request_id) VALUES($1,$2,$3,$4,$5::jsonb,$6,'completed',$7,$8,$9)`,[tenantId,req.auth.user_id,questionHash,crypto.createHash('sha256').update(answer).digest('hex'),JSON.stringify(matched),OPENAI_MODEL,payload.usage?.input_tokens||null,payload.usage?.output_tokens||null,req.requestId||null]));
+    res.json({answer,modules:matched,mode:'read_only_advisory',request_id:req.requestId||null});
+  }catch(err){
+    await withTenant(tenantId,c=>c.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,matched_modules,model,status,error_code,request_id) VALUES($1,$2,$3,$4::jsonb,$5,'failed',$6,$7)`,[tenantId,req.auth.user_id,questionHash,JSON.stringify(matched),OPENAI_MODEL,String(err.code||'provider_error').slice(0,100),req.requestId||null])).catch(()=>{});
+    res.status(err.statusCode||500).json({error:err.statusCode===502?'The assistant is temporarily unavailable. No PatrolSync records were changed.':err.message});
+  }
+});
 
 // ------------------------ SERVER START ------------------------
 

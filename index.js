@@ -6861,6 +6861,59 @@ app.get('/api/launch/workflow-acceptance',requireAuth,requireOwnerAdmin,async(re
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
 });
 
+// ------------------------ STAGE 12.2: BROWSER, MOBILE & OFFLINE ACCEPTANCE ------------------------
+const BROWSER_ACCEPTANCE_CAPABILITIES=['secure_context','service_worker','indexed_db','local_storage','geolocation','camera','responsive_layout'];
+const BROWSER_ACCEPTANCE_MANUAL=['admin_desktop','guard_mobile','camera_qr','gps_capture','offline_patrol_sync','offline_incident_sync','retry_idempotency','offline_shell'];
+
+app.post('/api/launch/browser-offline-acceptance/evidence',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const tenantId=Number(req.auth.tenant_id),capabilities=req.body?.capabilities||{},manual=req.body?.manual||{},notes=String(req.body?.notes||'').trim().slice(0,2000);
+  const normalizedCapabilities={};for(const key of BROWSER_ACCEPTANCE_CAPABILITIES)normalizedCapabilities[key]=Boolean(capabilities[key]);
+  const normalizedManual={};for(const key of BROWSER_ACCEPTANCE_MANUAL)normalizedManual[key]=Boolean(manual[key]);
+  const viewport={width:Math.max(0,Math.min(10000,Number(req.body?.viewport?.width)||0)),height:Math.max(0,Math.min(10000,Number(req.body?.viewport?.height)||0)),pixel_ratio:Math.max(0,Math.min(10,Number(req.body?.viewport?.pixel_ratio)||1))};
+  const details={capabilities:normalizedCapabilities,manual:normalizedManual,viewport,online:Boolean(req.body?.online),service_worker_registered:Boolean(req.body?.service_worker_registered),user_agent:String(req.headers['user-agent']||'').slice(0,500),notes,accepted_by:Number(req.auth.user_id),accepted_by_email:req.auth.email||null};
+  try{
+    const saved=await withTenant(tenantId,c=>c.query(`INSERT INTO system_events(tenant_id,event_type,severity,message,details,request_id) VALUES($1,'stage_12_2_acceptance','info','Browser, mobile and offline acceptance evidence recorded',$2::jsonb,$3) RETURNING id,created_at`,[tenantId,JSON.stringify(details),req.requestId||null]));
+    res.status(201).json({saved:true,id:saved.rows[0].id,created_at:saved.rows[0].created_at,evidence:details});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
+});
+
+app.get('/api/launch/browser-offline-acceptance',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=Number(req.auth.tenant_id),checks=[];
+  const add=(code,label,passed,message,critical=true,details={})=>checks.push({code,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+  try{
+    const requiredColumns=['patrol_logs.client_scan_id','patrol_logs.offline_captured','patrol_logs.device_scanned_at','incidents.client_incident_id','incidents.offline_captured','incidents.device_reported_at','incident_photos.checksum_sha256'];
+    const columns=(await pool.query(`SELECT table_name,column_name FROM information_schema.columns WHERE table_schema='public' AND table_name IN('patrol_logs','incidents','incident_photos')`)).rows;
+    const available=new Set(columns.map(x=>`${x.table_name}.${x.column_name}`));
+    add('structures','Browser and offline evidence structures',requiredColumns.every(x=>available.has(x)),`${requiredColumns.filter(x=>available.has(x)).length}/${requiredColumns.length} required evidence fields available`,true,{missing:requiredColumns.filter(x=>!available.has(x))});
+    const indexRows=(await pool.query(`SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname IN('uq_patrol_logs_tenant_client_scan','uq_incidents_tenant_client_id')`)).rows;
+    add('idempotency_indexes','Offline retry protection',indexRows.length===2,`${indexRows.length}/2 required unique retry indexes installed`,true,{indexes:indexRows.map(x=>x.indexname)});
+    const data=await withTenant(tenantId,async c=>{
+      const [scans,incidents,duplicates,photos,acceptance]=await Promise.all([
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE offline_captured)::int offline,COUNT(*) FILTER(WHERE offline_captured AND client_scan_id IS NOT NULL AND device_scanned_at IS NOT NULL)::int traceable FROM patrol_logs WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE offline_captured)::int offline,COUNT(*) FILTER(WHERE offline_captured AND client_incident_id IS NOT NULL AND device_reported_at IS NOT NULL AND device_id IS NOT NULL)::int traceable FROM incidents WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT (SELECT COUNT(*) FROM(SELECT client_scan_id FROM patrol_logs WHERE tenant_id=$1 AND client_scan_id IS NOT NULL GROUP BY client_scan_id HAVING COUNT(*)>1)s)::int scan_duplicates,(SELECT COUNT(*) FROM(SELECT client_incident_id FROM incidents WHERE tenant_id=$1 AND client_incident_id IS NOT NULL GROUP BY client_incident_id HAVING COUNT(*)>1)i)::int incident_duplicates`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE checksum_sha256 IS NOT NULL AND(storage_key IS NOT NULL OR photo_data IS NOT NULL))::int recoverable FROM incident_photos WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_2_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId])
+      ]);
+      return{scans:scans.rows[0],incidents:incidents.rows[0],duplicates:duplicates.rows[0],photos:photos.rows[0],acceptance:acceptance.rows[0]||null};
+    });
+    add('offline_patrol','Offline patrol synchronization evidence',Number(data.scans.offline)>0&&Number(data.scans.offline)===Number(data.scans.traceable),`${data.scans.traceable}/${data.scans.offline} offline patrol scan(s) retain client identity and capture time`,true,data.scans);
+    add('offline_incident','Offline incident synchronization evidence',Number(data.incidents.offline)>0&&Number(data.incidents.offline)===Number(data.incidents.traceable),`${data.incidents.traceable}/${data.incidents.offline} offline incident(s) retain client identity, device and capture time`,true,data.incidents);
+    const duplicateCount=Number(data.duplicates.scan_duplicates)+Number(data.duplicates.incident_duplicates);
+    add('retry_safety','Retry and replay safety',duplicateCount===0,duplicateCount===0?'No duplicate patrol or incident client identities':'Duplicate client identities require correction',true,data.duplicates);
+    add('photo_recovery','Mobile photo recoverability',Number(data.photos.total)===Number(data.photos.recoverable),`${data.photos.recoverable}/${data.photos.total} incident photo(s) are recoverable and checksummed`,true,data.photos);
+    const evidence=data.acceptance?.details||{},ageDays=data.acceptance?((Date.now()-new Date(data.acceptance.created_at).getTime())/86400000):null;
+    add('acceptance_record','Recorded browser acceptance',Boolean(data.acceptance)&&ageDays<=30,data.acceptance?`Latest acceptance recorded ${new Date(data.acceptance.created_at).toISOString()} by ${evidence.accepted_by_email||'an administrator'}`:'Save browser and manual acceptance evidence from the Stage 12.2 page',true,{event_id:data.acceptance?.id||null,created_at:data.acceptance?.created_at||null,age_days:ageDays});
+    const capabilityMissing=BROWSER_ACCEPTANCE_CAPABILITIES.filter(key=>!evidence.capabilities?.[key]);
+    add('browser_capabilities','Required browser capabilities',Boolean(data.acceptance)&&capabilityMissing.length===0,capabilityMissing.length?`Missing or unsupported: ${capabilityMissing.join(', ')}`:'Secure context, storage, service worker, camera, location and responsive layout are supported',true,{capabilities:evidence.capabilities||{},missing:capabilityMissing,service_worker_registered:Boolean(evidence.service_worker_registered)});
+    const manualMissing=BROWSER_ACCEPTANCE_MANUAL.filter(key=>!evidence.manual?.[key]);
+    add('manual_workflows','Desktop, mobile and offline workflow acceptance',Boolean(data.acceptance)&&manualMissing.length===0,manualMissing.length?`${manualMissing.length} manual acceptance item(s) remain incomplete`:'All required administrator and guard acceptance workflows were confirmed',true,{manual:evidence.manual||{},missing:manualMissing});
+    add('acceptance_context','Acceptance device context',Boolean(data.acceptance)&&Boolean(evidence.user_agent)&&Number(evidence.viewport?.width)>0,data.acceptance?`${evidence.viewport?.width||0}×${evidence.viewport?.height||0} viewport · ${evidence.online?'online':'offline'} when saved`:'No browser context has been recorded',true,{viewport:evidence.viewport||null,user_agent:evidence.user_agent||null,online:evidence.online});
+    const failures=checks.filter(x=>x.status==='fail').length,warnings=checks.filter(x=>x.status==='warning').length,passed=checks.filter(x=>x.status==='pass').length;
+    res.json({status:failures?'action_required':warnings?'ready_with_warnings':'stage_12_2_ready',label:failures?'ACTION REQUIRED':warnings?'READY WITH WARNINGS':'STAGE 12.2 READY',completed_at:new Date().toISOString(),duration_ms:Date.now()-started,summary:{passed,warnings,failures,total:checks.length},activity:{patrol_scans:Number(data.scans.total),offline_patrol_scans:Number(data.scans.offline),incidents:Number(data.incidents.total),offline_incidents:Number(data.incidents.offline),photos:Number(data.photos.total),acceptance_recorded:Boolean(data.acceptance)},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

@@ -6819,6 +6819,46 @@ app.get('/api/ai-assistant/readiness',requireAuth,requireOwnerAdmin,async(req,re
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
 });
 
+// ------------------------ STAGE 12.1: ROLE & WORKFLOW ACCEPTANCE ------------------------
+app.get('/api/launch/workflow-acceptance',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const started=Date.now(),tenantId=Number(req.auth.tenant_id),checks=[];
+  const add=(code,label,passed,message,critical=true,details={})=>checks.push({code,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+  try{
+    const required=['users','client_users','sites','guard_assignments','auth_sessions','attendance_sessions','patrol_logs','incidents','audit_logs'];
+    const structures=(await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name=ANY($1::text[])`,[required])).rows.map(x=>x.table_name);
+    add('structures','Stage 12 acceptance structures',required.every(x=>structures.includes(x)),`${structures.length}/${required.length} required tables available`,true,{missing:required.filter(x=>!structures.includes(x))});
+    const data=await withTenant(tenantId,async c=>{
+      const [roles,clients,assignments,sessions,workflow,clientLinks,audit,staffPermissions]=await Promise.all([
+        c.query(`SELECT role,COUNT(*)::int total,COUNT(*) FILTER(WHERE account_active=TRUE)::int active,COUNT(*) FILTER(WHERE account_active=TRUE AND COALESCE(password_hash,'')<>'')::int login_ready FROM users WHERE tenant_id=$1 GROUP BY role`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE COALESCE(password_hash,'')<>'')::int login_ready FROM client_users WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(DISTINCT u.id)::int active_guards,COUNT(DISTINCT ga.user_id)::int assigned_guards FROM users u LEFT JOIN guard_assignments ga ON ga.tenant_id=u.tenant_id AND ga.user_id=u.id WHERE u.tenant_id=$1 AND u.role='guard' AND u.account_active=TRUE`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE revoked_at IS NULL AND expires_at>NOW())::int active,COUNT(DISTINCT role)::int roles_seen FROM auth_sessions WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT (SELECT COUNT(*)::int FROM attendance_sessions WHERE tenant_id=$1) attendance,(SELECT COUNT(*)::int FROM patrol_logs WHERE tenant_id=$1) patrol_scans,(SELECT COUNT(*)::int FROM incidents WHERE tenant_id=$1) incidents`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE s.id IS NULL)::int broken FROM client_users cu LEFT JOIN sites s ON s.id=cu.site_id AND s.tenant_id=cu.tenant_id WHERE cu.tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE COALESCE(user_email,'')='')::int unattributed,COUNT(DISTINCT user_role)::int roles_seen FROM audit_logs WHERE tenant_id=$1`,[tenantId]),
+        c.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE account_active=TRUE)::int active,COUNT(*) FILTER(WHERE account_active=TRUE AND jsonb_typeof(permissions)='array')::int valid_permissions FROM users WHERE tenant_id=$1 AND role='staff'`,[tenantId])
+      ]);
+      return{roles:roles.rows,clients:clients.rows[0],assignments:assignments.rows[0],sessions:sessions.rows[0],workflow:workflow.rows[0],client_links:clientLinks.rows[0],audit:audit.rows[0],staff:staffPermissions.rows[0]};
+    });
+    const role=name=>data.roles.find(x=>x.role===name)||{total:0,active:0,login_ready:0};
+    const admins=role('admin'),guards=role('guard');
+    add('subscriber_admin','Subscriber administrator access',Number(admins.login_ready)>0,`${admins.login_ready}/${admins.active} active administrator account(s) are login-ready`,true,admins);
+    add('guard_access','Guard access',Number(guards.login_ready)>0,`${guards.login_ready}/${guards.active} active guard account(s) are login-ready`,true,guards);
+    add('client_access','Site-specific client access',Number(data.clients.login_ready)>0,`${data.clients.login_ready}/${data.clients.total} client account(s) are login-ready`,true,data.clients);
+    const staffValid=Number(data.staff.active)===0||Number(data.staff.valid_permissions)===Number(data.staff.active);
+    add('delegated_staff','Delegated staff permission boundary',staffValid,Number(data.staff.active)?`${data.staff.valid_permissions}/${data.staff.active} active staff account(s) have structured module permissions`:'No delegated staff accounts; owner-admin access remains available',false,data.staff);
+    const assignmentValid=Number(data.assignments.active_guards)>0&&Number(data.assignments.assigned_guards)===Number(data.assignments.active_guards);
+    add('guard_assignments','Active guard site assignments',assignmentValid,`${data.assignments.assigned_guards}/${data.assignments.active_guards} active guard(s) assigned to a site`,true,data.assignments);
+    add('session_lifecycle','Tracked authentication sessions',Number(data.sessions.total)>0,`${data.sessions.active} active of ${data.sessions.total} tracked session(s); ${data.sessions.roles_seen} role type(s) observed`,true,data.sessions);
+    const workflowValid=Number(data.workflow.attendance)>0&&Number(data.workflow.patrol_scans)>0&&Number(data.workflow.incidents)>0;
+    add('field_workflows','Core field workflow evidence',workflowValid,`${data.workflow.attendance} attendance session(s), ${data.workflow.patrol_scans} patrol scan(s), ${data.workflow.incidents} incident(s)`,true,data.workflow);
+    add('client_site_boundary','Client-to-site access relationships',Number(data.client_links.total)>0&&Number(data.client_links.broken)===0,`${data.client_links.total} client account relationship(s); ${data.client_links.broken} broken site link(s)`,true,data.client_links);
+    add('audit_attribution','Role-attributed operational audit',Number(data.audit.total)>0&&Number(data.audit.unattributed)===0,`${data.audit.total} audit record(s); ${data.audit.unattributed} without user attribution; ${data.audit.roles_seen} role type(s) observed`,true,data.audit);
+    const failures=checks.filter(x=>x.status==='fail').length,warnings=checks.filter(x=>x.status==='warning').length,passed=checks.filter(x=>x.status==='pass').length;
+    res.json({status:failures?'action_required':warnings?'ready_with_warnings':'stage_12_1_ready',label:failures?'ACTION REQUIRED':warnings?'READY WITH WARNINGS':'STAGE 12.1 READY',completed_at:new Date().toISOString(),duration_ms:Date.now()-started,summary:{passed,warnings,failures,total:checks.length},activity:{active_admins:Number(admins.active),active_guards:Number(guards.active),active_staff:Number(data.staff.active),client_accounts:Number(data.clients.total),assigned_guards:Number(data.assignments.assigned_guards),tracked_sessions:Number(data.sessions.total)},checks});
+  }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

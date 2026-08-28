@@ -24,7 +24,7 @@ const runtimeState={ready:false,draining:false,shutdown_signal:null,shutdown_sta
 app.disable('x-powered-by');
 app.set('trust proxy',1);
 app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&origin!=='null'&&!allowedOrigins.has(origin))return res.status(403).json({error:'Origin is not allowed'});if(origin==='null'&&IS_PRODUCTION)return res.status(403).json({error:'Local-file browser requests are not allowed in production'});next()});
-app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After','X-Cache','X-Cache-Age'],maxAge:86400}));
+app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key','X-PatrolSync-Device'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After','X-Cache','X-Cache-Age'],maxAge:86400}));
 app.use(express.json({ limit: '12mb' }));
 app.use((req,res,next)=>{
   if(runtimeState.draining&&req.path!=='/live')return res.status(503).set('Connection','close').json({error:'Service is restarting',retry_after_seconds:10});
@@ -1904,7 +1904,7 @@ app.get('/api/audit-logs', requireAuth, requireAdmin, async (req, res) => {
 
 // ------------------------ SOS ROUTES ------------------------
 
-app.post('/api/sos', requireAuth, async (req, res) => {
+app.post('/api/sos', requireAuth, requireTrustedGuardDevice, async (req, res) => {
   const { tenant_id, site_id, latitude, longitude, message } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || !site_id) {
@@ -3259,7 +3259,7 @@ app.delete('/api/patrol-schedules/:id', requireAuth, requireAdmin, async (req, r
   }
 });
 
-app.post('/api/patrol-logs', requireAuth, async (req, res) => {
+app.post('/api/patrol-logs', requireAuth, requireTrustedGuardDevice, async (req, res) => {
   const { tenant_id, checkpoint_id, user_id, latitude, longitude, accuracy, scanned_at, device_scanned_at, patrol_run_id, checkpoint_note, instruction_confirmed } = req.body;
   const clientScanId = String(req.body.client_scan_id || '').trim() || null;
   const scanMethod = String(req.body.scan_method || 'qr').trim().toLowerCase();
@@ -3878,7 +3878,7 @@ app.patch('/api/handovers/:id/resolve',requireAuth,requireAdmin,async(req,res)=>
 
 // ------------------------ INCIDENTS ------------------------
 
-app.post('/api/incidents', requireAuth, async (req, res) => {
+app.post('/api/incidents', requireAuth, requireTrustedGuardDevice, async (req, res) => {
   const { tenant_id, site_id, checkpoint_id, description, severity, category, photos } = req.body;
   const clientIncidentId=String(req.body.client_incident_id||'').trim()||null;
   const deviceId=String(req.body.device_id||'').trim()||null;
@@ -4106,7 +4106,7 @@ app.get('/api/attendance/current', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/attendance/clock-in', requireAuth, async (req, res) => {
+app.post('/api/attendance/clock-in', requireAuth, requireTrustedGuardDevice, async (req, res) => {
   if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Only guards can clock in' });
   const tenantId = attendanceTenant(req, req.body.tenant_id);
   const { site_id, latitude, longitude, accuracy } = req.body;
@@ -6554,12 +6554,20 @@ async function ensureIdentityAssuranceSchema(){
     CONSTRAINT guard_trusted_device_status CHECK(status IN('pending','trusted','revoked')),
     UNIQUE(tenant_id,user_id,device_hash))`);
   await pool.query(`CREATE INDEX IF NOT EXISTS guard_trusted_devices_tenant_status ON guard_trusted_devices(tenant_id,status,created_at DESC)`);
-  for(const table of ['identity_assurance_settings','guard_trusted_devices']){
+  await pool.query(`CREATE TABLE IF NOT EXISTS identity_verification_events(
+    id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,device_id BIGINT,
+    action_type TEXT NOT NULL,resource_type TEXT NOT NULL,outcome TEXT NOT NULL,enforcement_mode TEXT NOT NULL,
+    reason TEXT,request_id TEXT,ip_address TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT identity_verification_outcome CHECK(outcome IN('verified','not_required','pending','revoked','unregistered','missing_device')),
+    CONSTRAINT identity_verification_mode CHECK(enforcement_mode IN('observe','enforce','emergency_fallback')))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS identity_verification_events_tenant_time ON identity_verification_events(tenant_id,created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS identity_verification_events_user_action ON identity_verification_events(tenant_id,user_id,action_type,created_at DESC)`);
+  for(const table of ['identity_assurance_settings','guard_trusted_devices','identity_verification_events']){
     await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);
     await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);
     await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
   }
-  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){for(const table of ['identity_assurance_settings','guard_trusted_devices'])await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO "${role}"`);for(const sequence of ['identity_assurance_settings_id_seq','guard_trusted_devices_id_seq'])await pool.query(`GRANT USAGE,SELECT ON SEQUENCE ${sequence} TO "${role}"`)}}catch(err){console.warn('Identity assurance tenant-role grant skipped:',err.message)}
+  try{const role=decodeURIComponent(new URL(tenantDatabaseUrl).username||'');if(/^[A-Za-z_][A-Za-z0-9_]*$/.test(role)){for(const table of ['identity_assurance_settings','guard_trusted_devices','identity_verification_events'])await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO "${role}"`);for(const sequence of ['identity_assurance_settings_id_seq','guard_trusted_devices_id_seq','identity_verification_events_id_seq'])await pool.query(`GRANT USAGE,SELECT ON SEQUENCE ${sequence} TO "${role}"`)}}catch(err){console.warn('Identity assurance tenant-role grant skipped:',err.message)}
   console.log('Privacy-safe identity assurance schema ready');
 }
 ensureIdentityAssuranceSchema().catch(err=>console.error('Identity assurance schema setup failed:',err.message));
@@ -6568,9 +6576,49 @@ async function identitySettings(client,tenantId){
   const found=await client.query(`SELECT * FROM identity_assurance_settings WHERE tenant_id=$1`,[tenantId]);
   return found.rows[0]||{tenant_id:tenantId,enabled:false,require_trusted_device:false,consent_version:'1.0',retention_days:90,policy_notice:'PatrolSync records trusted-device consent and approval metadata. No facial recognition or biometric matching is performed.'};
 }
+function trustedDeviceAction(req){
+  if(req.path==='/api/sos')return{action:'sos_alert',resource:'sos'};
+  if(req.path==='/api/patrol-logs')return{action:'patrol_scan',resource:'patrol_log'};
+  if(req.path==='/api/incidents')return{action:'incident_report',resource:'incident'};
+  return{action:'clock_in',resource:'attendance'};
+}
+async function requireTrustedGuardDevice(req,res,next){
+  if(req.auth?.role!=='guard')return next();
+  const tenantId=Number(req.auth.tenant_id||req.body?.tenant_id),deviceToken=String(req.get('X-PatrolSync-Device')||'').trim();
+  const emergency=req.path==='/api/sos',action=trustedDeviceAction(req);
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{
+    const result=await withTenant(tenantId,async client=>{
+      const settings=await identitySettings(client,tenantId);
+      let device=null,outcome='not_required',reason='Identity assurance is disabled';
+      if(settings.enabled){
+        if(!deviceToken){outcome='missing_device';reason='This browser has no device identifier'}
+        else{
+          const hash=identityDeviceHash(tenantId,req.auth.user_id,deviceToken);
+          device=(await client.query(`SELECT id,status,device_name FROM guard_trusted_devices WHERE tenant_id=$1 AND user_id=$2 AND device_hash=$3`,[tenantId,req.auth.user_id,hash])).rows[0]||null;
+          if(!device){outcome='unregistered';reason='This device has not been enrolled'}
+          else if(device.status==='trusted'){outcome='verified';reason='Trusted device verified'}
+          else{outcome=device.status;reason=device.status==='pending'?'Device approval is pending':'Device trust has been revoked'}
+          if(device)await client.query(`UPDATE guard_trusted_devices SET last_seen_at=NOW(),updated_at=NOW() WHERE id=$1`,[device.id]);
+        }
+      }
+      const mode=emergency?'emergency_fallback':(settings.enabled&&settings.require_trusted_device?'enforce':'observe');
+      await client.query(`INSERT INTO identity_verification_events(tenant_id,user_id,device_id,action_type,resource_type,outcome,enforcement_mode,reason,request_id,ip_address) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[tenantId,req.auth.user_id,device?.id||null,action.action,action.resource,outcome,mode,reason,req.requestId||null,requestIp(req)]);
+      return{settings,outcome,reason,mode};
+    });
+    req.identityVerification=result;
+    if(!emergency&&result.settings.enabled&&result.settings.require_trusted_device&&result.outcome!=='verified')return res.status(403).json({error:`Trusted device required: ${result.reason}`,code:'TRUSTED_DEVICE_REQUIRED',identity_assurance:result});
+    next();
+  }catch(err){
+    console.error('Trusted-device verification failed:',err);
+    if(emergency)return next();
+    res.status(503).json({error:'Identity verification is temporarily unavailable',code:'IDENTITY_VERIFICATION_UNAVAILABLE'});
+  }
+}
 app.get('/api/identity-assurance/settings',requireAuth,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!['admin','staff','guard'].includes(req.auth.role))return res.status(403).json({error:'Identity assurance unavailable'});try{const settings=await withTenant(tenantId,c=>identitySettings(c,tenantId));res.json(settings)}catch(err){res.status(500).json({error:err.message})}});
 app.put('/api/identity-assurance/settings',requireAuth,requireOwnerAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),version=String(req.body.consent_version||'').trim(),notice=String(req.body.policy_notice||'').trim(),retention=Number(req.body.retention_days);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!version||!notice||notice.length>2000||!Number.isInteger(retention)||retention<7||retention>730)return res.status(400).json({error:'Consent version, policy notice, and retention of 7–730 days are required'});try{const result=await withTenant(tenantId,c=>c.query(`INSERT INTO identity_assurance_settings(tenant_id,enabled,require_trusted_device,consent_version,retention_days,policy_notice,updated_by_user_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id) DO UPDATE SET enabled=EXCLUDED.enabled,require_trusted_device=EXCLUDED.require_trusted_device,consent_version=EXCLUDED.consent_version,retention_days=EXCLUDED.retention_days,policy_notice=EXCLUDED.policy_notice,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW() RETURNING *`,[tenantId,Boolean(req.body.enabled),Boolean(req.body.require_trusted_device),version,retention,notice,req.auth.user_id]));res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}});
 app.get('/api/identity-assurance/devices',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const rows=await withTenant(tenantId,c=>c.query(`SELECT d.id,d.user_id,u.email guard_email,d.device_name,d.platform,d.status,d.consent_version,d.consented_at,d.approved_at,d.revoked_at,d.last_seen_at,d.created_at,approver.email approved_by_email,revoker.email revoked_by_email FROM guard_trusted_devices d JOIN users u ON u.id=d.user_id AND u.tenant_id=d.tenant_id LEFT JOIN users approver ON approver.id=d.approved_by_user_id AND approver.tenant_id=d.tenant_id LEFT JOIN users revoker ON revoker.id=d.revoked_by_user_id AND revoker.tenant_id=d.tenant_id WHERE d.tenant_id=$1 ORDER BY CASE d.status WHEN 'pending' THEN 1 WHEN 'trusted' THEN 2 ELSE 3 END,d.created_at DESC`,[tenantId]));res.json(rows.rows)}catch(err){res.status(500).json({error:err.message})}});
+app.get('/api/identity-assurance/events',requireAuth,requireAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.query.tenant_id),limit=Math.min(200,Math.max(1,Number(req.query.limit)||100));if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const result=await withTenant(tenantId,c=>c.query(`SELECT e.id,e.action_type,e.resource_type,e.outcome,e.enforcement_mode,e.reason,e.request_id,e.ip_address,e.created_at,u.email guard_email,d.device_name FROM identity_verification_events e JOIN users u ON u.id=e.user_id AND u.tenant_id=e.tenant_id LEFT JOIN guard_trusted_devices d ON d.id=e.device_id AND d.tenant_id=e.tenant_id WHERE e.tenant_id=$1 ORDER BY e.created_at DESC LIMIT $2`,[tenantId,limit]));res.json(result.rows)}catch(err){res.status(500).json({error:err.message})}});
 app.patch('/api/identity-assurance/devices/:id/status',requireAuth,requireOwnerAdmin,async(req,res)=>{const tenantId=communicationTenant(req,req.body.tenant_id),id=Number(req.params.id),status=String(req.body.status||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(!id||!['trusted','revoked'].includes(status))return res.status(400).json({error:'Valid device and status are required'});try{const result=await withTenant(tenantId,c=>c.query(`UPDATE guard_trusted_devices SET status=$3,approved_by_user_id=CASE WHEN $3='trusted' THEN $4 ELSE approved_by_user_id END,approved_at=CASE WHEN $3='trusted' THEN NOW() ELSE approved_at END,revoked_by_user_id=CASE WHEN $3='revoked' THEN $4 ELSE NULL END,revoked_at=CASE WHEN $3='revoked' THEN NOW() ELSE NULL END,updated_at=NOW() WHERE id=$1 AND tenant_id=$2 RETURNING id,user_id,device_name,status,approved_at,revoked_at`,[id,tenantId,status,req.auth.user_id]));if(!result.rowCount)return res.status(404).json({error:'Device registration not found'});res.json(result.rows[0])}catch(err){res.status(500).json({error:err.message})}});
 app.get('/api/guard/identity-assurance',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.query.tenant_id),deviceId=String(req.query.device_id||'');if(!tenantId)return res.status(403).json({error:'Tenant access denied'});try{const data=await withTenant(tenantId,async c=>{const settings=await identitySettings(c,tenantId);let device=null;if(deviceId){const hash=identityDeviceHash(tenantId,req.auth.user_id,deviceId);device=(await c.query(`SELECT id,device_name,platform,status,consent_version,consented_at,approved_at,revoked_at,last_seen_at FROM guard_trusted_devices WHERE tenant_id=$1 AND user_id=$2 AND device_hash=$3`,[tenantId,req.auth.user_id,hash])).rows[0]||null;if(device)await c.query(`UPDATE guard_trusted_devices SET last_seen_at=NOW() WHERE id=$1`,[device.id])}return{settings,device}});res.json(data)}catch(err){res.status(500).json({error:err.message})}});
 app.post('/api/guard/identity-assurance/enrol',requireAuth,async(req,res)=>{if(req.auth.role!=='guard')return res.status(403).json({error:'Guard access required'});const tenantId=communicationTenant(req,req.body.tenant_id),deviceId=String(req.body.device_id||''),name=String(req.body.device_name||'').trim();if(!tenantId)return res.status(403).json({error:'Tenant access denied'});if(req.body.consent_accepted!==true||deviceId.length<16||!name)return res.status(400).json({error:'Explicit consent, a device identifier, and device name are required'});try{const saved=await withTenant(tenantId,async c=>{const settings=await identitySettings(c,tenantId);if(!settings.enabled)throw Object.assign(new Error('Identity assurance is not enabled by your company'),{statusCode:409});const hash=identityDeviceHash(tenantId,req.auth.user_id,deviceId);return c.query(`INSERT INTO guard_trusted_devices(tenant_id,user_id,device_hash,device_name,platform,user_agent,status,consent_version,consented_at) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,NOW()) ON CONFLICT(tenant_id,user_id,device_hash) DO UPDATE SET device_name=EXCLUDED.device_name,platform=EXCLUDED.platform,user_agent=EXCLUDED.user_agent,status=CASE WHEN guard_trusted_devices.status='revoked' THEN 'pending' ELSE guard_trusted_devices.status END,consent_version=EXCLUDED.consent_version,consented_at=NOW(),revoked_by_user_id=NULL,revoked_at=NULL,last_seen_at=NOW(),updated_at=NOW() RETURNING id,device_name,platform,status,consent_version,consented_at,approved_at`,[tenantId,req.auth.user_id,hash,name,String(req.body.platform||'').slice(0,200)||null,String(req.body.user_agent||'').slice(0,500)||null,settings.consent_version])});res.status(201).json(saved.rows[0])}catch(err){res.status(err.statusCode||500).json({error:err.message})}});

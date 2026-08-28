@@ -6695,6 +6695,16 @@ function aiRelevantModules(question){
 function responseText(payload){
   return String(payload?.output_text||payload?.output?.flatMap(item=>item?.content||[]).find(item=>item?.type==='output_text')?.text||'').trim();
 }
+function aiAssistantPublicError(err){
+  const code=String(err?.code||'assistant_error').toLowerCase();
+  if(['invalid_api_key','incorrect_api_key'].includes(code))return{code,message:'The OpenAI API key is invalid or has been revoked. Replace OPENAI_API_KEY in Render and redeploy.'};
+  if(['insufficient_quota','billing_hard_limit_reached'].includes(code))return{code,message:'The OpenAI API project has no available credit or has reached its billing limit. Check API billing, then try again.'};
+  if(['model_not_found','model_not_available','permission_denied'].includes(code))return{code,message:`The configured OpenAI model (${OPENAI_MODEL}) is unavailable to this API project. Check OPENAI_MODEL and project access.`};
+  if(['rate_limit_exceeded','tokens'].includes(code)||Number(err?.providerStatus)===429)return{code,message:'The OpenAI API rate limit was reached. Wait briefly and try again.'};
+  if(Number(err?.providerStatus)>=500)return{code,message:'OpenAI is temporarily unavailable. Try again shortly.'};
+  if(/^42|^22|^23|^28|^40|^53|^57|^58/.test(code))return{code,message:`PatrolSync could not prepare the aggregate assistant context. Diagnostic code: ${code}.`};
+  return{code,message:`The assistant request could not be completed. Diagnostic code: ${code}.`};
+}
 async function ensureAiAssistantSchema(){
   await pool.query(`CREATE TABLE IF NOT EXISTS ai_assistant_audit(
     id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,
@@ -6735,13 +6745,15 @@ app.post('/api/ai-assistant/chat',requireAuth,requireOwnerAdmin,aiAssistantRateL
     const input=`Aggregate company context (counts only):\n${JSON.stringify(context)}\n\nAvailable PatrolSync modules:\n${catalogue}\n\nAdministrator question:\n${question}`;
     const apiResponse=await fetch('https://api.openai.com/v1/responses',{method:'POST',headers:{'Authorization':`Bearer ${OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:OPENAI_MODEL,instructions,input,max_output_tokens:700,store:false,safety_identifier:crypto.createHash('sha256').update(`${tenantId}:${req.auth.user_id}`).digest('hex')})});
     const payload=await apiResponse.json().catch(()=>({}));
-    if(!apiResponse.ok)throw Object.assign(new Error(payload?.error?.message||'AI provider request failed'),{code:payload?.error?.code||`http_${apiResponse.status}`,statusCode:502});
+    if(!apiResponse.ok)throw Object.assign(new Error(payload?.error?.message||'AI provider request failed'),{code:payload?.error?.code||payload?.error?.type||`http_${apiResponse.status}`,statusCode:502,providerStatus:apiResponse.status});
     const answer=responseText(payload);if(!answer)throw Object.assign(new Error('The assistant returned an empty response'),{code:'empty_response',statusCode:502});
     await withTenant(tenantId,c=>c.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,response_hash,matched_modules,model,status,input_tokens,output_tokens,request_id) VALUES($1,$2,$3,$4,$5::jsonb,$6,'completed',$7,$8,$9)`,[tenantId,req.auth.user_id,questionHash,crypto.createHash('sha256').update(answer).digest('hex'),JSON.stringify(matched),OPENAI_MODEL,payload.usage?.input_tokens||null,payload.usage?.output_tokens||null,req.requestId||null]));
     res.json({answer,modules:matched,mode:'read_only_advisory',request_id:req.requestId||null});
   }catch(err){
     await withTenant(tenantId,c=>c.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,matched_modules,model,status,error_code,request_id) VALUES($1,$2,$3,$4::jsonb,$5,'failed',$6,$7)`,[tenantId,req.auth.user_id,questionHash,JSON.stringify(matched),OPENAI_MODEL,String(err.code||'provider_error').slice(0,100),req.requestId||null])).catch(()=>{});
-    res.status(err.statusCode||500).json({error:err.statusCode===502?'The assistant is temporarily unavailable. No PatrolSync records were changed.':err.message});
+    const safe=aiAssistantPublicError(err);
+    console.error('Operations assistant request failed',{request_id:req.requestId||null,tenant_id:tenantId,provider_status:err.providerStatus||null,error_code:safe.code,message:err.message});
+    res.status(err.statusCode||500).json({error:`${safe.message} No PatrolSync records were changed.`,diagnostic_code:safe.code,request_id:req.requestId||null});
   }
 });
 

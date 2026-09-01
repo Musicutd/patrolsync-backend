@@ -6914,6 +6914,73 @@ app.get('/api/launch/browser-offline-acceptance',requireAuth,requireOwnerAdmin,a
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
 });
 
+// ------------------------ STAGE 13.1: PILOT OPERATIONS REGISTER ------------------------
+async function ensurePilotOperationsSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS pilot_operations_reviews(
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id INTEGER NOT NULL,
+    review_date DATE NOT NULL,
+    operational_status TEXT NOT NULL CHECK(operational_status IN('green','amber','red')),
+    platform_health TEXT NOT NULL CHECK(platform_health IN('pass','issue','not_tested')),
+    admin_workflow TEXT NOT NULL CHECK(admin_workflow IN('pass','issue','not_tested')),
+    guard_workflow TEXT NOT NULL CHECK(guard_workflow IN('pass','issue','not_tested')),
+    client_workflow TEXT NOT NULL CHECK(client_workflow IN('pass','issue','not_tested')),
+    offline_sync TEXT NOT NULL CHECK(offline_sync IN('pass','issue','not_tested')),
+    emergency_workflow TEXT NOT NULL CHECK(emergency_workflow IN('pass','issue','not_tested')),
+    incident_count INTEGER NOT NULL DEFAULT 0 CHECK(incident_count>=0),
+    support_issue_count INTEGER NOT NULL DEFAULT 0 CHECK(support_issue_count>=0),
+    critical_failure_count INTEGER NOT NULL DEFAULT 0 CHECK(critical_failure_count>=0),
+    rollback_signal BOOLEAN NOT NULL DEFAULT FALSE,
+    rollback_reason TEXT,
+    decision TEXT NOT NULL CHECK(decision IN('continue','monitor','pause','recommend_rollback')),
+    summary TEXT NOT NULL,
+    corrective_actions TEXT,
+    created_by_user_id INTEGER,
+    created_by_email TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS pilot_operations_reviews_tenant_date ON pilot_operations_reviews(tenant_id,review_date DESC,created_at DESC)`);
+  await pool.query(`ALTER TABLE pilot_operations_reviews ENABLE ROW LEVEL SECURITY`);
+  await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON pilot_operations_reviews`);
+  await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON pilot_operations_reviews USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
+  const tenantRole=quotedRoleFromTenantUrl();if(tenantRole){await pool.query(`GRANT SELECT,INSERT ON pilot_operations_reviews TO ${tenantRole}`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE pilot_operations_reviews_id_seq TO ${tenantRole}`)}
+  console.log('Pilot operations register ready');
+}
+ensurePilotOperationsSchema().catch(e=>console.error('Pilot operations schema setup failed:',e.message));
+
+app.get('/api/launch/production-pilot/operations',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{
+    const data=await withTenant(tenantId,async c=>{
+      const [pilotResult,reviewsResult]=await Promise.all([
+        c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_3_pilot_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId]),
+        c.query(`SELECT * FROM pilot_operations_reviews WHERE tenant_id=$1 ORDER BY review_date DESC,created_at DESC LIMIT 100`,[tenantId])
+      ]);return{pilot:pilotResult.rows[0]||null,reviews:reviewsResult.rows};
+    });
+    if(!data.pilot)return res.status(409).json({error:'Save the Stage 12.3 controlled pilot plan before recording operations reviews'});
+    const pilot=data.pilot.details||{},start=new Date(`${pilot.planned_start}T00:00:00Z`),duration=Math.max(1,Number(pilot.duration_days||14)),end=new Date(start.getTime()+(duration-1)*86400000),today=new Date(),elapsed=today<start?0:Math.min(duration,Math.floor((Date.UTC(today.getUTCFullYear(),today.getUTCMonth(),today.getUTCDate())-start.getTime())/86400000)+1),reviewDays=new Set(data.reviews.map(x=>String(x.review_date).slice(0,10))).size;
+    const summary={reviews:data.reviews.length,review_days:reviewDays,expected_days:elapsed,green:data.reviews.filter(x=>x.operational_status==='green').length,amber:data.reviews.filter(x=>x.operational_status==='amber').length,red:data.reviews.filter(x=>x.operational_status==='red').length,rollback_signals:data.reviews.filter(x=>x.rollback_signal).length,critical_failures:data.reviews.reduce((n,x)=>n+Number(x.critical_failure_count||0),0),support_issues:data.reviews.reduce((n,x)=>n+Number(x.support_issue_count||0),0)};
+    res.json({pilot:{...pilot,recorded_at:data.pilot.created_at,end_date:end.toISOString().slice(0,10),status:today<start?'scheduled':today>end?'completed_window':'active'},summary,reviews:data.reviews});
+  }catch(e){res.status(500).json({error:e.message,request_id:req.requestId||null})}
+});
+
+app.post('/api/launch/production-pilot/operations',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  const allowedState=new Set(['pass','issue','not_tested']),allowedDecision=new Set(['continue','monitor','pause','recommend_rollback']),reviewDate=String(req.body.review_date||'').trim(),status=String(req.body.operational_status||'').trim(),decision=String(req.body.decision||'').trim(),summary=String(req.body.summary||'').trim().slice(0,3000),actions=String(req.body.corrective_actions||'').trim().slice(0,3000),rollback=Boolean(req.body.rollback_signal),rollbackReason=String(req.body.rollback_reason||'').trim().slice(0,2000),states=['platform_health','admin_workflow','guard_workflow','client_workflow','offline_sync','emergency_workflow'];
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(reviewDate)||Number.isNaN(Date.parse(reviewDate+'T00:00:00Z')))return res.status(400).json({error:'Choose a valid review date'});
+  if(reviewDate>new Date().toISOString().slice(0,10))return res.status(400).json({error:'Future pilot reviews cannot be recorded'});
+  if(!['green','amber','red'].includes(status)||!allowedDecision.has(decision)||states.some(k=>!allowedState.has(String(req.body[k]||''))))return res.status(400).json({error:'Choose valid operational, workflow, and decision statuses'});
+  if(!summary)return res.status(400).json({error:'Daily review summary is required'});if(rollback&&!rollbackReason)return res.status(400).json({error:'Explain the rollback signal before saving'});
+  const counts=['incident_count','support_issue_count','critical_failure_count'].map(k=>Number(req.body[k]||0));if(counts.some(n=>!Number.isInteger(n)||n<0||n>100000))return res.status(400).json({error:'Incident, support, and critical-failure counts must be non-negative whole numbers'});
+  try{
+    const saved=await withTenant(tenantId,async c=>{
+      const plan=(await c.query(`SELECT details FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_3_pilot_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId])).rows[0]?.details;if(!plan)throw Object.assign(new Error('Save the Stage 12.3 controlled pilot plan first'),{statusCode:409});
+      const start=String(plan.planned_start),end=new Date(Date.parse(start+'T00:00:00Z')+(Math.max(1,Number(plan.duration_days||14))-1)*86400000).toISOString().slice(0,10);if(reviewDate<start||reviewDate>end)throw Object.assign(new Error(`Review date must be within the controlled pilot window: ${start} to ${end}`),{statusCode:400});
+      return c.query(`INSERT INTO pilot_operations_reviews(tenant_id,review_date,operational_status,platform_health,admin_workflow,guard_workflow,client_workflow,offline_sync,emergency_workflow,incident_count,support_issue_count,critical_failure_count,rollback_signal,rollback_reason,decision,summary,corrective_actions,created_by_user_id,created_by_email) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,[tenantId,reviewDate,status,...states.map(k=>String(req.body[k])),...counts,rollback,rollbackReason||null,decision,summary,actions||null,req.auth.user_id,req.auth.email||null]);
+    });res.status(201).json({message:'Pilot operations review recorded. No production action was performed.',review:saved.rows[0]});
+  }catch(e){res.status(e.statusCode||500).json({error:e.message,request_id:req.requestId||null})}
+});
+
 const PILOT_ACCEPTANCE_REQUIRED=['pilot_owner_email','support_contact_email','rollback_owner_email','planned_start','rollback_trigger'];
 app.post('/api/launch/production-pilot/evidence',requireAuth,requireOwnerAdmin,async(req,res)=>{
   const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});

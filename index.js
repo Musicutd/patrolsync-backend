@@ -6945,7 +6945,7 @@ app.get('/api/launch/production-pilot-readiness',requireAuth,requireOwnerAdmin,a
           c.query(`SELECT COUNT(*) FILTER(WHERE role='admin' AND COALESCE(account_active,TRUE))::int admins,COUNT(*) FILTER(WHERE role='guard' AND COALESCE(account_active,TRUE))::int guards,COUNT(*) FILTER(WHERE role='staff' AND COALESCE(account_active,TRUE))::int staff FROM users WHERE tenant_id=$1`,[tenantId]),
           c.query(`SELECT COUNT(DISTINCT ga.user_id)::int assigned FROM guard_assignments ga JOIN users u ON u.id=ga.user_id AND u.tenant_id=ga.tenant_id WHERE ga.tenant_id=$1 AND u.role='guard' AND COALESCE(u.account_active,TRUE)`,[tenantId]),
           c.query(`SELECT COUNT(*) FILTER(WHERE offline_captured=TRUE AND client_scan_id IS NOT NULL AND device_scanned_at IS NOT NULL)::int offline_scans FROM patrol_logs WHERE tenant_id=$1`,[tenantId]),
-          c.query(`SELECT COUNT(*) FILTER(WHERE captured_offline=TRUE)::int offline_incidents FROM incidents WHERE tenant_id=$1`,[tenantId]),
+          c.query(`SELECT COUNT(*) FILTER(WHERE offline_captured=TRUE AND client_incident_id IS NOT NULL AND device_reported_at IS NOT NULL AND device_id IS NOT NULL)::int offline_incidents FROM incidents WHERE tenant_id=$1`,[tenantId]),
           c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_2_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId]),
           c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_3_pilot_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId]),
           c.query(`SELECT COUNT(*)::int count FROM audit_logs WHERE tenant_id=$1`,[tenantId])

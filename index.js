@@ -6914,6 +6914,63 @@ app.get('/api/launch/browser-offline-acceptance',requireAuth,requireOwnerAdmin,a
   }catch(err){res.status(500).json({error:err.message,request_id:req.requestId||null})}
 });
 
+const PILOT_ACCEPTANCE_REQUIRED=['pilot_owner_email','support_contact_email','rollback_owner_email','planned_start','rollback_trigger'];
+app.post('/api/launch/production-pilot/evidence',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.body.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  try{
+    const clean=(value,max=500)=>String(value||'').trim().slice(0,max),email=value=>clean(value,320).toLowerCase();
+    const details={pilot_name:clean(req.body.pilot_name||'Controlled production pilot',200),pilot_owner_email:email(req.body.pilot_owner_email),support_contact_email:email(req.body.support_contact_email),rollback_owner_email:email(req.body.rollback_owner_email),planned_start:clean(req.body.planned_start,20),duration_days:Math.min(90,Math.max(1,Number(req.body.duration_days||14))),rollback_trigger:clean(req.body.rollback_trigger,1200),notes:clean(req.body.notes,2000),scope_acknowledged:req.body.scope_acknowledged===true,accepted_by_user_id:req.auth.user_id,accepted_by_email:req.auth.email||null,user_agent:String(req.headers['user-agent']||'').slice(0,500)};
+    const missing=PILOT_ACCEPTANCE_REQUIRED.filter(key=>!details[key]);if(missing.length)return res.status(400).json({error:`Complete the required pilot fields: ${missing.join(', ')}`});
+    for(const key of ['pilot_owner_email','support_contact_email','rollback_owner_email'])if(!/^\S+@\S+\.\S+$/.test(details[key]))return res.status(400).json({error:`Enter a valid ${key.replaceAll('_',' ')}`});
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(details.planned_start)||Number.isNaN(Date.parse(details.planned_start+'T00:00:00Z')))return res.status(400).json({error:'Choose a valid planned pilot start date'});
+    if(!details.scope_acknowledged)return res.status(400).json({error:'Confirm that this is a controlled pilot and does not enable an automatic public rollout'});
+    const saved=await withTenant(tenantId,c=>c.query(`INSERT INTO system_events(tenant_id,event_type,severity,message,details,request_id) VALUES($1,'stage_12_3_pilot_acceptance','info','Controlled production pilot evidence recorded',$2::jsonb,$3) RETURNING id,created_at`,[tenantId,JSON.stringify(details),req.requestId||null]));
+    res.json({message:'Controlled pilot evidence saved.',event:saved.rows[0]});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.get('/api/launch/production-pilot-readiness',requireAuth,requireOwnerAdmin,async(req,res)=>{
+  const tenantId=attendanceTenant(req,req.query.tenant_id);if(!tenantId)return res.status(403).json({error:'Tenant access denied'});const started=Date.now();
+  try{
+    const checks=[],add=(key,label,passed,message,critical=true,details={})=>checks.push({key,label,passed:Boolean(passed),critical,status:passed?'pass':critical?'fail':'warning',message,details});
+    const [globalData,tenantData]=await Promise.all([
+      Promise.all([
+        pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE c.relrowsecurity)::int enabled,COUNT(*) FILTER(WHERE EXISTS(SELECT 1 FROM pg_policies p WHERE p.schemaname=n.nspname AND p.tablename=c.relname))::int protected FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped WHERE n.nspname='public' AND c.relkind IN('r','p')`),
+        pool.query(`SELECT COUNT(*) FILTER(WHERE status='failed' AND started_at>=NOW()-INTERVAL '24 hours')::int failed,COUNT(*) FILTER(WHERE status='running' AND started_at<NOW()-INTERVAL '10 minutes')::int stuck FROM platform_job_runs`),
+        pool.query(`SELECT (SELECT COUNT(*) FROM webhook_deliveries WHERE status IN('queued','failed') AND attempts<5)::int webhooks,(SELECT COUNT(*) FROM email_deliveries WHERE status IN('queued','failed') AND attempt_count<5)::int emails`),
+        pool.query(`SELECT backup_verified_at,monitoring_verified_at,monitoring_endpoint FROM platform_launch_attestations WHERE id=1`)
+      ]),
+      withTenant(tenantId,async c=>{
+        const results=await Promise.all([
+          c.query(`SELECT COUNT(*) FILTER(WHERE role='admin' AND COALESCE(account_active,TRUE))::int admins,COUNT(*) FILTER(WHERE role='guard' AND COALESCE(account_active,TRUE))::int guards,COUNT(*) FILTER(WHERE role='staff' AND COALESCE(account_active,TRUE))::int staff FROM users WHERE tenant_id=$1`,[tenantId]),
+          c.query(`SELECT COUNT(DISTINCT ga.user_id)::int assigned FROM guard_assignments ga JOIN users u ON u.id=ga.user_id AND u.tenant_id=ga.tenant_id WHERE ga.tenant_id=$1 AND u.role='guard' AND COALESCE(u.account_active,TRUE)`,[tenantId]),
+          c.query(`SELECT COUNT(*) FILTER(WHERE client_created_at IS NOT NULL AND sync_status='synced')::int offline_scans FROM patrol_logs WHERE tenant_id=$1`+(await columnExists('patrol_logs','client_scan_id')?` AND client_scan_id IS NOT NULL`:``),[tenantId]),
+          c.query(`SELECT COUNT(*) FILTER(WHERE captured_offline=TRUE)::int offline_incidents FROM incidents WHERE tenant_id=$1`,[tenantId]),
+          c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_2_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId]),
+          c.query(`SELECT id,details,created_at FROM system_events WHERE tenant_id=$1 AND event_type='stage_12_3_pilot_acceptance' ORDER BY created_at DESC LIMIT 1`,[tenantId]),
+          c.query(`SELECT COUNT(*)::int count FROM audit_logs WHERE tenant_id=$1`,[tenantId])
+        ]);return{roles:results[0].rows[0],assigned:results[1].rows[0],scans:results[2].rows[0],incidents:results[3].rows[0],browser:results[4].rows[0]||null,pilot:results[5].rows[0]||null,audit:results[6].rows[0]};
+      })
+    ]);
+    const [rlsResult,jobsResult,queuesResult,attestationResult]=globalData,rls=rlsResult.rows[0],jobs=jobsResult.rows[0],queues=queuesResult.rows[0],attestation=attestationResult.rows[0]||{};
+    add('roles','Production role coverage',Number(tenantData.roles.admins)>0&&Number(tenantData.roles.guards)>0,`${tenantData.roles.admins} administrator(s), ${tenantData.roles.guards} guard(s), ${tenantData.roles.staff} delegated staff account(s)`,true,tenantData.roles);
+    add('assignments','Guard assignment readiness',Number(tenantData.roles.guards)>0&&Number(tenantData.assigned.assigned)===Number(tenantData.roles.guards),`${tenantData.assigned.assigned}/${tenantData.roles.guards} active guard(s) assigned to a site`,true,tenantData.assigned);
+    const browserAge=tenantData.browser?(Date.now()-new Date(tenantData.browser.created_at).getTime())/86400000:null,browserManual=tenantData.browser?.details?.manual||{},browserComplete=tenantData.browser&&browserAge<=30&&BROWSER_ACCEPTANCE_MANUAL.every(key=>browserManual[key]===true);
+    add('browser_acceptance','Browser, mobile and offline acceptance',browserComplete,browserComplete?`Complete acceptance recorded ${new Date(tenantData.browser.created_at).toISOString()}`:'Complete and save all Stage 12.2 acceptance items within the last 30 days',true,{created_at:tenantData.browser?.created_at||null,age_days:browserAge,manual:browserManual});
+    add('offline_evidence','Production offline evidence',Number(tenantData.scans.offline_scans)>0&&Number(tenantData.incidents.offline_incidents)>0,`${tenantData.scans.offline_scans} synchronized offline patrol scan(s); ${tenantData.incidents.offline_incidents} offline incident(s)`,true,{...tenantData.scans,...tenantData.incidents});
+    add('tenant_protection','Tenant RLS protection',Number(rls.total)>0&&Number(rls.enabled)===Number(rls.total)&&Number(rls.protected)===Number(rls.total),`${rls.protected}/${rls.total} tenant tables protected; ${rls.enabled}/${rls.total} have RLS enabled`,true,rls);
+    add('job_health','Background-job health',Number(jobs.failed)===0&&Number(jobs.stuck)===0,`${jobs.failed} failed in 24 hours; ${jobs.stuck} stuck`,true,jobs);
+    add('delivery_backlog','Delivery backlog',Number(queues.webhooks)===0&&Number(queues.emails)===0,`${queues.webhooks} webhook and ${queues.emails} email delivery item(s) queued for retry`,false,queues);
+    const backupFresh=attestation.backup_verified_at&&Date.now()-new Date(attestation.backup_verified_at).getTime()<=30*86400000;
+    add('recovery_monitoring','Recovery and monitoring evidence',backupFresh&&Boolean(attestation.monitoring_verified_at),backupFresh&&attestation.monitoring_verified_at?`Backup is current and health monitoring is confirmed at ${attestation.monitoring_endpoint||'/health'}`:'Refresh platform backup evidence and confirm production monitoring',true,{backup_verified_at:attestation.backup_verified_at,monitoring_verified_at:attestation.monitoring_verified_at,monitoring_endpoint:attestation.monitoring_endpoint});
+    const pilot=tenantData.pilot?.details||{},pilotAge=tenantData.pilot?(Date.now()-new Date(tenantData.pilot.created_at).getTime())/86400000:null,pilotComplete=tenantData.pilot&&pilotAge<=30&&PILOT_ACCEPTANCE_REQUIRED.every(key=>Boolean(pilot[key]))&&pilot.scope_acknowledged===true;
+    add('pilot_plan','Controlled pilot plan',pilotComplete,pilotComplete?`${pilot.pilot_name||'Controlled pilot'} starts ${pilot.planned_start} for ${pilot.duration_days||14} day(s)`:'Save a named owner, support contact, rollback owner and rollback trigger for the controlled pilot',true,{event_id:tenantData.pilot?.id||null,created_at:tenantData.pilot?.created_at||null,pilot});
+    add('auditability','Operational auditability',Number(tenantData.audit.count)>0,`${tenantData.audit.count} subscriber audit record(s) available for pilot review`,true,tenantData.audit);
+    const failures=checks.filter(x=>x.status==='fail').length,warnings=checks.filter(x=>x.status==='warning').length,passed=checks.filter(x=>x.status==='pass').length;
+    res.json({status:failures?'action_required':warnings?'ready_with_warnings':'stage_12_3_ready',label:failures?'ACTION REQUIRED':warnings?'READY WITH WARNINGS':'STAGE 12.3 READY',completed_at:new Date().toISOString(),duration_ms:Date.now()-started,summary:{passed,warnings,failures,total:checks.length},pilot:tenantData.pilot?{...pilot,recorded_at:tenantData.pilot.created_at}:null,checks});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
 // ------------------------ SERVER START ------------------------
 
 const server=app.listen(PORT, () => {

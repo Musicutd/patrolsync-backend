@@ -112,6 +112,7 @@ const backgroundJobs = new Map();
 const backgroundTimers = [];
 async function ensureBackgroundJobSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_job_runs(id BIGSERIAL PRIMARY KEY,job_name TEXT NOT NULL,instance_id TEXT NOT NULL,status TEXT NOT NULL,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,duration_ms INTEGER,error_message TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_job_runs_name_started ON platform_job_runs(job_name,started_at DESC)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_job_runs_failures ON platform_job_runs(started_at DESC) WHERE status='failed'`);const reconciled=await pool.query(`UPDATE platform_job_runs SET status='interrupted',finished_at=NOW(),duration_ms=GREATEST(0,FLOOR(EXTRACT(EPOCH FROM(NOW()-started_at))*1000)::int),error_message=COALESCE(error_message,'Previous instance stopped before recording completion') WHERE status='running' AND started_at<NOW()-INTERVAL '10 minutes' RETURNING id`);console.log(`Background job history ready; ${reconciled.rowCount} stale run(s) reconciled`)}
 async function ensureLoadTestSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_load_tests(id BIGSERIAL PRIMARY KEY,platform_admin_id BIGINT,scenario TEXT NOT NULL,tenant_id INTEGER,concurrency INTEGER NOT NULL,duration_seconds INTEGER NOT NULL,status TEXT NOT NULL,started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),finished_at TIMESTAMPTZ,total_requests INTEGER NOT NULL DEFAULT 0,successful_requests INTEGER NOT NULL DEFAULT 0,failed_requests INTEGER NOT NULL DEFAULT 0,requests_per_second NUMERIC,p50_ms INTEGER,p95_ms INTEGER,p99_ms INTEGER,max_ms INTEGER,error_summary JSONB NOT NULL DEFAULT '[]'::jsonb,instance_id TEXT NOT NULL)`);await pool.query(`ALTER TABLE platform_load_tests ENABLE ROW LEVEL SECURITY`);await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON platform_load_tests`);await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON platform_load_tests USING(tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK(tenant_id=current_setting('app.current_tenant',TRUE)::int)`);await pool.query(`CREATE INDEX IF NOT EXISTS idx_platform_load_tests_started ON platform_load_tests(started_at DESC)`);console.log('Load-test history ready')}
+async function ensureFreeAccessCodeSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_free_access_codes(id UUID PRIMARY KEY,code_hash TEXT NOT NULL UNIQUE,code_prefix TEXT NOT NULL,label TEXT NOT NULL,plan_code TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active' CHECK(status IN('active','redeemed','revoked')),issued_by_platform_admin_id BIGINT,redeemed_tenant_id INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),redeemed_at TIMESTAMPTZ,revoked_at TIMESTAMPTZ,revoked_by_platform_admin_id BIGINT,revocation_reason TEXT)`);await pool.query(`CREATE INDEX IF NOT EXISTS platform_free_access_codes_status_created ON platform_free_access_codes(status,created_at DESC)`);await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS platform_free_access_codes_redeemed_tenant ON platform_free_access_codes(redeemed_tenant_id) WHERE redeemed_tenant_id IS NOT NULL AND status<>'revoked'`);console.log('Free-access code register ready')}
 const BACKGROUND_INSTANCE_ID=String(process.env.RENDER_INSTANCE_ID||process.env.HOSTNAME||crypto.randomUUID()).slice(0,150);
 async function runBackgroundJob(name,fn,trigger='schedule'){
   const lockClient=await pool.connect();let locked=false,runId=null,started=Date.now();
@@ -128,6 +129,7 @@ async function runBackgroundJob(name,fn,trigger='schedule'){
 function scheduleBackgroundJob(name,intervalMs,initialDelayMs,fn){backgroundJobs.set(name,{name,interval_ms:intervalMs,fn});const execute=()=>{if(!runtimeState.draining)runBackgroundJob(name,fn).catch(e=>console.error(`Job ${name} runner failed:`,e.message))};const interval=setInterval(execute,intervalMs),initial=setTimeout(execute,initialDelayMs);backgroundTimers.push({type:'interval',handle:interval},{type:'timeout',handle:initial})}
 ensureBackgroundJobSchema().catch(e=>console.error('Background job schema setup failed:',e.message));
 ensureLoadTestSchema().catch(e=>console.error('Load-test schema setup failed:',e.message));
+ensureFreeAccessCodeSchema().catch(e=>console.error('Free-access code schema setup failed:',e.message));
 function percentile(values,percentage){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b);return sorted[Math.min(sorted.length-1,Math.max(0,Math.ceil((percentage/100)*sorted.length)-1))]}
 function trimPerformanceSamples(now=Date.now()){const cutoff=now-PERFORMANCE_SAMPLE_WINDOW_MS;while(performanceSamples.length&&performanceSamples[0].finished_at<cutoff)performanceSamples.shift();if(performanceSamples.length>PERFORMANCE_MAX_SAMPLES)performanceSamples.splice(0,performanceSamples.length-PERFORMANCE_MAX_SAMPLES)}
 
@@ -2442,14 +2444,25 @@ app.patch('/api/tenants/:id/emergency-contacts', requireAuth, requireAdmin, asyn
   }
 });
 
+// ------------------------ PLATFORM FREE-ACCESS CODES ------------------------
+function normalizeFreeAccessCode(value){return String(value||'').trim().toUpperCase().replace(/[^A-Z0-9]/g,'')}
+function hashFreeAccessCode(value){return crypto.createHash('sha256').update(normalizeFreeAccessCode(value)).digest('hex')}
+function generateFreeAccessCode(){const secret=crypto.randomBytes(10).toString('hex').toUpperCase();return`PSFREE-${secret.match(/.{1,4}/g).join('-')}`}
+
+app.get('/api/platform/free-access-codes',requirePlatformAuth,async(req,res)=>{try{const rows=(await pool.query(`SELECT c.id,c.code_prefix,c.label,c.plan_code,c.status,c.created_at,c.redeemed_at,c.revoked_at,c.revocation_reason,c.redeemed_tenant_id,t.name redeemed_company,issuer.email issued_by_email,revoker.email revoked_by_email FROM platform_free_access_codes c LEFT JOIN tenants t ON t.id=c.redeemed_tenant_id LEFT JOIN platform_admins issuer ON issuer.id=c.issued_by_platform_admin_id LEFT JOIN platform_admins revoker ON revoker.id=c.revoked_by_platform_admin_id ORDER BY c.created_at DESC LIMIT 500`)).rows;await platformAudit(req,'VIEW','free_access_codes',{count:rows.length});res.json(rows)}catch(e){res.status(500).json({error:e.message,request_id:req.requestId||null})}});
+
+app.post('/api/platform/free-access-codes',requirePlatformAuth,async(req,res)=>{const label=String(req.body.label||'').trim().slice(0,200),plan=String(req.body.plan_code||'').trim().toLowerCase();if(!label)return res.status(400).json({error:'A client or campaign label is required'});if(!VALID_PLANS.includes(plan))return res.status(400).json({error:'Choose a valid access plan'});try{let raw,row;for(let attempt=0;attempt<3;attempt++){raw=generateFreeAccessCode();try{row=(await pool.query(`INSERT INTO platform_free_access_codes(id,code_hash,code_prefix,label,plan_code,issued_by_platform_admin_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,code_prefix,label,plan_code,status,created_at`,[crypto.randomUUID(),hashFreeAccessCode(raw),raw.slice(0,15)+'…',label,plan,req.platformAdmin.id])).rows[0];break}catch(e){if(e.code!=='23505'||attempt===2)throw e}}await platformAudit(req,'ISSUE','free_access_code',{code_id:row.id,code_prefix:row.code_prefix,label,plan_code:plan});res.status(201).json({message:'Free-access code created. Copy it now; PatrolSync stores only its hash.',code:raw,record:row})}catch(e){res.status(500).json({error:e.message,request_id:req.requestId||null})}});
+
+app.post('/api/platform/free-access-codes/:id/revoke',requirePlatformAuth,async(req,res)=>{const id=String(req.params.id||''),reason=String(req.body.reason||'').trim().slice(0,1000),confirmation=String(req.body.confirmation||'').trim();if(!reason)return res.status(400).json({error:'A revocation reason is required'});const client=await pool.connect();try{await client.query('BEGIN');const code=(await client.query(`SELECT c.*,t.name tenant_name,t.billing_cycle FROM platform_free_access_codes c LEFT JOIN tenants t ON t.id=c.redeemed_tenant_id WHERE c.id=$1 FOR UPDATE OF c`,[id])).rows[0];if(!code){await client.query('ROLLBACK');return res.status(404).json({error:'Free-access code not found'})}if(code.status==='revoked'){await client.query('ROLLBACK');return res.status(409).json({error:'This free-access code is already revoked'})}if(confirmation!==`STOP ${code.code_prefix}`){await client.query('ROLLBACK');return res.status(400).json({error:`Type STOP ${code.code_prefix} to confirm`})}await client.query(`UPDATE platform_free_access_codes SET status='revoked',revoked_at=NOW(),revoked_by_platform_admin_id=$2,revocation_reason=$3 WHERE id=$1`,[id,req.platformAdmin.id,reason]);let accessStopped=false;if(code.redeemed_tenant_id&&code.billing_cycle==='free_access'){await client.query(`UPDATE tenants SET account_active=FALSE,subscription_status='suspended',suspended_at=NOW(),suspension_reason=$2,platform_notes=CONCAT_WS(E'\n',NULLIF(platform_notes,''),$3) WHERE id=$1`,[code.redeemed_tenant_id,`Free test access stopped: ${reason}`,`Free-access code ${code.code_prefix} revoked ${new Date().toISOString()}`]);await client.query(`UPDATE tenant_subscriptions SET status='suspended',updated_at=NOW() WHERE tenant_id=$1`,[code.redeemed_tenant_id]);await client.query(`UPDATE auth_sessions SET revoked_at=NOW(),revoked_reason='Free test access stopped by platform administrator' WHERE tenant_id=$1 AND revoked_at IS NULL`,[code.redeemed_tenant_id]);accessStopped=true}await client.query('COMMIT');await platformAudit(req,'REVOKE','free_access_code',{code_id:id,code_prefix:code.code_prefix,tenant_id:code.redeemed_tenant_id,tenant_name:code.tenant_name,reason,access_stopped:accessStopped});res.json({message:accessStopped?`Free access stopped for ${code.tenant_name}. Active sessions were revoked.`:code.redeemed_tenant_id?'Code revoked. The company was not suspended because its billing cycle is no longer free access.':'Unused code revoked.',access_stopped:accessStopped})}catch(e){try{await client.query('ROLLBACK')}catch(_){}res.status(500).json({error:e.message,request_id:req.requestId||null})}finally{client.release()}});
+
 // ------------------------ SIGNUP & AUTH ROUTES ------------------------
 
 app.post('/api/signup', async (req, res) => {
-  const { company_name, plan, admin_email, admin_password, timezone } = req.body;
+  const { company_name, plan, admin_email, admin_password, timezone, access_code } = req.body;
   if (!company_name || !admin_email || !admin_password) {
     return res.status(400).json({ error: 'company_name, admin_email, and admin_password are required' });
   }
-  const chosenPlan = VALID_PLANS.includes(plan) ? plan : 'starter';
+  let chosenPlan = VALID_PLANS.includes(plan) ? plan : 'starter';
   const validZones = getAllTimezones();
   const chosenTimezone = timezone && validZones.includes(timezone) ? timezone : 'UTC';
   const slug = company_name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
@@ -2458,9 +2471,17 @@ app.post('/api/signup', async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    let freeAccess=null;
+    if(String(access_code||'').trim()){
+      freeAccess=(await client.query(`SELECT id,code_prefix,label,plan_code,status FROM platform_free_access_codes WHERE code_hash=$1 FOR UPDATE`,[hashFreeAccessCode(access_code)])).rows[0];
+      if(!freeAccess||freeAccess.status!=='active'){await client.query('ROLLBACK');return res.status(400).json({error:'This free-access code is invalid, already used, or revoked'})}
+      if(!VALID_PLANS.includes(freeAccess.plan_code)){await client.query('ROLLBACK');return res.status(409).json({error:'The free-access code is not assigned to an available plan'})}
+      chosenPlan=freeAccess.plan_code;
+    }
+
     const tenantResult = await client.query(
-      'INSERT INTO tenants (name, slug, plan, timezone) VALUES ($1, $2, $3, $4) RETURNING *',
-      [company_name, slug, chosenPlan, chosenTimezone]
+      `INSERT INTO tenants (name,slug,plan,timezone,subscription_status,billing_cycle,platform_notes) VALUES($1,$2,$3,$4,'active',$5,$6) RETURNING *`,
+      [company_name,slug,chosenPlan,chosenTimezone,freeAccess?'free_access':'monthly',freeAccess?`Free test access · ${freeAccess.label} · ${freeAccess.code_prefix}`:null]
     );
     const tenant = tenantResult.rows[0];
 
@@ -2472,6 +2493,11 @@ app.post('/api/signup', async (req, res) => {
     );
     const adminUser = userResult.rows[0];
 
+    if(freeAccess){
+      await client.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id,status,period_start,period_end,billing_provider,migration_source) SELECT $1,p.id,'active',NOW(),NULL,'free_access_code','free_access_code' FROM plan_catalog p WHERE p.code=$2 AND p.status='active' ORDER BY p.is_public DESC,p.version DESC LIMIT 1 ON CONFLICT(tenant_id) DO UPDATE SET plan_id=EXCLUDED.plan_id,status='active',period_start=NOW(),period_end=NULL,billing_provider='free_access_code',migration_source='free_access_code',updated_at=NOW()`,[tenant.id,chosenPlan]);
+      await client.query(`UPDATE platform_free_access_codes SET status='redeemed',redeemed_tenant_id=$2,redeemed_at=NOW() WHERE id=$1`,[freeAccess.id,tenant.id]);
+    }
+
     await client.query('COMMIT');
 
     const token = jwt.sign(
@@ -2480,7 +2506,7 @@ app.post('/api/signup', async (req, res) => {
       { expiresIn: '12h' }
     );
 
-    res.status(201).json({ tenant, admin: adminUser, token });
+    res.status(201).json({ tenant, admin: adminUser, token, free_access:Boolean(freeAccess) });
   } catch (err) {
     await client.query('ROLLBACK');
     if (err.code === '23505') {

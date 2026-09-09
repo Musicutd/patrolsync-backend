@@ -25,6 +25,18 @@ app.disable('x-powered-by');
 app.set('trust proxy',1);
 app.use((req,res,next)=>{const origin=req.headers.origin;if(origin&&origin!=='null'&&!allowedOrigins.has(origin))return res.status(403).json({error:'Origin is not allowed'});if(origin==='null'&&IS_PRODUCTION)return res.status(403).json({error:'Local-file browser requests are not allowed in production'});next()});
 app.use(cors({origin:(origin,callback)=>callback(null,!origin||allowedOrigins.has(origin)),methods:['GET','POST','PUT','PATCH','DELETE','OPTIONS'],allowedHeaders:['Authorization','Content-Type','X-Request-ID','X-API-Key','X-PatrolSync-Device'],exposedHeaders:['X-Request-ID','X-RateLimit-Limit','X-RateLimit-Remaining','X-RateLimit-Reset','Retry-After','X-Cache','X-Cache-Age'],maxAge:86400}));
+// Stripe signatures cover the exact request bytes, so this endpoint must run
+// before the application-wide JSON parser.
+app.post('/api/billing/stripe-webhook',express.raw({type:'application/json',limit:'1mb'}),async(req,res)=>{
+  try{
+    const event=verifyStripeWebhook(req.body,req.headers['stripe-signature']);
+    await processStripeWebhook(event);
+    res.json({received:true});
+  }catch(error){
+    console.error('Stripe webhook rejected:',error.message);
+    res.status(error.statusCode||400).json({error:'Webhook could not be verified or processed'});
+  }
+});
 app.use(express.json({ limit: '12mb' }));
 app.use((req,res,next)=>{
   if(runtimeState.draining&&req.path!=='/live')return res.status(503).set('Connection','close').json({error:'Service is restarting',retry_after_seconds:10});
@@ -181,9 +193,121 @@ const PLAN_LIMITS = {
   medium:     { locations: 1,        checkpoints: 20,       guards: 6,        client_accounts: 2,        monthly_price: 79,  overage: null },
   pro:        { locations: 2,        checkpoints: 50,       guards: 10,       client_accounts: 5,        monthly_price: 149, overage: null },
   diamond:    { locations: 3,        checkpoints: 100,      guards: 15,       client_accounts: 10,       monthly_price: 299, overage: null },
-  enterprise: { locations: Infinity, checkpoints: Infinity, guards: Infinity, client_accounts: Infinity, monthly_price: 499, overage: { location: 80, checkpoint: 10, guard: 15, client_account: 20 } }
+  enterprise: { locations: Infinity, checkpoints: Infinity, guards: Infinity, client_accounts: Infinity, monthly_price: 499, overage: { location: 80, checkpoint: 10, guard: 15, client_account: 20 } },
+  // Current public catalogue. The legacy Medium and Diamond entries above remain
+  // available so existing subscribers and previously issued access codes continue
+  // to resolve without changing their contracted capacity.
+  growth:     { locations: 5,        checkpoints: 100,      guards: 15,       client_accounts: 10,       monthly_price: 129, overage: null },
+  command:    { locations: 50,       checkpoints: 1500,     guards: 100,      client_accounts: 100,      monthly_price: 499, overage: null }
 };
 const VALID_PLANS = Object.keys(PLAN_LIMITS);
+
+const PUBLIC_PLAN_CATALOG={
+  starter:{name:'Starter',locations:2,checkpoints:25,guards:5,client_accounts:3},
+  growth:{name:'Growth',locations:5,checkpoints:100,guards:15,client_accounts:10},
+  pro:{name:'Pro',locations:15,checkpoints:400,guards:40,client_accounts:30},
+  command:{name:'Command',locations:50,checkpoints:1500,guards:100,client_accounts:100},
+  enterprise:{name:'Enterprise',locations:null,checkpoints:null,guards:null,client_accounts:null}
+};
+const REGIONAL_PRICING={
+  EUR:{locale:'en-MT',countries:null,monthly:{starter:59,growth:129,pro:249,command:499,enterprise:899},annual:{starter:599,growth:1299,pro:2499,command:4999,enterprise:8999},onboarding:{starter:99,growth:249,pro:499,command:999,enterprise:2500}},
+  USD:{locale:'en-US',countries:['US'],monthly:{starter:65,growth:139,pro:269,command:539,enterprise:975},annual:{starter:659,growth:1399,pro:2699,command:5399,enterprise:9799},onboarding:{starter:109,growth:269,pro:539,command:1079,enterprise:2699}},
+  AUD:{locale:'en-AU',countries:['AU'],monthly:{starter:99,growth:215,pro:415,command:829,enterprise:1499},annual:{starter:999,growth:2149,pro:4149,command:8299,enterprise:14999},onboarding:{starter:165,growth:415,pro:829,command:1649,enterprise:4150}},
+  CAD:{locale:'en-CA',countries:['CA'],monthly:{starter:89,growth:189,pro:359,command:719,enterprise:1299},annual:{starter:899,growth:1899,pro:3599,command:7199,enterprise:12999},onboarding:{starter:145,growth:359,pro:719,command:1439,enterprise:3599}},
+  JPY:{locale:'ja-JP',countries:['JP'],monthly:{starter:9900,growth:21500,pro:41500,command:82900,enterprise:149000},annual:{starter:99000,growth:215000,pro:415000,command:829000,enterprise:1490000},onboarding:{starter:16500,growth:41500,pro:82900,command:165000,enterprise:415000}}
+};
+const countryPriceCache=new Map();
+function requestIp(req){
+  const raw=String(req.headers['x-forwarded-for']||req.socket.remoteAddress||'').split(',')[0].trim();
+  return raw.replace(/^::ffff:/,'');
+}
+function fallbackCountry(locale,timezone){
+  const tag=String(locale||'').replace('_','-').toUpperCase(),zone=String(timezone||'');
+  if(tag.endsWith('-US'))return'US';if(tag.endsWith('-CA'))return'CA';if(tag.endsWith('-AU'))return'AU';if(tag.endsWith('-JP')||zone==='Asia/Tokyo')return'JP';
+  return null;
+}
+async function pricingCountry(req){
+  const headerCountry=String(req.headers['cf-ipcountry']||req.headers['cloudfront-viewer-country']||req.headers['x-vercel-ip-country']||'').toUpperCase();
+  if(/^(US|CA|AU|JP)$/.test(headerCountry))return headerCountry;
+  const ip=requestIp(req),fallback=fallbackCountry(req.query.locale,req.query.timezone);
+  if(!ip||/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$)/.test(ip))return fallback;
+  const cached=countryPriceCache.get(ip);if(cached&&cached.expires>Date.now())return cached.country||fallback;
+  try{
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),1500);
+    const response=await fetch(`https://api.country.is/${encodeURIComponent(ip)}`,{signal:controller.signal,headers:{Accept:'application/json'}});clearTimeout(timer);
+    const data=response.ok?await response.json():{};
+    const country=/^(US|CA|AU|JP)$/.test(String(data.country||'').toUpperCase())?String(data.country).toUpperCase():null;
+    countryPriceCache.set(ip,{country,expires:Date.now()+6*60*60*1000});
+    return country||fallback;
+  }catch(_){return fallback}
+}
+function regionalPricePayload(country){
+  const currency=Object.keys(REGIONAL_PRICING).find(code=>REGIONAL_PRICING[code].countries?.includes(country))||'EUR',region=REGIONAL_PRICING[currency];
+  return{country:country||null,currency,locale:region.locale,prices_fixed:true,tax_included:false,annual_discount_label:'Save compared with monthly billing',plans:Object.fromEntries(Object.entries(PUBLIC_PLAN_CATALOG).map(([code,plan])=>[code,{...plan,monthly_price:region.monthly[code],annual_price:region.annual[code],onboarding_price:region.onboarding[code],monthly_from:code==='enterprise',annual_from:code==='enterprise',onboarding_from:code==='enterprise',self_service_onboarding_waiver:code==='starter'}]))};
+}
+
+// ------------------------ STAGE 15.1: GLOBAL CHECKOUT ------------------------
+
+const STRIPE_SECRET_KEY=String(process.env.STRIPE_SECRET_KEY||'').trim();
+const STRIPE_WEBHOOK_SECRET=String(process.env.STRIPE_WEBHOOK_SECRET||'').trim();
+const STRIPE_AUTOMATIC_TAX=String(process.env.STRIPE_AUTOMATIC_TAX||'false').toLowerCase()==='true';
+const BILLING_FRONTEND_ORIGIN=normalizedOrigin(process.env.FRONTEND_URL)||'https://patrolsync.co';
+const STRIPE_ZERO_DECIMAL_CURRENCIES=new Set(['JPY']);
+function stripeMinorUnits(value,currency){return Math.round(Number(value)*(STRIPE_ZERO_DECIMAL_CURRENCIES.has(currency)?1:100))}
+async function stripeApi(path,params,idempotencyKey){
+  if(!STRIPE_SECRET_KEY)throw Object.assign(new Error('Stripe checkout is not configured'),{statusCode:503});
+  const body=new URLSearchParams();for(const[key,value]of Object.entries(params))if(value!==undefined&&value!==null)body.append(key,String(value));
+  const headers={Authorization:`Bearer ${STRIPE_SECRET_KEY}`,'Content-Type':'application/x-www-form-urlencoded'};
+  if(idempotencyKey)headers['Idempotency-Key']=idempotencyKey;
+  const response=await fetch(`https://api.stripe.com/v1${path}`,{method:'POST',headers,body});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw Object.assign(new Error(data.error?.message||'Stripe rejected the checkout request'),{statusCode:502,providerCode:data.error?.code||null});
+  return data;
+}
+function verifyStripeWebhook(rawBody,signatureHeader){
+  if(!STRIPE_WEBHOOK_SECRET)throw Object.assign(new Error('Stripe webhook secret is not configured'),{statusCode:503});
+  if(!Buffer.isBuffer(rawBody)||!signatureHeader)throw new Error('Missing raw payload or Stripe signature');
+  const parts=String(signatureHeader).split(',').map(x=>x.split('=',2)),timestamp=parts.find(([k])=>k==='t')?.[1],signatures=parts.filter(([k])=>k==='v1').map(([,v])=>v);
+  if(!timestamp||!signatures.length||Math.abs(Math.floor(Date.now()/1000)-Number(timestamp))>300)throw new Error('Expired or malformed Stripe signature');
+  const expected=crypto.createHmac('sha256',STRIPE_WEBHOOK_SECRET).update(`${timestamp}.${rawBody.toString('utf8')}`).digest('hex');
+  const valid=signatures.some(value=>{try{const a=Buffer.from(expected,'hex'),b=Buffer.from(value,'hex');return a.length===b.length&&crypto.timingSafeEqual(a,b)}catch(_){return false}});
+  if(!valid)throw new Error('Invalid Stripe signature');
+  try{return JSON.parse(rawBody.toString('utf8'))}catch(_){throw new Error('Invalid Stripe event JSON')}
+}
+async function ensureBillingCheckoutSchema(){
+  await pool.query(`CREATE TABLE IF NOT EXISTS billing_checkout_sessions(id UUID PRIMARY KEY,tenant_id INTEGER NOT NULL,requested_by_user_id INTEGER,plan_code TEXT NOT NULL,billing_interval TEXT NOT NULL CHECK(billing_interval IN('month','year')),currency TEXT NOT NULL,recurring_amount NUMERIC(12,2) NOT NULL,onboarding_amount NUMERIC(12,2) NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'creating',stripe_session_id TEXT UNIQUE,stripe_customer_id TEXT,stripe_subscription_id TEXT,checkout_url TEXT,expires_at TIMESTAMPTZ,completed_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS billing_webhook_events(stripe_event_id TEXT PRIMARY KEY,tenant_id INTEGER,event_type TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),processed_at TIMESTAMPTZ,last_error TEXT)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_billing_checkout_tenant_created ON billing_checkout_sessions(tenant_id,created_at DESC)`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS uq_billing_checkout_one_open_per_tenant ON billing_checkout_sessions(tenant_id) WHERE status IN('creating','open')`);
+  for(const table of ['billing_checkout_sessions','billing_webhook_events']){await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`)}
+  const tenantRole=quotedRoleFromTenantUrl();if(tenantRole){for(const table of ['billing_checkout_sessions','billing_webhook_events'])await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO ${tenantRole}`)}
+  console.log('Stage 15.1 billing checkout schema ready');
+}
+let billingCheckoutSchemaError=null;
+const billingCheckoutSchemaReady=ensureBillingCheckoutSchema().catch(error=>{billingCheckoutSchemaError=error;console.error('Billing checkout schema setup failed:',error.message);return null});
+async function requireBillingCheckoutSchema(){await billingCheckoutSchemaReady;if(billingCheckoutSchemaError)throw Object.assign(new Error('Billing checkout is temporarily unavailable'),{statusCode:503})}
+async function activatePaidCheckout(client,session,stripeObject){
+  const paid=['paid','no_payment_required'].includes(String(stripeObject.payment_status||''));if(!paid)return false;
+  const plan=(await client.query(`SELECT id FROM plan_catalog WHERE code=$1 AND version=$2 AND status='active' LIMIT 1`,[session.plan_code,EXPANSION_PLAN_VERSION])).rows[0];
+  if(!plan)throw new Error('Purchased plan is not available in the active catalogue');
+  const endSql=session.billing_interval==='year'?"NOW()+INTERVAL '1 year'":"NOW()+INTERVAL '1 month'";
+  await client.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id,status,period_start,period_end,billing_provider,billing_provider_ref,migration_source,updated_at) VALUES($1,$2,'active',NOW(),${endSql},'stripe',$3,'stripe_checkout',NOW()) ON CONFLICT(tenant_id) DO UPDATE SET plan_id=EXCLUDED.plan_id,status='active',period_start=NOW(),period_end=${endSql},billing_provider='stripe',billing_provider_ref=EXCLUDED.billing_provider_ref,migration_source='stripe_checkout',updated_at=NOW()`,[session.tenant_id,plan.id,stripeObject.subscription||null]);
+  await client.query(`UPDATE tenants SET plan=$2,subscription_status='active',billing_cycle=$3,renewal_at=${endSql},account_active=TRUE,suspended_at=NULL,suspension_reason=NULL WHERE id=$1`,[session.tenant_id,session.plan_code,session.billing_interval==='year'?'annual':'monthly']);
+  await client.query(`UPDATE billing_checkout_sessions SET status='paid',stripe_customer_id=$2,stripe_subscription_id=$3,completed_at=COALESCE(completed_at,NOW()),updated_at=NOW() WHERE id=$1`,[session.id,stripeObject.customer||null,stripeObject.subscription||null]);
+  await client.query(`INSERT INTO system_events(tenant_id,event_type,severity,message,details) VALUES($1,'billing_subscription_activated','info',$2,$3::jsonb)`,[session.tenant_id,`Paid ${session.plan_code} subscription activated`,JSON.stringify({checkout_id:session.id,plan_code:session.plan_code,billing_interval:session.billing_interval,currency:session.currency,recurring_amount:Number(session.recurring_amount),onboarding_amount:Number(session.onboarding_amount),stripe_session_id:stripeObject.id||null,stripe_subscription_id:stripeObject.subscription||null})]);
+  return true;
+}
+async function processStripeWebhook(event){
+  await requireBillingCheckoutSchema();if(!event?.id||!event?.type)throw new Error('Stripe event is missing its identity');
+  const client=await pool.connect();try{await client.query('BEGIN');const existing=(await client.query(`SELECT processed_at FROM billing_webhook_events WHERE stripe_event_id=$1 FOR UPDATE`,[event.id])).rows[0];if(existing?.processed_at){await client.query('COMMIT');return}
+    const object=event.data?.object||{},localId=String(object.metadata?.patrolsync_checkout_id||'');
+    const session=localId?(await client.query(`SELECT * FROM billing_checkout_sessions WHERE id=$1 FOR UPDATE`,[localId])).rows[0]:null;
+    await client.query(`INSERT INTO billing_webhook_events(stripe_event_id,tenant_id,event_type) VALUES($1,$2,$3) ON CONFLICT(stripe_event_id) DO UPDATE SET tenant_id=COALESCE(billing_webhook_events.tenant_id,EXCLUDED.tenant_id),event_type=EXCLUDED.event_type`,[event.id,session?.tenant_id||null,event.type]);
+    if(['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type)){if(!session)throw new Error('Checkout session does not match a PatrolSync request');await activatePaidCheckout(client,session,object)}
+    else if(event.type==='checkout.session.expired'&&session)await client.query(`UPDATE billing_checkout_sessions SET status='expired',updated_at=NOW() WHERE id=$1 AND status<>'paid'`,[session.id]);
+    await client.query(`UPDATE billing_webhook_events SET processed_at=NOW(),last_error=NULL WHERE stripe_event_id=$1`,[event.id]);await client.query('COMMIT');
+  }catch(error){try{await client.query('ROLLBACK')}catch(_){}throw error}finally{client.release()}
+}
 
 const FALLBACK_TIMEZONES = [
   'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'Europe/Madrid', 'Europe/Rome',
@@ -325,11 +449,11 @@ const ENTITLEMENT_ENGINE_MODE=String(process.env.ENTITLEMENT_ENGINE_MODE||'obser
 const EXPANSION_PLAN_VERSION='2026.1';
 const LEGACY_PLAN_VERSION='legacy-2026';
 const EXPANSION_PLAN_SEED=[
-  {code:'starter',name:'Starter',price:49,guards:5,sites:2,checkpoints:25,admins:2,clients:3,storage:5},
-  {code:'growth',name:'Growth',price:99,guards:15,sites:5,checkpoints:100,admins:5,clients:10,storage:25},
-  {code:'pro',name:'Pro',price:199,guards:40,sites:15,checkpoints:400,admins:12,clients:30,storage:100},
-  {code:'command',name:'Command',price:399,guards:100,sites:50,checkpoints:1500,admins:30,clients:100,storage:500},
-  {code:'enterprise',name:'Enterprise',price:699,guards:null,sites:null,checkpoints:null,admins:null,clients:null,storage:null}
+  {code:'starter',name:'Starter',price:59,guards:5,sites:2,checkpoints:25,admins:2,clients:3,storage:5,onboarding:99},
+  {code:'growth',name:'Growth',price:129,guards:15,sites:5,checkpoints:100,admins:5,clients:10,storage:25,onboarding:249},
+  {code:'pro',name:'Pro',price:249,guards:40,sites:15,checkpoints:400,admins:12,clients:30,storage:100,onboarding:499},
+  {code:'command',name:'Command',price:499,guards:100,sites:50,checkpoints:1500,admins:30,clients:100,storage:500,onboarding:999},
+  {code:'enterprise',name:'Enterprise',price:899,guards:null,sites:null,checkpoints:null,admins:null,clients:null,storage:null,onboarding:2500}
 ];
 const LEGACY_PLAN_SEED=Object.entries(PLAN_LIMITS).map(([code,limits])=>({code,name:`Legacy ${code}`,price:limits.monthly_price,guards:Number.isFinite(limits.guards)?limits.guards:null,sites:Number.isFinite(limits.locations)?limits.locations:null,checkpoints:Number.isFinite(limits.checkpoints)?limits.checkpoints:null,admins:null,clients:Number.isFinite(limits.client_accounts)?limits.client_accounts:null,storage:null}));
 const FEATURE_SEED=[
@@ -378,7 +502,7 @@ async function ensureEntitlementSchema(){
   for(const [code,category,unit] of FEATURE_SEED)await pool.query(`INSERT INTO feature_catalog(code,name,category,unit,metered) VALUES($1,$2,$3,$4,$5) ON CONFLICT(code) DO UPDATE SET category=EXCLUDED.category,unit=EXCLUDED.unit,metered=EXCLUDED.metered`,[code,code.split('_').map(x=>x[0].toUpperCase()+x.slice(1)).join(' '),category,unit,unit!=='boolean']);
   for(const plan of [...LEGACY_PLAN_SEED,...EXPANSION_PLAN_SEED]){
     const version=LEGACY_PLAN_SEED.includes(plan)?LEGACY_PLAN_VERSION:EXPANSION_PLAN_VERSION,isPublic=version===EXPANSION_PLAN_VERSION;
-    const planId=(await pool.query(`INSERT INTO plan_catalog(code,name,version,public_price_monthly,is_public,metadata) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(code,version) DO UPDATE SET name=EXCLUDED.name,public_price_monthly=EXCLUDED.public_price_monthly,is_public=EXCLUDED.is_public,metadata=EXCLUDED.metadata,updated_at=NOW() RETURNING id`,[plan.code,plan.name,version,plan.price,isPublic,JSON.stringify({source:version===EXPANSION_PLAN_VERSION?'expansion_pack':'legacy_compatibility'})])).rows[0].id;
+    const planId=(await pool.query(`INSERT INTO plan_catalog(code,name,version,public_price_monthly,is_public,metadata) VALUES($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT(code,version) DO UPDATE SET name=EXCLUDED.name,public_price_monthly=EXCLUDED.public_price_monthly,is_public=EXCLUDED.is_public,metadata=EXCLUDED.metadata,updated_at=NOW() RETURNING id`,[plan.code,plan.name,version,plan.price,isPublic,JSON.stringify({source:version===EXPANSION_PLAN_VERSION?'expansion_pack':'legacy_compatibility',onboarding_price_eur:plan.onboarding??null,self_service_onboarding_waiver:plan.code==='starter'})])).rows[0].id;
     const limits={active_guards:plan.guards,sites:plan.sites,checkpoints:plan.checkpoints,admin_users:plan.admins,client_users:plan.clients,document_storage_gb:plan.storage};
     for(const [featureCode,limit] of Object.entries(limits))if(limit!==undefined){await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled,included_quantity,hard_limit) SELECT $1,id,TRUE,$3,$3 FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE,included_quantity=EXCLUDED.included_quantity,hard_limit=EXCLUDED.hard_limit`,[planId,featureCode,limit]);}
     const booleans=version===EXPANSION_PLAN_VERSION?(PLAN_BOOLEAN_FEATURES[plan.code]||[]):(LEGACY_PLAN_BOOLEAN_FEATURES[plan.code]||['qr_checkpoints']);
@@ -1822,6 +1946,42 @@ app.get('/api/timezones', (req, res) => {
 
 app.get('/api/plans', (req, res) => {
   res.json(PLAN_LIMITS);
+});
+
+app.get('/api/public/pricing',async(req,res)=>{
+  try{
+    const country=await pricingCountry(req);
+    res.setHeader('Cache-Control','private, max-age=3600');
+    res.json(regionalPricePayload(country));
+  }catch(_){
+    res.json(regionalPricePayload(null));
+  }
+});
+
+app.post('/api/billing/checkout-session',requireAuth,requireAdmin,async(req,res)=>{
+  const planCode=String(req.body.plan_code||'').toLowerCase(),interval=String(req.body.billing_interval||'month').toLowerCase();
+  if(!PUBLIC_PLAN_CATALOG[planCode])return res.status(400).json({error:'Select an available PatrolSync plan'});
+  if(planCode==='enterprise')return res.status(400).json({error:'Enterprise subscriptions require a confirmed proposal',contact_url:'mailto:hello@patrolsync.co?subject=PatrolSync%20Enterprise'});
+  if(!['month','year'].includes(interval))return res.status(400).json({error:'Billing interval must be month or year'});
+  try{
+    await requireBillingCheckoutSchema();
+    const country=await pricingCountry(req),catalog=regionalPricePayload(country),offer=catalog.plans[planCode],recurring=interval==='year'?offer.annual_price:offer.monthly_price,onboarding=offer.self_service_onboarding_waiver?0:offer.onboarding_price,id=crypto.randomUUID(),tenantId=Number(req.auth.tenant_id);
+    const existingSubscription=(await pool.query(`SELECT ts.id FROM tenant_subscriptions ts WHERE ts.tenant_id=$1 AND ts.billing_provider='stripe' AND ts.status IN('active','trialing','past_due') LIMIT 1`,[tenantId])).rows[0];
+    if(existingSubscription)return res.status(409).json({error:'This company already has a Stripe subscription. Plan changes and cancellation will be available through subscription management in Stage 15.2.'});
+    await pool.query(`UPDATE billing_checkout_sessions SET status='expired',updated_at=NOW() WHERE tenant_id=$1 AND status='open' AND expires_at<NOW()`,[tenantId]);
+    const user=(await withTenant(tenantId,c=>c.query(`SELECT email FROM users WHERE id=$1 AND tenant_id=$2`,[req.auth.user_id,tenantId]))).rows[0];
+    if(!user?.email)return res.status(409).json({error:'The administrator email could not be confirmed'});
+    await pool.query(`INSERT INTO billing_checkout_sessions(id,tenant_id,requested_by_user_id,plan_code,billing_interval,currency,recurring_amount,onboarding_amount) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[id,tenantId,req.auth.user_id,planCode,interval,catalog.currency,recurring,onboarding]);
+    const currency=catalog.currency.toLowerCase(),params={mode:'subscription',client_reference_id:String(tenantId),customer_email:user.email,success_url:`${BILLING_FRONTEND_ORIGIN}/checkout_success.html?checkout=${id}&session_id={CHECKOUT_SESSION_ID}`,cancel_url:`${BILLING_FRONTEND_ORIGIN}/checkout_cancelled.html?checkout=${id}`,'metadata[patrolsync_checkout_id]':id,'metadata[tenant_id]':tenantId,'metadata[plan_code]':planCode,'subscription_data[metadata][patrolsync_checkout_id]':id,'subscription_data[metadata][tenant_id]':tenantId,'subscription_data[metadata][plan_code]':planCode,'line_items[0][quantity]':1,'line_items[0][price_data][currency]':currency,'line_items[0][price_data][unit_amount]':stripeMinorUnits(recurring,catalog.currency),'line_items[0][price_data][recurring][interval]':interval,'line_items[0][price_data][product_data][name]':`${offer.name} plan`,'line_items[0][price_data][product_data][description]':`PatrolSync ${offer.name} subscription billed ${interval==='year'?'annually':'monthly'}`,'line_items[0][price_data][tax_behavior]':'exclusive',billing_address_collection:'required',allow_promotion_codes:'true'};
+    if(onboarding>0){Object.assign(params,{'line_items[1][quantity]':1,'line_items[1][price_data][currency]':currency,'line_items[1][price_data][unit_amount]':stripeMinorUnits(onboarding,catalog.currency),'line_items[1][price_data][product_data][name]':'Onboarding','line_items[1][price_data][product_data][description]':`PatrolSync ${offer.name} implementation and onboarding`,'line_items[1][price_data][tax_behavior]':'exclusive'})}
+    if(STRIPE_AUTOMATIC_TAX)params['automatic_tax[enabled]']='true';
+    try{const stripeSession=await stripeApi('/checkout/sessions',params,`patrolsync-checkout-${id}`);await pool.query(`UPDATE billing_checkout_sessions SET status='open',stripe_session_id=$2,checkout_url=$3,expires_at=to_timestamp($4),updated_at=NOW() WHERE id=$1`,[id,stripeSession.id,stripeSession.url,stripeSession.expires_at]);res.status(201).json({checkout_id:id,url:stripeSession.url,currency:catalog.currency,plan_code:planCode,billing_interval:interval,recurring_amount:recurring,onboarding_amount:onboarding})}
+    catch(error){await pool.query(`UPDATE billing_checkout_sessions SET status='failed',updated_at=NOW() WHERE id=$1`,[id]);throw error}
+  }catch(error){res.status(error.code==='23505'?409:error.statusCode||500).json({error:error.code==='23505'?'A checkout is already open for this company. Complete it or wait for it to expire.':error.message,code:error.providerCode||null,request_id:req.requestId||null})}
+});
+
+app.get('/api/billing/checkout-session/:id',requireAuth,requireAdmin,async(req,res)=>{
+  try{await requireBillingCheckoutSchema();const result=await withTenant(req.auth.tenant_id,c=>c.query(`SELECT id,plan_code,billing_interval,currency,recurring_amount,onboarding_amount,status,expires_at,completed_at,created_at FROM billing_checkout_sessions WHERE id=$1 AND tenant_id=$2`,[req.params.id,req.auth.tenant_id]));if(!result.rowCount)return res.status(404).json({error:'Checkout request not found'});res.json(result.rows[0])}catch(error){res.status(error.statusCode||500).json({error:error.message})}
 });
 
 app.get('/api/usage', requireAuth, async (req, res) => {

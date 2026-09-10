@@ -1038,7 +1038,7 @@ async function ensureTenantLifecycleSchema(){
 }
 ensureTenantLifecycleSchema().catch(e=>console.error('Subscriber lifecycle setup failed:',e.message));
 
-async function ensureStaffAccessColumns(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_active_identity_unique ON users(tenant_id,LOWER(email),role) WHERE account_active=TRUE AND role IN('guard','staff')`);console.log('Staff access columns and active identity protection ready');}ensureStaffAccessColumns().catch(e=>console.error('Staff access setup failed:',e.message));
+async function ensureStaffAccessColumns(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS job_title TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT`);await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS account_active BOOLEAN NOT NULL DEFAULT TRUE`);await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_active_identity_unique ON users(tenant_id,LOWER(email),role) WHERE account_active=TRUE AND role IN('guard','staff')`);console.log('Staff access columns and active identity protection ready');}ensureStaffAccessColumns().catch(e=>console.error('Staff access setup failed:',e.message));
 async function ensureEmailMfaSchema(){await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE`);await pool.query(`CREATE TABLE IF NOT EXISTS email_mfa_challenges(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,purpose TEXT NOT NULL CHECK(purpose IN('login','enable')),token_hash TEXT NOT NULL UNIQUE,code_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE TABLE IF NOT EXISTS mfa_recovery_codes(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,code_hash TEXT NOT NULL,used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(tenant_id,user_id,code_hash))`);for(const table of ['email_mfa_challenges','mfa_recovery_codes']){await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`)}await pool.query(`CREATE INDEX IF NOT EXISTS email_mfa_challenges_lookup ON email_mfa_challenges(token_hash,expires_at) WHERE used_at IS NULL`);console.log('Email MFA schema ready')}ensureEmailMfaSchema().catch(e=>console.error('Email MFA setup failed:',e.message));
 async function ensureAuthSessionsSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS auth_sessions(id UUID PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,role TEXT NOT NULL,ip_address TEXT,user_agent TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,revoked_at TIMESTAMPTZ,revoked_reason TEXT)`);await pool.query(`CREATE INDEX IF NOT EXISTS auth_sessions_user_lookup ON auth_sessions(tenant_id,user_id,created_at DESC)`);console.log('Tracked authentication sessions ready')}ensureAuthSessionsSchema().catch(e=>console.error('Auth session setup failed:',e.message));
 async function ensurePlatformAdminSchema(){await pool.query(`CREATE TABLE IF NOT EXISTS platform_admins(id BIGSERIAL PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,display_name TEXT,active BOOLEAN NOT NULL DEFAULT TRUE,last_login_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE TABLE IF NOT EXISTS platform_mfa_challenges(id BIGSERIAL PRIMARY KEY,platform_admin_id BIGINT NOT NULL,token_hash TEXT NOT NULL UNIQUE,code_hash TEXT NOT NULL,expires_at TIMESTAMPTZ NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,used_at TIMESTAMPTZ,ip_address TEXT,user_agent TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);await pool.query(`CREATE TABLE IF NOT EXISTS platform_mfa_recovery_codes(id BIGSERIAL PRIMARY KEY,platform_admin_id BIGINT NOT NULL,code_hash TEXT NOT NULL,used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(platform_admin_id,code_hash))`);await pool.query(`CREATE TABLE IF NOT EXISTS platform_auth_sessions(id UUID PRIMARY KEY,platform_admin_id BIGINT NOT NULL,ip_address TEXT,user_agent TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,revoked_at TIMESTAMPTZ,revoked_reason TEXT)`);await pool.query(`CREATE INDEX IF NOT EXISTS platform_auth_sessions_lookup ON platform_auth_sessions(platform_admin_id,created_at DESC)`);await pool.query(`CREATE TABLE IF NOT EXISTS platform_audit_logs(id BIGSERIAL PRIMARY KEY,platform_admin_id BIGINT,admin_email TEXT,action TEXT NOT NULL,resource TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,ip_address TEXT,request_id TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);const email=String(process.env.PLATFORM_ADMIN_EMAIL||'').trim().toLowerCase(),password=String(process.env.PLATFORM_ADMIN_PASSWORD||'');const count=Number((await pool.query(`SELECT COUNT(*)::int count FROM platform_admins`)).rows[0].count);if(count===0&&email&&password.length>=12){const hash=await bcrypt.hash(password,12);await pool.query(`INSERT INTO platform_admins(email,password_hash,display_name) VALUES($1,$2,'Platform Owner')`,[email,hash]);console.log('Initial platform administrator created')}else if(count===0)console.warn('No platform administrator exists. Set PLATFORM_ADMIN_EMAIL and PLATFORM_ADMIN_PASSWORD (12+ characters) to bootstrap one.');console.log('Platform administrator schema ready')}ensurePlatformAdminSchema().catch(e=>console.error('Platform admin setup failed:',e.message));
@@ -3027,10 +3027,12 @@ app.delete('/api/checkpoints/:id', requireAuth, requireAdmin, async (req, res) =
 // ------------------------ USERS & GUARDS ------------------------
 
 app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, firebase_uid, email, role, password } = req.body;
+  const { firebase_uid, email, role, password } = req.body;
+  const tenant_id=attendanceTenant(req,req.body.tenant_id),firstName=String(req.body.first_name||'').trim(),lastName=String(req.body.last_name||'').trim();
   if (!tenant_id || !email) {
     return res.status(400).json({ error: 'tenant_id and email are required' });
   }
+  if(firstName.length>100||lastName.length>100||/[\u0000-\u001f\u007f]/.test(firstName+lastName))return res.status(400).json({error:'Guard names must be 100 characters or fewer and cannot contain control characters'});
   if (role && !['admin', 'guard'].includes(role)) {
     return res.status(400).json({ error: 'role must be admin or guard' });
   }
@@ -3049,8 +3051,8 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
       }
       const hash = password ? await bcrypt.hash(password, 10) : null;
       return client.query(
-        'INSERT INTO users (tenant_id, firebase_uid, email, role, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, tenant_id, email, role',
-        [tenant_id, firebase_uid || null, email.toLowerCase().trim(), role || 'guard', hash]
+        'INSERT INTO users (tenant_id,firebase_uid,email,role,password_hash,first_name,last_name) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,tenant_id,email,role,first_name,last_name',
+        [tenant_id,firebase_uid||null,email.toLowerCase().trim(),role||'guard',hash,firstName||null,lastName||null]
       );
     });
     res.status(201).json(result.rows[0]);
@@ -3060,19 +3062,30 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
 });
 
 app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
-  const { tenant_id, role } = req.query;
+  const tenant_id=attendanceTenant(req,req.query.tenant_id),{ role } = req.query;
   if (!tenant_id) return res.status(400).json({ error: 'tenant_id query param is required' });
   try {
     const includeInactive=req.query.include_inactive==='true';
     const result = await withTenant(tenant_id, (client) =>
       role
-        ? client.query(`SELECT * FROM users WHERE tenant_id=$1 AND role=$2 AND ($3::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,role,includeInactive])
-        : client.query(`SELECT * FROM users WHERE tenant_id=$1 AND ($2::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,includeInactive])
+        ? client.query(`SELECT id,tenant_id,email,role,first_name,last_name,job_title,permissions,account_active,created_at FROM users WHERE tenant_id=$1 AND role=$2 AND ($3::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,role,includeInactive])
+        : client.query(`SELECT id,tenant_id,email,role,first_name,last_name,job_title,permissions,account_active,created_at FROM users WHERE tenant_id=$1 AND ($2::boolean OR COALESCE(account_active,TRUE)=TRUE) ORDER BY created_at DESC`,[tenant_id,includeInactive])
     );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.patch('/api/users/:id/profile',requireAuth,requireAdmin,async(req,res)=>{
+  const id=Number(req.params.id),tenantId=attendanceTenant(req,req.body.tenant_id),firstName=String(req.body.first_name||'').trim(),lastName=String(req.body.last_name||'').trim(),email=String(req.body.email||'').trim().toLowerCase();
+  if(!tenantId)return res.status(403).json({error:'Tenant access denied'});
+  if(!Number.isInteger(id)||id<1)return res.status(400).json({error:'Invalid guard ID'});
+  if(!firstName||!lastName)return res.status(400).json({error:'First name and surname are required'});
+  if(firstName.length>100||lastName.length>100||/[\u0000-\u001f\u007f]/.test(firstName+lastName))return res.status(400).json({error:'Names must be 100 characters or fewer and cannot contain control characters'});
+  if(email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:'Enter a valid guard email address'});
+  try{const result=await withTenant(tenantId,c=>c.query(`UPDATE users SET first_name=$3,last_name=$4,email=$5 WHERE id=$1 AND tenant_id=$2 AND role='guard' RETURNING id,tenant_id,email,role,first_name,last_name,account_active`,[id,tenantId,firstName,lastName,email]));if(!result.rowCount)return res.status(404).json({error:'Guard not found'});res.json({guard:result.rows[0],message:'Guard details updated.'})}
+  catch(error){res.status(error.code==='23505'?409:500).json({error:error.code==='23505'?'Another active guard already uses this email':error.message})}
 });
 
 app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {

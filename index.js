@@ -1104,6 +1104,8 @@ async function ensurePatrolRoutesTables() {
     status TEXT NOT NULL DEFAULT 'scheduled', notes TEXT, started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ, cancelled_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await pool.query(`ALTER TABLE patrol_runs ADD COLUMN IF NOT EXISTS shift_id BIGINT`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_patrol_runs_shift ON patrol_runs(tenant_id,shift_id)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS patrol_run_scans (
     id BIGSERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL, run_id BIGINT NOT NULL REFERENCES patrol_runs(id) ON DELETE CASCADE,
     checkpoint_id INTEGER NOT NULL, patrol_log_id INTEGER, position INTEGER NOT NULL,
@@ -4893,6 +4895,7 @@ app.delete('/api/shift-templates/:id', requireAuth, requireAdmin, async (req, re
 app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   const { tenant_id, site_id, user_id, start_date, start_time, end_time, break_minutes,
     employment_type, recurrence, days_of_week, days_of_month, repeat_until, notes, dry_run } = req.body;
+  const patrolAssignments=Array.isArray(req.body.patrol_assignments)?req.body.patrol_assignments:[];
   if (!tenant_id || !site_id || !user_id || !start_date || !start_time || !end_time) {
     return res.status(400).json({ error: 'tenant_id, site_id, user_id, start_date, start_time, and end_time are required' });
   }
@@ -4903,6 +4906,8 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
   const recurrenceType = ['none', 'weekly', 'monthly'].includes(recurrence) ? recurrence : 'none';
   const breakMinutes = Number(break_minutes || 0);
   if (!Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 720) return res.status(400).json({ error: 'Break must be between 0 and 720 minutes' });
+  if(patrolAssignments.length>12)return res.status(400).json({error:'A shift can contain up to 12 scheduled patrols'});
+  for(const patrol of patrolAssignments){if(!Number.isInteger(Number(patrol.route_id))||!TIME_FORMAT_REGEX.test(String(patrol.start_time||''))||!TIME_FORMAT_REGEX.test(String(patrol.end_time||''))||patrol.start_time===patrol.end_time)return res.status(400).json({error:'Every patrol requires a route and a valid start/end time'});}
 
   try {
     const dates = generateShiftDates({ recurrence: recurrenceType, start_date, repeat_until, days_of_week, days_of_month });
@@ -4913,6 +4918,14 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       if (guard.rows.length === 0) throw Object.assign(new Error('Guard not found for this tenant'), { statusCode: 404 });
       const site = await client.query('SELECT id FROM sites WHERE id = $1 AND tenant_id = $2', [site_id, tenant_id]);
       if (site.rows.length === 0) throw Object.assign(new Error('Site not found for this tenant'), { statusCode: 404 });
+      const tenant=(await client.query('SELECT timezone FROM tenants WHERE id=$1',[tenant_id])).rows[0]||{},zone=tenant.timezone||'UTC';
+      const routeIds=[...new Set(patrolAssignments.map(x=>Number(x.route_id)))];
+      const routes=routeIds.length?(await client.query(`SELECT id,name,site_id,active FROM patrol_routes WHERE tenant_id=$1 AND id=ANY($2::int[])`,[tenant_id,routeIds])).rows:[];
+      if(routes.length!==routeIds.length||routes.some(route=>!route.active||Number(route.site_id)!==Number(site_id)))throw Object.assign(new Error('Each selected patrol route must be active and belong to the shift site'),{statusCode:400});
+      for(const date of dates){
+        const shiftStart=DateTime.fromISO(`${date.toISODate()}T${start_time}`,{zone}),shiftEndBase=DateTime.fromISO(`${date.toISODate()}T${end_time}`,{zone}),shiftEnd=shiftEndBase<=shiftStart?shiftEndBase.plus({days:1}):shiftEndBase;
+        for(const patrol of patrolAssignments){let patrolStart=DateTime.fromISO(`${date.toISODate()}T${patrol.start_time}`,{zone});if(patrolStart<shiftStart&&shiftEnd.day!==shiftStart.day)patrolStart=patrolStart.plus({days:1});let patrolEnd=DateTime.fromISO(`${patrolStart.toISODate()}T${patrol.end_time}`,{zone});if(patrolEnd<=patrolStart)patrolEnd=patrolEnd.plus({days:1});if(!patrolStart.isValid||!patrolEnd.isValid||patrolStart<shiftStart||patrolEnd>shiftEnd)throw Object.assign(new Error(`Patrol ${patrol.start_time}–${patrol.end_time} must be inside the ${start_time}–${end_time} shift window`),{statusCode:400});}
+      }
 
       const analysis = await analyseProposedShifts(client, tenant_id, user_id, dates, start_time, end_time, breakMinutes);
       if (analysis.conflicts.length > 0) {
@@ -4926,19 +4939,22 @@ app.post('/api/shifts', requireAuth, requireAdmin, async (req, res) => {
       if (dry_run) return { dryRun: true, analysis };
 
       const seriesId = recurrenceType === 'none' ? null : crypto.randomUUID();
-      const inserted = [];
-      for (const date of dates) {
+      const inserted = [],patrolRuns=[];
+      await client.query('BEGIN');
+      try{for (const date of dates) {
         const result = await client.query(
           `INSERT INTO shifts (tenant_id, site_id, user_id, shift_date, start_time, end_time, break_minutes, employment_type, recurrence_group_id, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
           [tenant_id, site_id, user_id, date.toISODate(), start_time, end_time, breakMinutes, employmentType, seriesId, notes || null]
         );
-        inserted.push(result.rows[0]);
-      }
-      return { inserted, analysis };
+        const shift=result.rows[0];inserted.push(shift);
+        const shiftStart=DateTime.fromISO(`${date.toISODate()}T${start_time}`,{zone}),shiftEndBase=DateTime.fromISO(`${date.toISODate()}T${end_time}`,{zone}),shiftEnd=shiftEndBase<=shiftStart?shiftEndBase.plus({days:1}):shiftEndBase;
+        for(const patrol of patrolAssignments){let patrolStart=DateTime.fromISO(`${date.toISODate()}T${patrol.start_time}`,{zone});if(patrolStart<shiftStart&&shiftEnd.day!==shiftStart.day)patrolStart=patrolStart.plus({days:1});let patrolEnd=DateTime.fromISO(`${patrolStart.toISODate()}T${patrol.end_time}`,{zone});if(patrolEnd<=patrolStart)patrolEnd=patrolEnd.plus({days:1});const run=(await client.query(`INSERT INTO patrol_runs(tenant_id,route_id,site_id,user_id,scheduled_start,scheduled_end,grace_minutes,notes,shift_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[tenant_id,Number(patrol.route_id),site_id,user_id,patrolStart.toUTC().toISO(),patrolEnd.toUTC().toISO(),Math.max(0,Math.min(120,Number(patrol.grace_minutes??15))),String(patrol.notes||'').trim()||`Automatically scheduled with shift #${shift.id}`,shift.id])).rows[0];patrolRuns.push(run);}
+      }await client.query('COMMIT');}catch(error){await client.query('ROLLBACK');throw error;}
+      return { inserted, patrolRuns, analysis };
     });
     if (shifts.dryRun) return res.json({ valid: true, ...shifts.analysis });
-    res.status(201).json({ created_count: shifts.inserted.length, recurrence_group_id: shifts.inserted[0].recurrence_group_id, shifts: shifts.inserted, warnings: shifts.analysis.warnings });
+    res.status(201).json({ created_count: shifts.inserted.length, patrol_created_count:shifts.patrolRuns.length, recurrence_group_id: shifts.inserted[0].recurrence_group_id, shifts: shifts.inserted, patrol_runs:shifts.patrolRuns, warnings: shifts.analysis.warnings });
   } catch (err) {
     res.status(err.statusCode || 500).json({ error: err.message, code: err.code, conflicts: err.conflicts, availability_conflicts:err.availability_conflicts });
   }

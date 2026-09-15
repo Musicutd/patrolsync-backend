@@ -3256,7 +3256,7 @@ app.get('/api/guard-progress', requireAuth, async (req, res) => {
       const assignment = assignmentRes.rows[0];
 
       const checkpointsRes = await client.query(
-        'SELECT id, name FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY name',
+        'SELECT id, name, floor FROM checkpoints WHERE tenant_id = $1 AND site_id = $2 ORDER BY floor NULLS LAST, name',
         [tenant_id, site_id]
       );
       const checkpoints = checkpointsRes.rows;
@@ -3278,7 +3278,7 @@ app.get('/api/guard-progress', requireAuth, async (req, res) => {
         scanned_count: scannedIds.size,
         target,
         round_complete: scannedIds.size >= target,
-        remaining: remaining.map(c => ({ checkpoint_id: c.id, name: c.name })),
+        remaining: remaining.map(c => ({ checkpoint_id: c.id, name: c.name, level: c.floor || null })),
         round_started_at: roundStart
       };
     });

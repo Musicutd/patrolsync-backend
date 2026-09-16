@@ -33,4 +33,5 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: node --check index.js
       - run: node --check vision-access.js
+      - run: node --check vision-routes.js
       - run: node --test

@@ -8,7 +8,8 @@ const QRCode = require('qrcode');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 require('dotenv').config();
-const { VISION_FLAG, VISION_FEATURE, VISION_PERMISSIONS, visionGlobalEnabled, queryVisionFlag, visionDecision } = require('./vision-access');
+const { VISION_FLAG, VISION_FEATURE, VISION_PERMISSIONS } = require('./vision-access');
+const { registerVisionRoutes } = require('./vision-routes');
 
 const IS_PRODUCTION=String(process.env.NODE_ENV||'').toLowerCase()==='production';
 function normalizedOrigin(value){try{return new URL(String(value||'').trim()).origin}catch(_){return null}}
@@ -534,19 +535,7 @@ async function resolveTenantEntitlement(tenantId,featureCode,client=pool){
   return result.rows[0]||null;
 }
 async function canUseFeature(tenantId,featureCode,client=pool){const entitlement=await resolveTenantEntitlement(tenantId,featureCode,client);return{allowed:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),mode:ENTITLEMENT_ENGINE_MODE,entitlement};}
-async function resolveVisionAccess(req){
-  if(!visionGlobalEnabled())return{enabled:false,reason:'not_enabled'};
-  await requireEntitlementSchema();
-  return withTenant(req.auth.tenant_id,async client=>{
-    const flag=await queryVisionFlag(client,req.auth.tenant_id);
-    const entitlement=await resolveTenantEntitlement(req.auth.tenant_id,VISION_FEATURE,client);
-    return visionDecision({globalEnabled:true,platformFlag:Boolean(flag?.platform_flag),tenantFlag:Boolean(flag?.tenant_flag),entitlement:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),tenantId:req.auth.tenant_id,flagTenantId:flag?.flag_tenant_id,entitlementTenantId:entitlement?.tenant_id,role:req.auth.role,permissions:req.auth.permissions||[]});
-  });
-}
-function requireVisionPermission(level){return(req,res,next)=>{const permission=VISION_PERMISSIONS[level];if(!permission)return res.status(500).json({error:'Invalid Vision permission'});if(req.auth?.role==='admin')return next();if(req.auth?.role!=='staff'||!req.auth.permissions?.includes(permission))return res.status(403).json({error:'Vision permission required'});next()}}
-async function requireVisionAccess(req,res,next){try{const access=await resolveVisionAccess(req);if(!access.enabled)return res.status(403).json({error:'Vision is not available'});next()}catch(error){res.status(503).json({error:'Vision access is temporarily unavailable'})}}
-app.get('/api/vision/status',requireAuth,requireAdmin,requireVisionPermission('view'),async(req,res)=>{try{const access=await resolveVisionAccess(req);res.json({enabled:access.enabled,reason:access.reason,capabilities:access.enabled?{overview:true,cameras:false,events:false,occupancy:false}:null})}catch(error){res.status(503).json({error:'Vision status is temporarily unavailable'})}});
-app.get('/api/vision/capabilities',requireAuth,requireAdmin,requireVisionPermission('view'),requireVisionAccess,(req,res)=>res.json({overview:true,cameras:false,events:false,occupancy:false}));
+registerVisionRoutes(app,{requireAuth,requireAdmin,requireEntitlementSchema,withTenant,resolveTenantEntitlement});
 async function recordUsageEvent({tenantId,featureCode,quantity=1,idempotencyKey,sourceObjectType=null,sourceObjectId=null,metadata={}}){
   if(!idempotencyKey)throw new Error('Usage idempotency key is required');
   return withTenant(tenantId,async client=>{try{

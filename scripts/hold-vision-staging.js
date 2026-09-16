@@ -10,6 +10,10 @@ async function main() {
     const result = await bootstrap();
     console.log(`Vision staging baseline ${result.alreadyInitialized ? 'verified' : 'created'}; API remains inactive.`);
   }
+  if (process.env.PATROLSYNC_STAGING_VERIFY === 'VERIFY_BASELINE') {
+    const result = await require('./verify-vision-staging-baseline').verify();
+    console.log(`Vision staging read-only audit passed: ${result.tables} RLS tables, ${result.policies} policies, restricted login, empty data. API remains inactive.`);
+  }
   http.createServer((request, response) => {
     response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end('PatrolSync Vision staging is not initialized');

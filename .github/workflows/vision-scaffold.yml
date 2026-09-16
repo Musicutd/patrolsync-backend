@@ -36,5 +36,9 @@ jobs:
       - run: node --check vision-routes.js
       - run: node --check vision-entitlement.js
       - run: node --test
-      - run: node scripts/verify-vision-staging-startup.js
+      - name: Repeat clean-database startup to detect initialization races
+        run: |
+          node scripts/verify-vision-staging-startup.js
+          node scripts/verify-vision-staging-startup.js
+          node scripts/verify-vision-staging-startup.js
 

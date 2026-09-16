@@ -88,6 +88,25 @@ async function main() {
     assert.ok(healthy, `API health did not become ready. Output:\n${output}`);
     assert.deepEqual(missingTables, [], `Missing startup tables: ${missingTables.join(', ')}. ${tables} tables initialized. Output:\n${output}`);
     assert.doesNotMatch(output, /setup failed:|unhandled_rejection/i, `Startup error:\n${output}`);
+    const audit = new Client({ connectionString: target.href });
+    await audit.connect();
+    try {
+      const coverage = await audit.query(`
+        SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+          AND EXISTS (
+            SELECT 1 FROM pg_attribute a
+            WHERE a.attrelid = c.oid AND a.attname = 'tenant_id'
+              AND a.attnum > 0 AND NOT a.attisdropped
+          )
+        ORDER BY c.relname
+      `);
+      const uncovered = coverage.rows.filter(row => !row.rls_enabled).map(row => row.table_name);
+      console.log(`Tenant-keyed RLS coverage: ${coverage.rows.length - uncovered.length}/${coverage.rows.length}.`);
+      if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
+    } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {
     if (child && child.exitCode === null) {

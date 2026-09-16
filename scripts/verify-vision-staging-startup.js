@@ -192,9 +192,15 @@ async function main() {
       const { user_id: userId, own_tenant_id: ownTenantId, other_tenant_id: otherTenantId } = account.rows[0];
       const token = jwt.sign({ user_id: userId, tenant_id: ownTenantId, role: 'admin', email: 'vision-http-admin@example.test' },
         process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const ownSites = await fetch(`http://127.0.0.1:${port}/api/sites?tenant_id=${ownTenantId}`, {
+        headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000)
+      });
+      assert.equal(ownSites.status, 200, 'A matching signed-in tenant must retain normal site access');
+      assert.deepEqual(await ownSites.json(), []);
       for (const [method, route, body] of [
         ['GET', `/api/usage?tenant_id=${otherTenantId}`],
         ['GET', `/api/notifications?tenant_id=${otherTenantId}`],
+        ['GET', `/api/sites?tenant_id=${ownTenantId}&tenant_id=${otherTenantId}`],
         ['POST', '/api/sos', { tenant_id: otherTenantId, message: 'CI only' }]
       ]) {
         const response = await fetch(`http://127.0.0.1:${port}${route}`, {
@@ -204,7 +210,7 @@ async function main() {
         assert.equal(response.status, 403, `${method} ${route} must reject a foreign tenant`);
         assert.equal((await response.json()).error, 'Tenant access denied');
       }
-      console.log('Subscriber HTTP tenant binding: forged query and body tenant IDs rejected.');
+      console.log('Subscriber HTTP tenant binding: matching tenant allowed; forged query/body tenant IDs rejected.');
       const coverage = await audit.query(`
         SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled
         FROM pg_class c

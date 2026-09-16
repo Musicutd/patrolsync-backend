@@ -56,6 +56,14 @@ CREATE TABLE alert_log (
   checkpoint_id INTEGER NOT NULL, last_alerted_at TIMESTAMP NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, checkpoint_id)
 );
+-- Existing production has this app-created table. Pre-create it in a fresh
+-- staging database because startup otherwise races its CREATE and ALTER calls.
+CREATE TABLE guard_assignments (
+  id SERIAL PRIMARY KEY, tenant_id INTEGER NOT NULL,
+  site_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT now(), round_size INTEGER,
+  UNIQUE (tenant_id, site_id, user_id)
+);
 
 CREATE INDEX idx_sites_tenant ON sites(tenant_id);
 CREATE INDEX idx_users_tenant ON users(tenant_id);
@@ -80,6 +88,7 @@ ALTER TABLE checkpoints ENABLE ROW LEVEL SECURITY;
 ALTER TABLE patrol_schedules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE patrol_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE alert_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE guard_assignments ENABLE ROW LEVEL SECURITY;
 
 -- This fixture uses a disposable restricted role created by the integration test.
 CREATE POLICY tenant_row ON tenants TO vision_base_reader
@@ -101,6 +110,9 @@ CREATE POLICY tenant_row ON patrol_logs TO vision_base_reader
   USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
   WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer);
 CREATE POLICY tenant_row ON alert_log TO vision_base_reader
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer);
+CREATE POLICY tenant_row ON guard_assignments TO vision_base_reader
   USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
   WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer);
 

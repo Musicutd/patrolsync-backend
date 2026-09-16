@@ -100,6 +100,15 @@ const DISPATCH_SAFETY_GRANTS = Object.freeze({
   notifications: 'SELECT,UPDATE,DELETE',
   communication_notifications: 'SELECT,INSERT,UPDATE,DELETE'
 });
+const COMMUNICATION_LONE_WORKER_GRANTS = Object.freeze({
+  communication_notification_receipts: 'SELECT,INSERT,UPDATE',
+  team_conversations: 'SELECT,INSERT,UPDATE',
+  team_messages: 'SELECT,INSERT',
+  team_conversation_reads: 'SELECT,INSERT,UPDATE',
+  lone_worker_settings: 'SELECT,INSERT,UPDATE',
+  lone_worker_checkins: 'SELECT,INSERT',
+  lone_worker_alerts: 'SELECT,UPDATE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -285,7 +294,25 @@ async function main() {
           && row.qual?.includes('app.current_tenant')
           && row.with_check?.includes('app.current_tenant')),
         'Every added policy must be scoped to the restricted role and tenant context');
-        const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS, ...DISPATCH_SAFETY_GRANTS };
+        // Parent IDs are globally unique, but the existing single-column FKs
+        // do not prevent an own-tenant child from referencing another tenant's
+        // parent. Prototype matching composite FKs before child-table grants.
+        for (const [parent, child, childColumn] of [
+          ['communication_notifications', 'communication_notification_receipts', 'notification_id'],
+          ['team_conversations', 'team_messages', 'conversation_id'],
+          ['team_conversations', 'team_conversation_reads', 'conversation_id'],
+          ['lone_worker_settings', 'lone_worker_checkins', 'setting_id'],
+          ['lone_worker_settings', 'lone_worker_alerts', 'setting_id']
+        ]) {
+          const uniqueName = `vision_ci_${parent}_tenant_id_unique`;
+          if (!(await audit.query(`SELECT 1 FROM pg_constraint WHERE conname=$1`, [uniqueName])).rowCount) {
+            await audit.query(`ALTER TABLE public.${parent} ADD CONSTRAINT ${uniqueName} UNIQUE(tenant_id,id)`);
+          }
+          await audit.query(`ALTER TABLE public.${child} ADD CONSTRAINT vision_ci_${child}_tenant_parent_fk
+            FOREIGN KEY(tenant_id,${childColumn}) REFERENCES public.${parent}(tenant_id,id)`);
+        }
+        const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
+          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -313,10 +340,21 @@ async function main() {
           VALUES($1,'VISION-CI-ONE','CI dispatch',100),($2,'VISION-CI-TWO','CI dispatch',200)`, [oneId, twoId]);
         await audit.query(`INSERT INTO sos_alerts(tenant_id,site_id,user_id)
           VALUES($1,$2,100),($3,$4,200)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const conversations = await audit.query(`INSERT INTO team_conversations(tenant_id,title,kind)
+          VALUES($1,'CI One Announcements','company'),($2,'CI Two Announcements','company') RETURNING id,tenant_id`, [oneId, twoId]);
+        const messages = await audit.query(`INSERT INTO communication_notifications(tenant_id,title,message)
+          VALUES($1,'CI One Notice','one'),($2,'CI Two Notice','two') RETURNING id,tenant_id`, [oneId, twoId]);
+        const settings = await audit.query(`INSERT INTO lone_worker_settings(tenant_id,user_id,site_id)
+          VALUES($1,100,$2),($3,200,$4) RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const otherConversationId = conversations.rows.find(row => Number(row.tenant_id) === twoId).id;
+        const otherNotificationId = messages.rows.find(row => Number(row.tenant_id) === twoId).id;
+        const otherSettingId = settings.rows.find(row => Number(row.tenant_id) === twoId).id;
         await audit.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
         await audit.query(`GRANT SELECT,UPDATE ON public.system_events TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.patrol_routes_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.shifts_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.team_messages_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.lone_worker_checkins_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -334,6 +372,20 @@ async function main() {
         assert.equal(await visibleShifts(), 1, 'Tenant one must see only its own shift');
         assert.equal(await visibleDispatch(), 1, 'Tenant one must see only its own dispatch');
         assert.equal(await visibleSos(), 1, 'Tenant one must see only its own SOS alert');
+        for (const [label, sql, params] of [
+          ['team message', `INSERT INTO team_messages(tenant_id,conversation_id,sender_user_id,sender_role,message)
+            VALUES($1,$2,100,'admin','CI cross-tenant')`, [oneId, otherConversationId]],
+          ['message receipt', `INSERT INTO communication_notification_receipts(tenant_id,notification_id,user_id)
+            VALUES($1,$2,100)`, [oneId, otherNotificationId]],
+          ['lone-worker check-in', `INSERT INTO lone_worker_checkins(tenant_id,setting_id,user_id,site_id)
+            VALUES($1,$2,100,$3)`, [oneId, otherSettingId, oneSite.rows[0].id]]
+        ]) {
+          await audit.query('SAVEPOINT vision_ci_cross_tenant_fk');
+          await assert.rejects(audit.query(sql, params), error => error.code === '23503',
+            `${label} must reject a parent belonging to another tenant`);
+          await audit.query('ROLLBACK TO SAVEPOINT vision_ci_cross_tenant_fk');
+          await audit.query('RELEASE SAVEPOINT vision_ci_cross_tenant_fk');
+        }
         assert.equal((await audit.query(`UPDATE dispatch_jobs SET status='accepted' WHERE tenant_id=$1 AND title='CI dispatch'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE sos_alerts SET status='resolved' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE patrol_routes SET active=FALSE WHERE tenant_id=$1 AND name='CI Route'`, [twoId])).rowCount, 0);

@@ -15,7 +15,7 @@ The backend GitHub repository contains `package.json` and a legacy `run-migratio
 
 ## Audit method and evidence boundary
 
-The audit inspected the supplied workspace, the current `work/` production snapshot, the linked GitHub backend repository root and package/migration files, existing architecture and implementation status documents, deployment instructions, SQL isolation scripts, backend route/table/job declarations, authentication and permission middleware, plan and entitlement configuration, Stripe integration, object storage, email delivery, client portal boundaries, and deployment environment references. GitHub `main` is currently unprotected and has no required status checks; this is a repository governance concern before Vision code work. The 118 frontend pages are local workspace evidence, not files in the linked backend repository.
+The audit inspected the supplied workspace, the current `work/` production snapshot, the linked GitHub backend repository root and package/migration files, existing architecture and implementation status documents, deployment instructions, SQL isolation scripts, backend route/table/job declarations, authentication and permission middleware, plan and entitlement configuration, Stripe integration, object storage, email delivery, client portal boundaries, and deployment environment references. GitHub backend `main` is currently unprotected and has no required status checks; this is a repository governance concern before Vision code work. The 118 frontend pages are local workspace evidence, not files in the linked backend repository. A separate `Musicutd/patrolsync-frontend` repository is accessible; its `dashboard.html` blob exactly matches local `work/dashboard.html` (`7e20616405a5233f04e132a45d1df422a0ef8fe3`).
 
 Static syntax checks passed for:
 
@@ -265,7 +265,7 @@ This commercial decision is not a blocker for V01 scaffolding, but it is a block
 
 ### Required approach
 
-1. Use the confirmed `Musicutd/patrolsync-backend` repository and add a dependency lockfile; obtain or clone the separately deployed frontend repository if it exists.
+1. Use the confirmed `Musicutd/patrolsync-backend` repository and add a dependency lockfile; use the confirmed `Musicutd/patrolsync-frontend` repository for frontend work after verifying the production deployment source.
 2. Introduce an explicit ordered migration directory and migration ledger. Do not repurpose the historical `run-migration.js` without a controlled baseline review.
 3. Baseline the live database without recreating existing tables.
 4. Add Vision tables incrementally, initially unused and behind flags.
@@ -390,7 +390,7 @@ The in-process job system is protected by advisory locks, but it still depends o
 
 The specification's V01 to V20 order is sound, with these repository prerequisites inserted:
 
-0. **Repository controls prerequisite:** use the confirmed backend repository; add a lockfile, secret-safe environment example, test command, CI, branch protection and migration ledger. Confirm the separate frontend deployment source before editing its navigation.
+0. **Repository controls prerequisite:** use the confirmed backend and frontend repositories; add a backend lockfile, secret-safe environment example, test command, CI, branch protection and migration ledger. Verify the frontend deployment source before publishing navigation changes.
 1. **V01 Vision scaffolding:** disabled global and tenant flags, Vision feature code, permission constants, server status guard, native navigation placeholder, internal contracts and docs. No camera data tables.
 2. **V02 plans and entitlements:** resolve the plan-ladder conflict; version the catalogue; add camera SKUs/classes and active-camera usage semantics.
 3. **V03 database foundation:** explicit migrations for the Vision core tables, RLS, grants, constraints, indexes and rollback/disable strategy.
@@ -448,5 +448,5 @@ V01 establishes a disabled, native-looking Vision boundary without adding CCTV p
 
 ## V00 decision
 
-**Decision: proceed to V01 scaffolding, conditionally.** There is no architectural conflict requiring a PatrolSync rewrite. The existing product foundations are suitable and should be reused. The authoritative backend repository is confirmed; before V02/V03 production work, a lockfile, automated tests and migration mechanism must be present. The plan-catalogue conflict must be resolved before Vision pricing or entitlements are activated. Frontend changes require confirmation of the separately deployed frontend repository.
+**Decision: proceed to V01 scaffolding, conditionally.** There is no architectural conflict requiring a PatrolSync rewrite. The existing product foundations are suitable and should be reused. The backend and frontend repositories are confirmed; before V02/V03 production work, a lockfile, automated tests and migration mechanism must be present. The plan-catalogue conflict must be resolved before Vision pricing or entitlements are activated. Frontend publishing requires verification that production deploys from the confirmed frontend repository.
 

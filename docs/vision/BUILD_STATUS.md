@@ -10,7 +10,7 @@ Next stage: V01 Vision Scaffolding
 | Stage | Status | Exit evidence or dependency |
 |---|---|---|
 | V00 Repository Audit | Complete | Real supplied workspace audited; architecture, reuse, gaps, risks, database expectations and V01 plan documented. |
-| V01 Vision Scaffolding | Not started | Backend Git repository confirmed; add lockfile/test baseline and identify the separate frontend source before navigation changes. |
+| V01 Vision Scaffolding | Not started | Backend and frontend Git repositories confirmed; add lockfile/test baseline before navigation changes. |
 | V02 Plans and Entitlements | Not started | Requires a product decision resolving the legacy versus current public plan ladder. |
 | V03 Database Foundation | Not started | Requires an explicit migration framework and live-schema baseline. |
 | V04 Edge Enrolment | Not started | Depends on V03 machine identity tables and security design. |
@@ -77,7 +77,7 @@ No live database query, deployed endpoint test or browser workflow was executed 
 
 ## Known limitations and unresolved issues
 
-1. The supplied local workspace is not a Git checkout; the linked backend repository is accessible through GitHub and can receive a review branch. The separately deployed frontend source has not yet been identified.
+1. The supplied local workspace is not a Git checkout. The backend repository `Musicutd/patrolsync-backend` and frontend repository `Musicutd/patrolsync-frontend` are accessible through GitHub; their `index.js` and `dashboard.html` files respectively match the local snapshot exactly. Confirm the frontend deployment points to that repository before publishing navigation changes.
 2. GitHub `package.json` provides dependency ranges, but exact installed versions and third-party licences cannot be verified without a lockfile.
 3. The original complete base-schema migrations for tenants, users, sites, checkpoints and patrol logs are absent. The existing `run-migration.js` is a one-time legacy organizations migration, not a repeatable migration framework; do not run it for Vision.
 4. Production RLS and environment state were not independently queried; existing readiness evidence must be re-run before V03.

@@ -118,6 +118,7 @@ V01 must not create camera/event tables, connect CCTV streams, add inference dep
 - Extracted the existing entitlement query without changing its SQL and added a second disposable PostgreSQL/Express integration test using the real query, tenant RLS, explicit override and expiration. GitHub CI passed all seven backend tests with `npm ci`.
 - Extended that test to load unchanged production JWT/session and staff-permission middleware in isolation. It passed missing/invalid token, revoked-session, disabled-account, guard, unpermitted-staff and permitted-staff checks without booting production services.
 - Extended the disposable harness to exercise the unchanged password-login handler and tracked-session token issuance before calling the Vision endpoint. Wrong passwords are rejected and a login-issued administrator token follows the same Vision gates. No production authentication or email provider was contacted.
+- Prepared `V01_STAGING_GATE.md` with isolation requirements and a role-by-role deployed acceptance sequence. No staging service or database has been created; the Render account connection is not yet available.
 - Ran local Chromium checks with mocked status responses: disabled and denied direct visits redirect, an enabled placeholder and dashboard navigation render, and a 390px mobile layout has no horizontal overflow. No production records were accessed.
 - Added `V01_SCAFFOLD.md` documenting the exact inactive boundary.
 - Added `V01_CONTRACTS.md` with non-executable edge, camera, count, heartbeat and confidence interface sketches.

@@ -8,7 +8,7 @@ const QRCode = require('qrcode');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 require('dotenv').config();
-const { VISION_FLAG, VISION_FEATURE, VISION_PERMISSIONS, visionGlobalEnabled, visionDecision } = require('./vision-access');
+const { VISION_FLAG, VISION_FEATURE, VISION_PERMISSIONS, visionGlobalEnabled, queryVisionFlag, visionDecision } = require('./vision-access');
 
 const IS_PRODUCTION=String(process.env.NODE_ENV||'').toLowerCase()==='production';
 function normalizedOrigin(value){try{return new URL(String(value||'').trim()).origin}catch(_){return null}}
@@ -538,9 +538,9 @@ async function resolveVisionAccess(req){
   if(!visionGlobalEnabled())return{enabled:false,reason:'not_enabled'};
   await requireEntitlementSchema();
   return withTenant(req.auth.tenant_id,async client=>{
-    const flag=await client.query(`SELECT f.enabled_globally platform_flag,COALESCE(ft.enabled,FALSE) tenant_flag,ft.tenant_id flag_tenant_id FROM feature_flags f LEFT JOIN feature_flag_tenants ft ON ft.flag_id=f.id AND ft.tenant_id=$1 WHERE f.code=$2`,[req.auth.tenant_id,VISION_FLAG]);
+    const flag=await queryVisionFlag(client,req.auth.tenant_id);
     const entitlement=await resolveTenantEntitlement(req.auth.tenant_id,VISION_FEATURE,client);
-    return visionDecision({globalEnabled:true,platformFlag:Boolean(flag.rows[0]?.platform_flag),tenantFlag:Boolean(flag.rows[0]?.tenant_flag),entitlement:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),tenantId:req.auth.tenant_id,flagTenantId:flag.rows[0]?.flag_tenant_id,entitlementTenantId:entitlement?.tenant_id,role:req.auth.role,permissions:req.auth.permissions||[]});
+    return visionDecision({globalEnabled:true,platformFlag:Boolean(flag?.platform_flag),tenantFlag:Boolean(flag?.tenant_flag),entitlement:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),tenantId:req.auth.tenant_id,flagTenantId:flag?.flag_tenant_id,entitlementTenantId:entitlement?.tenant_id,role:req.auth.role,permissions:req.auth.permissions||[]});
   });
 }
 function requireVisionPermission(level){return(req,res,next)=>{const permission=VISION_PERMISSIONS[level];if(!permission)return res.status(500).json({error:'Invalid Vision permission'});if(req.auth?.role==='admin')return next();if(req.auth?.role!=='staff'||!req.auth.permissions?.includes(permission))return res.status(403).json({error:'Vision permission required'});next()}}

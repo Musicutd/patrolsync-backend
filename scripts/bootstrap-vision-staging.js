@@ -16,12 +16,11 @@ const REQUIRED_TABLES = [
   'patrol_schedules', 'service_contracts', 'sites', 'tenants', 'users'
 ];
 
-function validateTarget(env) {
-  if (env.PATROLSYNC_STAGING_BOOTSTRAP !== 'BOOTSTRAP_EMPTY_VISION_DB' ||
-      env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID ||
+function validateStagingConnection(env) {
+  if (env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID ||
       env.RENDER_GIT_BRANCH !== STAGING_BRANCH ||
       env.VISION_ENABLED !== 'false') {
-    throw new Error('Staging bootstrap confirmation, service, branch, or disabled Vision flag is missing');
+    throw new Error('Staging service, branch, or disabled Vision flag is missing');
   }
   let url;
   try { url = new URL(env.SYSTEM_DATABASE_URL || ''); }
@@ -38,6 +37,13 @@ function validateTarget(env) {
     throw new Error('A separate 32–256 character staging tenant-role password is required');
   }
   return { connectionString: url.href, rolePassword };
+}
+
+function validateTarget(env) {
+  if (env.PATROLSYNC_STAGING_BOOTSTRAP !== 'BOOTSTRAP_EMPTY_VISION_DB') {
+    throw new Error('Staging bootstrap confirmation is missing');
+  }
+  return validateStagingConnection(env);
 }
 
 function quoteLiteral(value) { return `'${String(value).replaceAll("'", "''")}'`; }
@@ -107,5 +113,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = { validateTarget, bootstrap };
+module.exports = { validateTarget, validateStagingConnection, bootstrap };
 

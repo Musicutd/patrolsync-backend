@@ -12,7 +12,7 @@ Access requires all of the following:
 
 The status decision also checks that the returned flag and entitlement rows belong to the authenticated tenant. Missing or mismatched tenant IDs fail closed.
 
-A disposable PostgreSQL CI test exercises the rollout-flag query with the restricted database role and a tenant RLS policy. It demonstrates that a different tenant context cannot read an enabled flag. An isolated Express HTTP test also exercises the status and capabilities routes with injected authentication, tenant, entitlement and schema dependencies, including disabled, denied, role-restricted and schema-failure cases. Neither test yet exercises the full production authentication and entitlement path against a representative base schema.
+A disposable PostgreSQL CI test exercises the rollout-flag query with the restricted database role and a tenant RLS policy. A second disposable PostgreSQL/Express test runs the actual tenant-scoped flag and entitlement queries through the status route. It confirms that a flag alone is insufficient, a tenant-specific entitlement enables only that tenant, and expiration disables access. Another isolated HTTP test covers disabled, denied, role-restricted and schema-failure cases. Production JWT/session middleware is still untested end-to-end against a representative base schema.
 
 The `vision_access` feature is inserted **after** plan-feature seeding, so no existing plan receives it automatically, including Enterprise. The two Vision catalogue records are inserted idempotently into existing tables; no Vision data tables or irreversible migration are introduced. Do not turn on any flag or entitlement during V01 review.
 

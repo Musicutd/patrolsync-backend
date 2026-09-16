@@ -8,6 +8,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { setTimeout: delay } = require('node:timers/promises');
 const { Client } = require('pg');
+const jwt = require('jsonwebtoken');
 
 const TEST_DB = 'vision_startup_ci';
 const TEST_ROLE = 'vision_startup_reader';
@@ -179,6 +180,31 @@ async function main() {
     const audit = new Client({ connectionString: target.href });
     await audit.connect();
     try {
+      // HTTP regression: legacy subscriber endpoints must reject a tenant_id
+      // different from the one in the signed token before selecting RLS context.
+      const account = await audit.query(`WITH own AS (
+        INSERT INTO tenants(name,slug) VALUES('HTTP One','vision-http-one') RETURNING id
+      ), other AS (
+        INSERT INTO tenants(name,slug) VALUES('HTTP Two','vision-http-two') RETURNING id
+      ), actor AS (
+        INSERT INTO users(tenant_id,email,role) SELECT id,'vision-http-admin@example.test','admin' FROM own RETURNING id,tenant_id
+      ) SELECT actor.id AS user_id, actor.tenant_id AS own_tenant_id, other.id AS other_tenant_id FROM actor CROSS JOIN other`);
+      const { user_id: userId, own_tenant_id: ownTenantId, other_tenant_id: otherTenantId } = account.rows[0];
+      const token = jwt.sign({ user_id: userId, tenant_id: ownTenantId, role: 'admin', email: 'vision-http-admin@example.test' },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      for (const [method, route, body] of [
+        ['GET', `/api/usage?tenant_id=${otherTenantId}`],
+        ['GET', `/api/notifications?tenant_id=${otherTenantId}`],
+        ['POST', '/api/sos', { tenant_id: otherTenantId, message: 'CI only' }]
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+          method, headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+          ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5000)
+        });
+        assert.equal(response.status, 403, `${method} ${route} must reject a foreign tenant`);
+        assert.equal((await response.json()).error, 'Tenant access denied');
+      }
+      console.log('Subscriber HTTP tenant binding: forged query and body tenant IDs rejected.');
       const coverage = await audit.query(`
         SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled
         FROM pg_class c

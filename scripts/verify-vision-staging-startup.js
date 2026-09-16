@@ -11,6 +11,65 @@ const { Client } = require('pg');
 
 const TEST_DB = 'vision_startup_ci';
 const TEST_ROLE = 'vision_startup_reader';
+// Review-only snapshot of the previously unprotected tables on a clean startup.
+// Any addition, removal, or rename must stop CI for a fresh security review.
+const EXPECTED_UNCOVERED_TABLES = Object.freeze([
+  'asset_custody',
+  'attendance_breaks',
+  'attendance_sessions',
+  'audit_logs',
+  'auth_sessions',
+  'client_report_runs',
+  'client_report_schedules',
+  'client_users',
+  'communication_notification_receipts',
+  'communication_notifications',
+  'contract_renewal_history',
+  'contract_renewals',
+  'corrective_actions',
+  'dispatch_jobs',
+  'email_deliveries',
+  'guard_availability',
+  'guard_certifications',
+  'guard_location_history',
+  'guard_locations',
+  'handover_logs',
+  'incident_activities',
+  'incident_photos',
+  'incidents',
+  'inspection_runs',
+  'inspection_templates',
+  'integration_api_keys',
+  'invoice_payments',
+  'invoices',
+  'leave_requests',
+  'lone_worker_alerts',
+  'lone_worker_checkins',
+  'lone_worker_settings',
+  'managed_assets',
+  'notifications',
+  'password_reset_tokens',
+  'patrol_alerts',
+  'patrol_route_checkpoints',
+  'patrol_routes',
+  'patrol_run_scans',
+  'patrol_runs',
+  'service_ticket_comments',
+  'service_tickets',
+  'shift_swap_requests',
+  'shift_templates',
+  'shifts',
+  'sos_alerts',
+  'system_events',
+  'team_conversation_reads',
+  'team_conversations',
+  'team_messages',
+  'timesheets',
+  'training_assignments',
+  'training_materials',
+  'webhook_deliveries',
+  'webhook_endpoints',
+]);
 
 async function freePort() {
   const server = net.createServer();
@@ -106,6 +165,8 @@ async function main() {
       const uncovered = coverage.rows.filter(row => !row.rls_enabled).map(row => row.table_name);
       console.log(`Tenant-keyed RLS coverage: ${coverage.rows.length - uncovered.length}/${coverage.rows.length}.`);
       if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
+      assert.deepEqual(uncovered, EXPECTED_UNCOVERED_TABLES,
+        'Clean-startup RLS inventory changed; review table ownership before extending the prototype');
       // Prototype the missing-table policy in this disposable CI database only.
       // ROLLBACK ensures this test does not represent an applied migration.
       await audit.query('BEGIN');
@@ -129,6 +190,17 @@ async function main() {
               AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
         `);
         assert.equal(after.rows[0].protected, after.rows[0].total);
+        const addedPolicies = await audit.query(`
+          SELECT tablename, roles::text AS roles, qual, with_check
+          FROM pg_policies
+          WHERE schemaname='public' AND policyname='vision_ci_tenant_isolation'
+          ORDER BY tablename
+        `);
+        assert.deepEqual(addedPolicies.rows.map(row => row.tablename), EXPECTED_UNCOVERED_TABLES);
+        assert.ok(addedPolicies.rows.every(row => row.roles.includes(TEST_ROLE)
+          && row.qual?.includes('app.current_tenant')
+          && row.with_check?.includes('app.current_tenant')),
+        'Every added policy must be scoped to the restricted role and tenant context');
         assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
         const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
         const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);

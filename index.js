@@ -361,6 +361,15 @@ async function requireAuth(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
+    // Subscriber requests may name their company for legacy clients, but that
+    // value must never select a different RLS tenant than the signed token.
+    const authenticatedTenant = Number(req.auth.tenant_id);
+    const requestedTenants = [req.query?.tenant_id, req.body?.tenant_id]
+      .filter(value => value !== undefined && value !== null && value !== '');
+    if (!Number.isInteger(authenticatedTenant) || authenticatedTenant < 1 ||
+        requestedTenants.some(value => !Number.isInteger(Number(value)) || Number(value) !== authenticatedTenant)) {
+      return res.status(403).json({ error: 'Tenant access denied' });
+    }
     const tenantState=await pool.query(`SELECT COALESCE(account_active,TRUE) active FROM tenants WHERE id=$1`,[req.auth.tenant_id]);
     if(!tenantState.rowCount||tenantState.rows[0].active===false)return res.status(403).json({error:'Company subscription is suspended. Contact PatrolSync support.'});
     if(req.auth.role==='client')return next();

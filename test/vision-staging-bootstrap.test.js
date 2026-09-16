@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { validateTarget } = require('../scripts/bootstrap-vision-staging');
+const { validateTarget, validateStagingConnection } = require('../scripts/bootstrap-vision-staging');
 
 const valid = {
   PATROLSYNC_STAGING_BOOTSTRAP: 'BOOTSTRAP_EMPTY_VISION_DB',
@@ -26,5 +26,12 @@ test('only the approved staging service and database can bootstrap', () => {
   ]) {
     assert.throws(() => validateTarget({ ...valid, [key]: value }), key);
   }
+});
+
+test('read-only checks can validate the staging connection without bootstrap permission', () => {
+  const checking = { ...valid, PATROLSYNC_STAGING_BOOTSTRAP: '' };
+  assert.equal(validateStagingConnection(checking).rolePassword, valid.STAGING_TENANT_ROLE_PASSWORD);
+  assert.throws(() => validateTarget(checking));
+  assert.throws(() => validateStagingConnection({ ...checking, RENDER_SERVICE_ID: 'srv-production' }));
 });
 

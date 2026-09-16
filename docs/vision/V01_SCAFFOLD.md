@@ -12,6 +12,8 @@ Access requires all of the following:
 
 The status decision also checks that the returned flag and entitlement rows belong to the authenticated tenant. Missing or mismatched tenant IDs fail closed.
 
+A disposable PostgreSQL CI test exercises the rollout-flag query with the restricted database role and a tenant RLS policy. It demonstrates that a different tenant context cannot read an enabled flag. This is not yet a full HTTP-route or entitlement integration test.
+
 The `vision_access` feature is inserted **after** plan-feature seeding, so no existing plan receives it automatically, including Enterprise. The two Vision catalogue records are inserted idempotently into existing tables; no Vision data tables or irreversible migration are introduced. Do not turn on any flag or entitlement during V01 review.
 
 `GET /api/vision/status` returns only enabled/disabled status and scaffold capability booleans. `GET /api/vision/capabilities` is forbidden unless every gate passes. Guards, clients and platform tokens cannot use subscriber Vision routes. The frontend adds the navigation entry only after a successful enabled status response; hiding navigation is not the API security boundary.

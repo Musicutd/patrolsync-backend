@@ -10,7 +10,7 @@ Next stage: Complete V01 verification before V02
 | Stage | Status | Exit evidence or dependency |
 |---|---|---|
 | V00 Repository Audit | Complete | Real supplied workspace audited; architecture, reuse, gaps, risks, database expectations and V01 plan documented. |
-| V01 Vision Scaffolding | In progress | Disabled scaffold, unit tests and a generated dependency lockfile are in review; database-backed isolation and frontend acceptance remain unverified. |
+| V01 Vision Scaffolding | In progress | Disabled scaffold, lockfile, unit tests and restricted-role PostgreSQL rollout-flag isolation pass in CI; full endpoint and browser acceptance remain unverified. |
 | V02 Plans and Entitlements | Not started | Requires a product decision resolving the legacy versus current public plan ladder. |
 | V03 Database Foundation | Not started | Requires an explicit migration framework and live-schema baseline. |
 | V04 Edge Enrolment | Not started | Depends on V03 machine identity tables and security design. |
@@ -112,8 +112,9 @@ V01 must not create camera/event tables, connect CCTV streams, add inference dep
 - Added a status-gated placeholder page and navigation in both the dashboard and shared module shell. Added `vision_view` to delegated staff permission management.
 - Added three pure access-decision tests and a syntax/unit CI workflow.
 - Added a fourth pure test that rejects a rollout flag or entitlement belonging to another tenant, and hid the direct placeholder page until an enabled status is confirmed.
+- Added a disposable PostgreSQL CI test that queries the real rollout-flag SQL as a restricted tenant role. It verifies that a tenant cannot see another tenant's enabled flag. The CI run passed all five backend tests after the V01 branch was rebased onto `main`.
 - Added `V01_SCAFFOLD.md` documenting the exact inactive boundary.
 - Added `V01_CONTRACTS.md` with non-executable edge, camera, count, heartbeat and confidence interface sketches.
 - No production deployment, customer entitlement, camera credential, Vision data table, video processing or inference dependency was introduced.
 
-V01 is **not ready for activation**. The workspace has pnpm but no npm. Offline lockfile generation lacked cached registry metadata; online resolution failed TLS certificate verification. TLS checks were not bypassed. A trusted GitHub Actions runner generated `package-lock.json`; CI now uses `npm ci` to verify it. Integration tests against a tenant-isolated database and frontend browser acceptance are still required. Keep `VISION_ENABLED` unset/false and do not merge or deploy the scaffold until the review checks pass.
+V01 is **not ready for activation**. The workspace has pnpm but no npm. Offline lockfile generation lacked cached registry metadata; online resolution failed TLS certificate verification. TLS checks were not bypassed. A trusted GitHub Actions runner generated `package-lock.json`; CI now uses `npm ci` to verify it. The rollout-flag query has passed a restricted-role PostgreSQL integration test, but the full authenticated status endpoint and entitlement path have not been exercised against a representative base schema. Frontend browser acceptance is also pending. Keep `VISION_ENABLED` unset/false and do not merge or deploy the scaffold until the review checks pass.

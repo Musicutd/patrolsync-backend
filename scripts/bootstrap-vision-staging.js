@@ -53,10 +53,21 @@ async function bootstrap(env = process.env) {
     if (identity.db !== STAGING_DATABASE || identity.role !== STAGING_OWNER) {
       throw new Error('Connected database identity differs from the approved staging target');
     }
-    const existing = await client.query("SELECT tablename FROM pg_tables WHERE schemaname = 'public'");
-    if (existing.rowCount !== 0) throw new Error('Refusing to bootstrap a nonempty public schema');
+    const existing = await client.query("SELECT tablename, rowsecurity FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename");
     const roleExists = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [TENANT_ROLE]);
-    if (roleExists.rowCount !== 0) throw new Error('Refusing to reuse an existing staging tenant role');
+    if (existing.rowCount !== 0 || roleExists.rowCount !== 0) {
+      if (roleExists.rowCount === 0 ||
+          JSON.stringify(existing.rows.map(row => row.tablename)) !== JSON.stringify(REQUIRED_TABLES) ||
+          !existing.rows.every(row => row.rowsecurity)) {
+        throw new Error('Refusing to bootstrap a nonempty or partially initialized public schema');
+      }
+      const priorRole = (await client.query('SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb FROM pg_roles WHERE rolname = $1', [TENANT_ROLE])).rows[0];
+      if (!priorRole?.rolcanlogin || priorRole.rolsuper || priorRole.rolbypassrls || priorRole.rolcreaterole || priorRole.rolcreatedb) {
+        throw new Error('Existing staging tenant role is not restricted');
+      }
+      await client.query('COMMIT');
+      return { database: STAGING_DATABASE, tables: existing.rowCount, role: TENANT_ROLE, alreadyInitialized: true };
+    }
 
     await client.query(`CREATE ROLE ${TENANT_ROLE} LOGIN PASSWORD ${quoteLiteral(rolePassword)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
     const fixture = fs.readFileSync(path.join(__dirname, '..', 'test', 'fixtures', 'vision-staging-base.sql'), 'utf8');
@@ -79,7 +90,7 @@ async function bootstrap(env = process.env) {
       throw new Error('Restricted staging role verification failed');
     }
     await client.query('COMMIT');
-    return { database: STAGING_DATABASE, tables: tables.rowCount, role: TENANT_ROLE };
+    return { database: STAGING_DATABASE, tables: tables.rowCount, role: TENANT_ROLE, alreadyInitialized: false };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;
@@ -88,7 +99,7 @@ async function bootstrap(env = process.env) {
 
 if (require.main === module) {
   bootstrap().then(result => {
-    console.log(`Vision staging baseline ready: ${result.tables} RLS tables; restricted role ${result.role}. API remains inactive.`);
+    console.log(`Vision staging baseline ${result.alreadyInitialized ? 'verified' : 'created'}: ${result.tables} RLS tables; restricted role ${result.role}. API remains inactive.`);
   }).catch(error => {
     // Database errors may embed query text; print only their SQLSTATE, never a URL or password.
     console.error(`Vision staging bootstrap refused: ${error.code || error.message}`);

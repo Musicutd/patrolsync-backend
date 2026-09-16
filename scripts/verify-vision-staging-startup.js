@@ -11,6 +11,7 @@ const { Client } = require('pg');
 
 const TEST_DB = 'vision_startup_ci';
 const TEST_ROLE = 'vision_startup_reader';
+const TEST_PASSWORD = 'vision_startup_ci_only';
 // Review-only snapshot of the previously unprotected tables on a clean startup.
 // Any addition, removal, or rename must stop CI for a fresh security review.
 const EXPECTED_UNCOVERED_TABLES = Object.freeze([
@@ -94,12 +95,18 @@ async function main() {
     const db = new Client({ connectionString: target.href });
     await db.connect();
     try {
-      await db.query(`CREATE ROLE ${TEST_ROLE}`);
+      await db.query(`CREATE ROLE ${TEST_ROLE} LOGIN PASSWORD '${TEST_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
       const fixture = fs.readFileSync(path.join(__dirname, '..', 'test', 'fixtures', 'vision-staging-base.sql'), 'utf8');
       await db.query(fixture.replaceAll('vision_base_reader', TEST_ROLE));
+      await db.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
+      await db.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON tenants,sites,users,checkpoints,patrol_schedules,patrol_logs,alert_log,guard_assignments,service_contracts TO ${TEST_ROLE}`);
+      await db.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${TEST_ROLE}`);
     } finally { await db.end(); }
 
     const port = await freePort();
+    const restricted = new URL(target.href);
+    restricted.username = TEST_ROLE;
+    restricted.password = TEST_PASSWORD;
     child = spawn(process.execPath, [
       '--require', path.join(__dirname, '..', 'test', 'helpers', 'local-postgres-no-ssl.js'),
       path.join(__dirname, '..', 'index.js')
@@ -108,7 +115,7 @@ async function main() {
       env: {
         ...process.env, NODE_ENV: 'test', VISION_ENABLED: 'false',
         DATABASE_URL: target.href, SYSTEM_DATABASE_URL: target.href,
-        TENANT_DATABASE_URL: target.href, VISION_TEST_DATABASE_URL: target.href,
+        TENANT_DATABASE_URL: restricted.href, VISION_TEST_DATABASE_URL: target.href,
         PORT: String(port), AI_ASSISTANT_ENABLED: 'false',
         STRIPE_SECRET_KEY: '', OPENAI_API_KEY: '', BREVO_API_KEY: ''
       },
@@ -167,6 +174,22 @@ async function main() {
       if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
       assert.deepEqual(uncovered, EXPECTED_UNCOVERED_TABLES,
         'Clean-startup RLS inventory changed; review table ownership before extending the prototype');
+      const privileges = await audit.query(`
+        SELECT c.relname AS table_name,
+          has_table_privilege($1, format('public.%I',c.relname), 'SELECT') AS can_select,
+          has_table_privilege($1, format('public.%I',c.relname), 'INSERT') AS can_insert,
+          has_table_privilege($1, format('public.%I',c.relname), 'UPDATE') AS can_update,
+          has_table_privilege($1, format('public.%I',c.relname), 'DELETE') AS can_delete
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='public' AND c.relkind IN ('r','p')
+          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid
+            AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
+        ORDER BY c.relname
+      `, [TEST_ROLE]);
+      const readable = privileges.rows.filter(row => row.can_select);
+      const writable = privileges.rows.filter(row => row.can_insert && row.can_update && row.can_delete);
+      console.log(`Restricted-role tenant-table grants: ${readable.length}/${privileges.rowCount} readable; ${writable.length}/${privileges.rowCount} full CRUD.`);
+      console.log(`Tenant-keyed tables without restricted-role SELECT: ${privileges.rows.filter(row => !row.can_select).map(row => row.table_name).join(', ')}.`);
       // Prototype the missing-table policy in this disposable CI database only.
       // ROLLBACK ensures this test does not represent an applied migration.
       await audit.query('BEGIN');

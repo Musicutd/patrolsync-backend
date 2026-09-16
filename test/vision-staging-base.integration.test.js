@@ -25,7 +25,8 @@ test('disposable staging baseline creates legacy tables and isolates tenants', {
     await admin.query(sql);
     const tables = await admin.query(`SELECT tablename, rowsecurity FROM pg_tables WHERE schemaname='vision_base_test' ORDER BY tablename`);
     assert.deepEqual(tables.rows.map(row => row.tablename), [
-      'alert_log', 'checkpoints', 'patrol_logs', 'patrol_schedules', 'sites', 'tenants', 'users'
+      'alert_log', 'checkpoints', 'guard_assignments', 'patrol_logs',
+      'patrol_schedules', 'sites', 'tenants', 'users'
     ]);
     assert.ok(tables.rows.every(row => row.rowsecurity));
     await admin.query(`GRANT USAGE ON SCHEMA vision_base_test TO vision_base_reader`);

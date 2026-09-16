@@ -61,6 +61,13 @@ async function main() {
 
     let healthy = false;
     let tables = 0;
+    let missingTables = [];
+    const sourceCode = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+    const expectedTables = new Set([...sourceCode.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
+      .map(match => match[1].toLowerCase()));
+    for (const name of ['tenants', 'sites', 'users', 'checkpoints', 'patrol_schedules', 'patrol_logs', 'alert_log']) {
+      expectedTables.add(name);
+    }
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline && child.exitCode === null) {
       try {
@@ -69,14 +76,17 @@ async function main() {
         const count = new Client({ connectionString: target.href });
         await count.connect();
         try {
-          tables = Number((await count.query(`SELECT count(*)::int AS total FROM pg_tables WHERE schemaname='public'`)).rows[0].total);
+          const found = new Set((await count.query(`SELECT tablename FROM pg_tables WHERE schemaname='public'`))
+            .rows.map(row => row.tablename));
+          tables = found.size;
+          missingTables = [...expectedTables].filter(name => !found.has(name)).sort();
         } finally { await count.end(); }
-        if (healthy && tables >= 116) break;
+        if (healthy && missingTables.length === 0) break;
       } catch (_) { /* Server is still starting. */ }
       await delay(500);
     }
     assert.ok(healthy, `API health did not become ready. Output:\n${output}`);
-    assert.ok(tables >= 116, `Only ${tables} tables initialized. Output:\n${output}`);
+    assert.deepEqual(missingTables, [], `Missing startup tables: ${missingTables.join(', ')}. ${tables} tables initialized. Output:\n${output}`);
     assert.doesNotMatch(output, /setup failed:|unhandled_rejection/i, `Startup error:\n${output}`);
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {

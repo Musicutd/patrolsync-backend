@@ -2,15 +2,15 @@
 
 Updated: 16 September 2026  
 Master specification: PatrolSync Vision Codex Master Upgrade Specification v1.0  
-Current stage: V00 Repository Audit complete  
-Next stage: V01 Vision Scaffolding
+Current stage: V01 Vision Scaffolding in review  
+Next stage: Complete V01 verification before V02
 
 ## Programme status
 
 | Stage | Status | Exit evidence or dependency |
 |---|---|---|
 | V00 Repository Audit | Complete | Real supplied workspace audited; architecture, reuse, gaps, risks, database expectations and V01 plan documented. |
-| V01 Vision Scaffolding | Not started | Backend and frontend Git repositories confirmed; add lockfile/test baseline before navigation changes. |
+| V01 Vision Scaffolding | In progress | Disabled scaffold, unit tests and a generated dependency lockfile are in review; database-backed isolation and frontend acceptance remain unverified. |
 | V02 Plans and Entitlements | Not started | Requires a product decision resolving the legacy versus current public plan ladder. |
 | V03 Database Foundation | Not started | Requires an explicit migration framework and live-schema baseline. |
 | V04 Edge Enrolment | Not started | Depends on V03 machine identity tables and security design. |
@@ -105,3 +105,15 @@ V01 should implement only:
 
 V01 must not create camera/event tables, connect CCTV streams, add inference dependencies or expose camera credentials.
 
+## V01 work in review
+
+- Added a fail-closed Vision switch, explicit Vision permission names, a tenant-flag and entitlement access decision, and guarded status/capabilities endpoints.
+- Added `vision_access` to the existing feature catalogue without automatically granting it to any plan, plus a disabled `vision_rollout` flag.
+- Added a status-gated placeholder page and navigation in both the dashboard and shared module shell. Added `vision_view` to delegated staff permission management.
+- Added three pure access-decision tests and a syntax/unit CI workflow.
+- Added a fourth pure test that rejects a rollout flag or entitlement belonging to another tenant, and hid the direct placeholder page until an enabled status is confirmed.
+- Added `V01_SCAFFOLD.md` documenting the exact inactive boundary.
+- Added `V01_CONTRACTS.md` with non-executable edge, camera, count, heartbeat and confidence interface sketches.
+- No production deployment, customer entitlement, camera credential, Vision data table, video processing or inference dependency was introduced.
+
+V01 is **not ready for activation**. The workspace has pnpm but no npm. Offline lockfile generation lacked cached registry metadata; online resolution failed TLS certificate verification. TLS checks were not bypassed. A trusted GitHub Actions runner generated `package-lock.json`; CI now uses `npm ci` to verify it. Integration tests against a tenant-isolated database and frontend browser acceptance are still required. Keep `VISION_ENABLED` unset/false and do not merge or deploy the scaffold until the review checks pass.

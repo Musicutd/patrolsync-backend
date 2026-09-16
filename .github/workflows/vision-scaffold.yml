@@ -1,0 +1,20 @@
+name: Vision scaffold checks
+
+on:
+  pull_request:
+  push:
+    branches: [feature/vision-v01-scaffold]
+
+jobs:
+  syntax-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node --check index.js
+      - run: node --check vision-access.js
+      - run: node --test

@@ -71,6 +71,19 @@ const EXPECTED_UNCOVERED_TABLES = Object.freeze([
   'webhook_deliveries',
   'webhook_endpoints',
 ]);
+// Prototype only: operations observed in the attendance, patrol, and incident
+// withTenant() paths. This is not a complete permission map for the application.
+const CORE_WORKFLOW_GRANTS = Object.freeze({
+  attendance_sessions: 'SELECT,INSERT,UPDATE',
+  attendance_breaks: 'SELECT,INSERT,UPDATE',
+  patrol_routes: 'SELECT,INSERT,UPDATE,DELETE',
+  patrol_route_checkpoints: 'SELECT,INSERT,UPDATE,DELETE',
+  patrol_runs: 'SELECT,INSERT,UPDATE',
+  patrol_run_scans: 'SELECT,INSERT',
+  incidents: 'SELECT,INSERT,UPDATE',
+  incident_activities: 'SELECT,INSERT',
+  incident_photos: 'SELECT,INSERT,DELETE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -225,6 +238,17 @@ async function main() {
           && row.qual?.includes('app.current_tenant')
           && row.with_check?.includes('app.current_tenant')),
         'Every added policy must be scoped to the restricted role and tenant context');
+        for (const [table, operations] of Object.entries(CORE_WORKFLOW_GRANTS)) {
+          assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
+          await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
+          for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+            const granted = (await audit.query(`SELECT has_table_privilege($1,$2,$3) AS allowed`,
+              [TEST_ROLE, `public.${table}`, operation])).rows[0].allowed;
+            assert.equal(granted, operations.split(',').includes(operation),
+              `${table} ${operation} differs from reviewed core-workflow scope`);
+          }
+        }
+        console.log(`Disposable core-workflow grant prototype passed: ${Object.keys(CORE_WORKFLOW_GRANTS).length} tables; no blanket grant.`);
         assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
         const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
         const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);

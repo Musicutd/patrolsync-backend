@@ -116,6 +116,7 @@ async function main() {
         ...process.env, NODE_ENV: 'test', VISION_ENABLED: 'false',
         DATABASE_URL: target.href, SYSTEM_DATABASE_URL: target.href,
         TENANT_DATABASE_URL: restricted.href, VISION_TEST_DATABASE_URL: target.href,
+        VISION_TEST_TENANT_DATABASE_URL: restricted.href,
         PORT: String(port), AI_ASSISTANT_ENABLED: 'false',
         STRIPE_SECRET_KEY: '', OPENAI_API_KEY: '', BREVO_API_KEY: ''
       },

@@ -106,6 +106,47 @@ async function main() {
       const uncovered = coverage.rows.filter(row => !row.rls_enabled).map(row => row.table_name);
       console.log(`Tenant-keyed RLS coverage: ${coverage.rows.length - uncovered.length}/${coverage.rows.length}.`);
       if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
+      // Prototype the missing-table policy in this disposable CI database only.
+      // ROLLBACK ensures this test does not represent an applied migration.
+      await audit.query('BEGIN');
+      try {
+        for (const tableName of uncovered) {
+          const policies = await audit.query(`SELECT policyname FROM pg_policies WHERE schemaname='public' AND tablename=$1`, [tableName]);
+          assert.equal(policies.rowCount, 0, `${tableName} has an existing policy requiring manual review`);
+          const table = `"${tableName.replaceAll('"', '""')}"`;
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_tenant_isolation ON public.${table}
+            TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        const after = await audit.query(`
+          SELECT COUNT(*)::int AS total,
+                 COUNT(*) FILTER (WHERE c.relrowsecurity)::int AS protected
+          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='public' AND c.relkind IN ('r','p')
+            AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid
+              AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
+        `);
+        assert.equal(after.rows[0].protected, after.rows[0].total);
+        assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
+        const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
+        const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);
+        const oneId = first.rows[0].id, twoId = second.rows[0].id;
+        await audit.query(`INSERT INTO system_events(tenant_id,event_type,message) VALUES($1,'vision_ci','one'),($2,'vision_ci','two')`, [oneId, twoId]);
+        await audit.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT,UPDATE ON public.system_events TO ${TEST_ROLE}`);
+        await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
+        const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
+        assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
+        await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
+        assert.equal(await visible(), 1, 'Tenant one must see only its own row');
+        assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
+        await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
+        assert.equal(await visible(), 1, 'Tenant two must see only its own row');
+        console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant read/update denied.`);
+      } finally { await audit.query('ROLLBACK'); }
     } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {

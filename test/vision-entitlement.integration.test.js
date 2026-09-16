@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 const { queryVisionFlag } = require('../vision-access');
 const { resolveTenantEntitlement } = require('../vision-entitlement');
 const { registerVisionRoutes } = require('../vision-routes');
@@ -9,6 +12,7 @@ const { registerVisionRoutes } = require('../vision-routes');
 test('Vision HTTP access follows real tenant-scoped flag and entitlement queries', { skip: !process.env.VISION_TEST_DATABASE_URL }, async t => {
   const { Client } = require('pg');
   const express = require('express');
+  const jwt = require('jsonwebtoken');
   const admin = new Client({ connectionString: process.env.VISION_TEST_DATABASE_URL });
   const url = new URL(process.env.VISION_TEST_DATABASE_URL);
   const reader = new Client({ host: url.hostname, port: Number(url.port || 5432), database: url.pathname.slice(1), user: 'vision_v01_entitlement_reader', password: 'vision_v01_test_only' });
@@ -24,6 +28,9 @@ test('Vision HTTP access follows real tenant-scoped flag and entitlement queries
     await admin.query(`CREATE TABLE vision_v01_entitlement.plan_features(plan_id BIGINT NOT NULL,feature_id BIGINT NOT NULL,enabled BOOLEAN NOT NULL, included_quantity NUMERIC,soft_limit NUMERIC,hard_limit NUMERIC)`);
     await admin.query(`CREATE TABLE vision_v01_entitlement.tenant_subscriptions(tenant_id INTEGER NOT NULL,plan_id BIGINT NOT NULL,status TEXT NOT NULL)`);
     await admin.query(`CREATE TABLE vision_v01_entitlement.tenant_entitlement_overrides(tenant_id INTEGER NOT NULL,feature_id BIGINT NOT NULL,enabled BOOLEAN,included_quantity NUMERIC,reason TEXT,expires_at TIMESTAMPTZ)`);
+    await admin.query(`CREATE TABLE vision_v01_entitlement.tenants(id INTEGER PRIMARY KEY,account_active BOOLEAN NOT NULL)`);
+    await admin.query(`CREATE TABLE vision_v01_entitlement.users(id INTEGER PRIMARY KEY,tenant_id INTEGER NOT NULL,role TEXT NOT NULL,permissions TEXT[] NOT NULL DEFAULT '{}',account_active BOOLEAN NOT NULL,password_changed_at TIMESTAMPTZ)`);
+    await admin.query(`CREATE TABLE vision_v01_entitlement.auth_sessions(id UUID PRIMARY KEY,tenant_id INTEGER NOT NULL,user_id INTEGER NOT NULL,revoked_at TIMESTAMPTZ,expires_at TIMESTAMPTZ NOT NULL,last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     for (const table of ['feature_flag_tenants','tenant_subscriptions','tenant_entitlement_overrides']) {
       await admin.query(`ALTER TABLE vision_v01_entitlement.${table} ENABLE ROW LEVEL SECURITY`);
       await admin.query(`CREATE POLICY tenant_isolation ON vision_v01_entitlement.${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int)`);
@@ -35,6 +42,11 @@ test('Vision HTTP access follows real tenant-scoped flag and entitlement queries
     const feature = (await admin.query(`INSERT INTO vision_v01_entitlement.feature_catalog(code,unit) VALUES('vision_access','boolean') RETURNING id`)).rows[0].id;
     await admin.query(`INSERT INTO vision_v01_entitlement.feature_flag_tenants(flag_id,tenant_id,enabled) VALUES($1,11,TRUE),($1,22,TRUE)`, [flag]);
     await admin.query(`INSERT INTO vision_v01_entitlement.tenant_subscriptions(tenant_id,plan_id,status) VALUES(11,$1,'active'),(22,$1,'active')`, [plan]);
+    await admin.query(`INSERT INTO vision_v01_entitlement.tenants(id,account_active) VALUES(11,TRUE),(22,TRUE)`);
+    await admin.query(`INSERT INTO vision_v01_entitlement.users(id,tenant_id,role,permissions,account_active) VALUES(101,11,'admin','{}',TRUE),(102,11,'staff','{}',TRUE),(103,11,'guard','{}',TRUE),(201,22,'admin','{}',TRUE)`);
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    await admin.query(`INSERT INTO vision_v01_entitlement.auth_sessions(id,tenant_id,user_id,expires_at) VALUES($1,11,101,NOW()+INTERVAL '1 hour')`, [sessionId]);
+    await admin.query(`SET search_path TO vision_v01_entitlement`);
     await reader.connect();
     readerConnected = true;
     await reader.query(`SET search_path TO vision_v01_entitlement`);
@@ -45,10 +57,21 @@ test('Vision HTTP access follows real tenant-scoped flag and entitlement queries
       finally { await reader.query(`RESET app.current_tenant`); }
     };
     const app = express();
+    // Load the unchanged middleware declarations from index.js without booting
+    // the full production server or its unrelated schema/background jobs.
+    const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
+    const authStart = source.indexOf('async function requireAuth(req, res, next) {');
+    const authEnd = source.indexOf('\nfunction permissionForPath(', authStart);
+    const adminEnd = source.indexOf('\nfunction requireOwnerAdmin(', authEnd);
+    assert.ok(authStart >= 0 && authEnd > authStart && adminEnd > authEnd);
+    const { requireAuth, requireAdmin } = vm.runInNewContext(
+      `${source.slice(authStart, adminEnd)}\n({ requireAuth, requireAdmin })`,
+      { pool: admin, jwt, JWT_SECRET: 'vision-test-secret', VISION_PERMISSIONS: { view: 'vision_view' } }
+    );
     registerVisionRoutes(app, {
       globalEnabled: () => globalOn,
-      requireAuth: (req, res, next) => { req.auth = { tenant_id: Number(req.headers['x-test-tenant']), role: 'admin' }; next(); },
-      requireAdmin: (_req, _res, next) => next(),
+      requireAuth,
+      requireAdmin,
       requireEntitlementSchema: async () => {},
       withTenant,
       resolveTenantEntitlement
@@ -56,25 +79,39 @@ test('Vision HTTP access follows real tenant-scoped flag and entitlement queries
     const server = app.listen(0, '127.0.0.1');
     await new Promise(resolve => server.once('listening', resolve));
     t.after(() => new Promise(resolve => server.close(resolve)));
-    const status = async tenantId => {
-      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/vision/status`, { headers: { 'x-test-tenant': String(tenantId) } });
+    const tokenFor = (tenantId, userId, role, withSession = false) => jwt.sign({ tenant_id: tenantId, user_id: userId, role, ...(withSession ? { session_id: sessionId } : {}) }, 'vision-test-secret', { expiresIn: '1h' });
+    const adminToken = tokenFor(11, 101, 'admin', true);
+    const statusResponse = token => fetch(`http://127.0.0.1:${server.address().port}/api/vision/status`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    const status = async token => {
+      const response = await statusResponse(token);
       assert.equal(response.status, 200);
       return response.json();
     };
 
+    assert.equal((await statusResponse()).status, 401);
+    assert.equal((await statusResponse('invalid-token')).status, 401);
     // A rollout flag alone cannot grant a plan entitlement.
-    assert.equal((await status(11)).enabled, false);
+    assert.equal((await status(adminToken)).enabled, false);
     await admin.query(`INSERT INTO vision_v01_entitlement.tenant_entitlement_overrides(tenant_id,feature_id,enabled,reason) VALUES(11,$1,TRUE,'test only')`, [feature]);
-    assert.equal((await status(11)).enabled, true);
-    assert.equal((await status(22)).enabled, false);
+    assert.equal((await status(adminToken)).enabled, true);
+    assert.equal((await status(tokenFor(22, 201, 'admin'))).enabled, false);
+    assert.equal((await statusResponse(tokenFor(11, 103, 'guard'))).status, 403);
+    assert.equal((await statusResponse(tokenFor(11, 102, 'staff'))).status, 403);
+    await admin.query(`UPDATE vision_v01_entitlement.users SET permissions=ARRAY['vision_view'] WHERE id=102`);
+    assert.equal((await status(tokenFor(11, 102, 'staff'))).enabled, true);
+    await admin.query(`UPDATE vision_v01_entitlement.users SET account_active=FALSE WHERE id=102`);
+    assert.equal((await statusResponse(tokenFor(11, 102, 'staff'))).status, 401);
+    await admin.query(`UPDATE vision_v01_entitlement.auth_sessions SET revoked_at=NOW() WHERE id=$1`, [sessionId]);
+    assert.equal((await statusResponse(adminToken)).status, 401);
+    await admin.query(`UPDATE vision_v01_entitlement.auth_sessions SET revoked_at=NULL WHERE id=$1`, [sessionId]);
     await withTenant(22, async client => {
       assert.equal(await queryVisionFlag(client, 11).then(row => row.flag_tenant_id), null);
       assert.equal(await resolveTenantEntitlement(11, 'vision_access', client), null);
     });
     await admin.query(`UPDATE vision_v01_entitlement.tenant_entitlement_overrides SET expires_at=NOW()-INTERVAL '1 minute' WHERE tenant_id=11`);
-    assert.equal((await status(11)).enabled, false);
+    assert.equal((await status(adminToken)).enabled, false);
     globalOn = false;
-    assert.equal((await status(11)).enabled, false);
+    assert.equal((await status(adminToken)).enabled, false);
   } finally {
     if (readerConnected) await reader.end();
     await admin.query(`DROP SCHEMA IF EXISTS vision_v01_entitlement CASCADE`);

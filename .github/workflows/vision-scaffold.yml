@@ -36,3 +36,5 @@ jobs:
       - run: node --check vision-routes.js
       - run: node --check vision-entitlement.js
       - run: node --test
+      - run: node scripts/verify-vision-staging-startup.js
+

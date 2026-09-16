@@ -147,8 +147,9 @@ function scheduleBackgroundJob(name,intervalMs,initialDelayMs,fn){backgroundJobs
 ensureBackgroundJobSchema().catch(e=>console.error('Background job schema setup failed:',e.message));
 ensureLoadTestSchema().catch(e=>console.error('Load-test schema setup failed:',e.message));
 ensureFreeAccessCodeSchema().catch(e=>console.error('Free-access code schema setup failed:',e.message));
-ensurePublicLaunchDecisionSchema().catch(e=>console.error('Public-launch decision schema setup failed:',e.message));
-ensureLimitedLaunchSchema().catch(e=>console.error('Limited-launch schema setup failed:',e.message));
+const publicLaunchDecisionSchemaReady=ensurePublicLaunchDecisionSchema();
+publicLaunchDecisionSchemaReady.catch(e=>console.error('Public-launch decision schema setup failed:',e.message));
+publicLaunchDecisionSchemaReady.then(ensureLimitedLaunchSchema).catch(e=>console.error('Limited-launch schema setup failed:',e.message));
 function percentile(values,percentage){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b);return sorted[Math.min(sorted.length-1,Math.max(0,Math.ceil((percentage/100)*sorted.length)-1))]}
 function trimPerformanceSamples(now=Date.now()){const cutoff=now-PERFORMANCE_SAMPLE_WINDOW_MS;while(performanceSamples.length&&performanceSamples[0].finished_at<cutoff)performanceSamples.shift();if(performanceSamples.length>PERFORMANCE_MAX_SAMPLES)performanceSamples.splice(0,performanceSamples.length-PERFORMANCE_MAX_SAMPLES)}
 

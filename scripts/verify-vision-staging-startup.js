@@ -71,8 +71,8 @@ const EXPECTED_UNCOVERED_TABLES = Object.freeze([
   'webhook_deliveries',
   'webhook_endpoints',
 ]);
-// Prototype only: operations observed in the attendance, patrol, and incident
-// withTenant() paths. This is not a complete permission map for the application.
+// Prototype only: operations observed in reviewed withTenant() paths.
+// This is not a complete permission map for the application.
 const CORE_WORKFLOW_GRANTS = Object.freeze({
   attendance_sessions: 'SELECT,INSERT,UPDATE',
   attendance_breaks: 'SELECT,INSERT,UPDATE',
@@ -83,6 +83,14 @@ const CORE_WORKFLOW_GRANTS = Object.freeze({
   incidents: 'SELECT,INSERT,UPDATE',
   incident_activities: 'SELECT,INSERT',
   incident_photos: 'SELECT,INSERT,DELETE'
+});
+const WORKFORCE_GRANTS = Object.freeze({
+  shifts: 'SELECT,INSERT,UPDATE,DELETE',
+  shift_templates: 'SELECT,INSERT,UPDATE,DELETE',
+  shift_swap_requests: 'SELECT,INSERT,UPDATE',
+  guard_availability: 'SELECT,INSERT,UPDATE',
+  leave_requests: 'SELECT,INSERT,UPDATE,DELETE',
+  timesheets: 'SELECT,INSERT,UPDATE'
 });
 
 async function freePort() {
@@ -238,7 +246,8 @@ async function main() {
           && row.qual?.includes('app.current_tenant')
           && row.with_check?.includes('app.current_tenant')),
         'Every added policy must be scoped to the restricted role and tenant context');
-        for (const [table, operations] of Object.entries(CORE_WORKFLOW_GRANTS)) {
+        const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS };
+        for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
           for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
@@ -248,7 +257,7 @@ async function main() {
               `${table} ${operation} differs from reviewed core-workflow scope`);
           }
         }
-        console.log(`Disposable core-workflow grant prototype passed: ${Object.keys(CORE_WORKFLOW_GRANTS).length} tables; no blanket grant.`);
+        console.log(`Disposable workflow grant prototype passed: ${Object.keys(reviewedGrants).length} tables; no blanket grant.`);
         assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
         const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
         const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);
@@ -257,28 +266,40 @@ async function main() {
         const twoSite = await audit.query(`INSERT INTO sites(tenant_id,name) VALUES($1,'CI Two Site') RETURNING id`, [twoId]);
         await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI Route'),($3,$4,'CI Route')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
+          VALUES($1,$2,100,'2026-09-16','08:00','16:00'),($3,$4,200,'2026-09-16','08:00','16:00')`,
+        [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         await audit.query(`INSERT INTO system_events(tenant_id,event_type,message) VALUES($1,'vision_ci','one'),($2,'vision_ci','two')`, [oneId, twoId]);
         await audit.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
         await audit.query(`GRANT SELECT,UPDATE ON public.system_events TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.patrol_routes_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.shifts_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
+        const visibleShifts = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM shifts WHERE shift_date='2026-09-16'`)).rows[0].count);
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
         assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
+        assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         assert.equal(await visible(), 1, 'Tenant one must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
+        assert.equal(await visibleShifts(), 1, 'Tenant one must see only its own shift');
         assert.equal((await audit.query(`UPDATE patrol_routes SET active=FALSE WHERE tenant_id=$1 AND name='CI Route'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`DELETE FROM patrol_routes WHERE tenant_id=$1 AND name='CI Route'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE shifts SET notes='blocked' WHERE tenant_id=$1 AND shift_date='2026-09-16'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`DELETE FROM shifts WHERE tenant_id=$1 AND shift_date='2026-09-16'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI One Extra') RETURNING id`,
           [oneId, oneSite.rows[0].id])).rowCount, 1);
+        assert.equal((await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
+          VALUES($1,$2,101,'2026-09-17','08:00','16:00') RETURNING id`, [oneId, oneSite.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
         assert.equal(await visible(), 1, 'Tenant two must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant two must see only its own route');
-        console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant read/update/delete denied, own-route insert allowed.`);
+        assert.equal(await visibleShifts(), 1, 'Tenant two must see only its own shift');
+        console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
     } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);

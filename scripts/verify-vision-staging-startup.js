@@ -416,6 +416,29 @@ async function main() {
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const planId = (await audit.query(`INSERT INTO plan_catalog(code,name,version)
+          VALUES('vision_ci_plan','Disposable CI plan','1') RETURNING id`)).rows[0].id;
+        const featureId = (await audit.query(`INSERT INTO feature_catalog(code,name,category)
+          VALUES('vision_ci_feature','Disposable CI feature','ci') RETURNING id`)).rows[0].id;
+        const flagId = (await audit.query(`INSERT INTO feature_flags(code,description)
+          VALUES('vision_ci_isolation','Disposable isolation fixture') RETURNING id`)).rows[0].id;
+        await audit.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id)
+          VALUES($1,$3),($2,$3)`, [oneId, twoId, planId]);
+        await audit.query(`INSERT INTO tenant_entitlement_overrides(tenant_id,feature_id,enabled,reason)
+          VALUES($1,$3,TRUE,'CI only'),($2,$3,FALSE,'CI only')`, [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO usage_events(tenant_id,feature_id,quantity,idempotency_key)
+          VALUES($1,$3,1,'vision-ci-one'),($2,$3,1,'vision-ci-two')`, [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO usage_period_summaries(tenant_id,feature_id,period_start,period_end)
+          VALUES($1,$3,'2026-09-01','2026-09-30'),($2,$3,'2026-09-01','2026-09-30')`,
+          [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO feature_flag_tenants(tenant_id,flag_id,enabled)
+          VALUES($1,$3,TRUE),($2,$3,FALSE)`, [oneId, twoId, flagId]);
+        await audit.query(`INSERT INTO billing_checkout_sessions(id,tenant_id,plan_code,billing_interval,currency,recurring_amount,status)
+          VALUES('00000000-0000-4000-8000-000000000001',$1,'starter','month','EUR',1,'completed'),
+                ('00000000-0000-4000-8000-000000000002',$2,'starter','month','EUR',1,'completed')`,
+          [oneId, twoId]);
+        await audit.query(`INSERT INTO billing_webhook_events(stripe_event_id,tenant_id,event_type)
+          VALUES('vision-ci-one',$1,'ci.test'),('vision-ci-two',$2,'ci.test')`, [oneId, twoId]);
         await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI Route'),($3,$4,'CI Route')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
@@ -468,9 +491,13 @@ async function main() {
         const visibleTicketComments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_ticket_comments`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
+        const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
+          'usage_events', 'usage_period_summaries', 'feature_flag_tenants',
+          'billing_checkout_sessions', 'billing_webhook_events'];
+        const existingPolicyTables = [...baselineTables, ...entitlementTables];
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
-        for (const table of baselineTables) {
+        for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 0, `${table} must hide both tenants without context`);
         }
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
@@ -484,7 +511,7 @@ async function main() {
         assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
         assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
-        for (const table of baselineTables) {
+        for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
           assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
             WHERE tenant_id=$1`, [twoId])).rowCount, 0,
@@ -554,7 +581,7 @@ async function main() {
         assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
-        for (const table of baselineTables) {
+        for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant two's row`);
         }
         assert.equal(await visible(), 1, 'Tenant two must see only its own row');
@@ -565,7 +592,7 @@ async function main() {
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');
-        console.log(`Existing RLS behavior passed for ${baselineTables.length} legacy tenant tables: no-context and cross-tenant reads/updates denied.`);
+        console.log(`Existing RLS behavior passed for ${existingPolicyTables.length} tenant tables: no-context and cross-tenant reads/updates denied.`);
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
       // Only after baseline inventory and rollback, prepare the disposable DB

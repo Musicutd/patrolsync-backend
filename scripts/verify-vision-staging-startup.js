@@ -427,6 +427,36 @@ async function main() {
         assert.equal(await visibleSos(), 1, 'Tenant two must see only its own SOS alert');
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
+      // Only after baseline inventory and rollback, prepare the disposable DB
+      // for one real HTTP write through the restricted tenant connection.
+      // This committed fixture is dropped with TEST_DB at the end of this run.
+      await audit.query('BEGIN');
+      try {
+        for (const table of ['guard_locations', 'guard_location_history']) {
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_location_tenant ON public.${table} TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        await audit.query(`GRANT SELECT,INSERT,UPDATE ON public.guard_locations TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT,INSERT ON public.guard_location_history TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.guard_locations_id_seq,public.guard_location_history_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`INSERT INTO guard_assignments(tenant_id,site_id,user_id)
+          VALUES($1,$2,$3)`, [ownTenantId, site.rows[0].id, guard.rows[0].id]);
+        await audit.query('COMMIT');
+      } catch (error) { await audit.query('ROLLBACK'); throw error; }
+      const assignedLocation = await fetch(`http://127.0.0.1:${port}/api/guard-locations`, {
+        method: 'POST', headers: { Authorization: `Bearer ${guardToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tenant_id: ownTenantId, site_id: site.rows[0].id, latitude: 35.9, longitude: 14.5 }),
+        signal: AbortSignal.timeout(5000)
+      });
+      assert.equal(assignedLocation.status, 200, `Assigned guard location should succeed: ${await assignedLocation.text()}`);
+      const locationRows = await audit.query(`SELECT
+        (SELECT COUNT(*)::int FROM guard_locations WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3) AS current_count,
+        (SELECT COUNT(*)::int FROM guard_location_history WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3) AS history_count`,
+        [ownTenantId, guard.rows[0].id, site.rows[0].id]);
+      assert.deepEqual(locationRows.rows[0], { current_count: 1, history_count: 1 });
+      console.log('Assigned guard HTTP location write passed; one current and one history row recorded in disposable CI.');
     } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {

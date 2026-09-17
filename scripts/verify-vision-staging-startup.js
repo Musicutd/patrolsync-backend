@@ -113,6 +113,9 @@ const LOCATION_GRANTS = Object.freeze({
   guard_locations: 'SELECT,INSERT,UPDATE',
   guard_location_history: 'SELECT,INSERT'
 });
+const CLIENT_ACCESS_GRANTS = Object.freeze({
+  client_users: 'SELECT,INSERT,UPDATE,DELETE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -336,8 +339,12 @@ async function main() {
           await audit.query(`ALTER TABLE public.${child} ADD CONSTRAINT vision_ci_${child}_tenant_parent_fk
             FOREIGN KEY(tenant_id,${childColumn}) REFERENCES public.${parent}(tenant_id,id)`);
         }
+        await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
+          FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
-          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS, ...LOCATION_GRANTS };
+          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
+          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -369,6 +376,9 @@ async function main() {
           VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         await audit.query(`INSERT INTO guard_location_history(tenant_id,user_id,site_id,latitude,longitude)
           VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'ci-one@example.test','ci-only'),($3,$4,'ci-two@example.test','ci-only')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         const conversations = await audit.query(`INSERT INTO team_conversations(tenant_id,title,kind)
           VALUES($1,'CI One Announcements','company'),($2,'CI Two Announcements','company') RETURNING id,tenant_id`, [oneId, twoId]);
         const messages = await audit.query(`INSERT INTO communication_notifications(tenant_id,title,message)
@@ -384,6 +394,7 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.shifts_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.team_messages_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.lone_worker_checkins_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_users_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -392,6 +403,7 @@ async function main() {
         const visibleSos = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM sos_alerts`)).rows[0].count);
         const visibleLocations = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_locations`)).rows[0].count);
         const visibleLocationHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_location_history`)).rows[0].count);
+        const visibleClientUsers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_users`)).rows[0].count);
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
         assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
         assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
@@ -399,6 +411,7 @@ async function main() {
         assert.equal(await visibleSos(), 0, 'Restricted role must see no SOS alerts without tenant context');
         assert.equal(await visibleLocations(), 0, 'Restricted role must see no live locations without tenant context');
         assert.equal(await visibleLocationHistory(), 0, 'Restricted role must see no location history without tenant context');
+        assert.equal(await visibleClientUsers(), 0, 'Restricted role must see no client accounts without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         assert.equal(await visible(), 1, 'Tenant one must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
@@ -407,6 +420,17 @@ async function main() {
         assert.equal(await visibleSos(), 1, 'Tenant one must see only its own SOS alert');
         assert.equal(await visibleLocations(), 1, 'Tenant one must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant one must see only its own location history');
+        assert.equal(await visibleClientUsers(), 1, 'Tenant one must see only its own client account');
+        assert.equal((await audit.query(`UPDATE client_users SET email='blocked@example.test' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`DELETE FROM client_users WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_client_site_fk');
+        await assert.rejects(audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'cross-site@example.test','ci-only')`, [oneId, twoSite.rows[0].id]),
+          error => error.code === '23503', 'Client account must reject another tenant site');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_client_site_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_client_site_fk');
+        assert.equal((await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'ci-one-extra@example.test','ci-only')`, [oneId, oneSite.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`UPDATE guard_locations SET latitude=0 WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         for (const [label, sql, params] of [
           ['team message', `INSERT INTO team_messages(tenant_id,conversation_id,sender_user_id,sender_role,message)
@@ -442,6 +466,7 @@ async function main() {
         assert.equal(await visibleSos(), 1, 'Tenant two must see only its own SOS alert');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
+        assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
       // Only after baseline inventory and rollback, prepare the disposable DB

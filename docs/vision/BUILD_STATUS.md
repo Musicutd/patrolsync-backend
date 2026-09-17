@@ -2,15 +2,15 @@
 
 Updated: 16 September 2026  
 Master specification: PatrolSync Vision Codex Master Upgrade Specification v1.0  
-Current stage: V00 Repository Audit complete  
-Next stage: V01 Vision Scaffolding
+Current stage: V01 Vision Scaffolding in review  
+Next stage: Complete V01 verification before V02
 
 ## Programme status
 
 | Stage | Status | Exit evidence or dependency |
 |---|---|---|
 | V00 Repository Audit | Complete | Real supplied workspace audited; architecture, reuse, gaps, risks, database expectations and V01 plan documented. |
-| V01 Vision Scaffolding | Not started | Backend and frontend Git repositories confirmed; add lockfile/test baseline before navigation changes. |
+| V01 Vision Scaffolding | In progress | Disabled scaffold, lockfile, unit tests and restricted-role PostgreSQL rollout-flag isolation pass in CI; full endpoint and browser acceptance remain unverified. |
 | V02 Plans and Entitlements | Not started | Requires a product decision resolving the legacy versus current public plan ladder. |
 | V03 Database Foundation | Not started | Requires an explicit migration framework and live-schema baseline. |
 | V04 Edge Enrolment | Not started | Depends on V03 machine identity tables and security design. |
@@ -104,4 +104,27 @@ V01 should implement only:
 - safe environment documentation.
 
 V01 must not create camera/event tables, connect CCTV streams, add inference dependencies or expose camera credentials.
+
+## V01 work in review
+
+- Added a fail-closed Vision switch, explicit Vision permission names, a tenant-flag and entitlement access decision, and guarded status/capabilities endpoints.
+- Added `vision_access` to the existing feature catalogue without automatically granting it to any plan, plus a disabled `vision_rollout` flag.
+- Added a status-gated placeholder page and navigation in both the dashboard and shared module shell. Added `vision_view` to delegated staff permission management.
+- Added three pure access-decision tests and a syntax/unit CI workflow.
+- Added a fourth pure test that rejects a rollout flag or entitlement belonging to another tenant, and hid the direct placeholder page until an enabled status is confirmed.
+- Added a disposable PostgreSQL CI test that queries the real rollout-flag SQL as a restricted tenant role. It verifies that a tenant cannot see another tenant's enabled flag.
+- Rebased the backend V01 draft PR onto `main` after the V00 documentation PR was merged; its diff is now limited to V01 changes.
+- Extracted the Vision HTTP routes into an injectable router and added an isolated Express test for disabled, denied, tenant, entitlement, role, delegated permission and schema-failure responses.
+- Extracted the existing entitlement query without changing its SQL and added a second disposable PostgreSQL/Express integration test using the real query, tenant RLS, explicit override and expiration. GitHub CI passed all seven backend tests with `npm ci`.
+- Extended that test to load unchanged production JWT/session and staff-permission middleware in isolation. It passed missing/invalid token, revoked-session, disabled-account, guard, unpermitted-staff and permitted-staff checks without booting production services.
+- Extended the disposable harness to exercise the unchanged password-login handler and tracked-session token issuance before calling the Vision endpoint. Wrong passwords are rejected and a login-issued administrator token follows the same Vision gates. No production authentication or email provider was contacted.
+- Prepared `V01_STAGING_GATE.md` with isolation requirements and a role-by-role deployed acceptance sequence. No staging service or database has been created.
+- After the Render connection became available, confirmed the linked project contains the live backend, dashboard and Postgres database; the separate `patrolsync-frontend` static site also deploys from `main`. No isolated PatrolSync staging resources exist. A frontend-only scan found 119 HTML/JavaScript files referencing the production backend URL, so a plain staging copy could contact production. Staging deployment remains blocked until API-origin isolation is implemented and verified.
+- Added a fail-closed, staging-only static build and unit tests to the frontend V01 draft PR. CI generated a separate 127-file artifact with 119 API references rewritten to a test staging URL; source files and live services were unchanged. A real staging backend/database and served-artifact/browser verification are still required before deployment acceptance.
+- Ran local Chromium checks with mocked status responses: disabled and denied direct visits redirect, an enabled placeholder and dashboard navigation render, and a 390px mobile layout has no horizontal overflow. No production records were accessed.
+- Added `V01_SCAFFOLD.md` documenting the exact inactive boundary.
+- Added `V01_CONTRACTS.md` with non-executable edge, camera, count, heartbeat and confidence interface sketches.
+- No production deployment, customer entitlement, camera credential, Vision data table, video processing or inference dependency was introduced.
+
+V01 is **not ready for activation**. The workspace has pnpm but no npm. Offline lockfile generation lacked cached registry metadata; online resolution failed TLS certificate verification. TLS checks were not bypassed. A trusted GitHub Actions runner generated `package-lock.json`; CI now uses `npm ci` to verify it. Restricted-role PostgreSQL flag and entitlement tests, isolated login/session/HTTP tests and mocked-status browser checks passed. The complete production server, MFA login path and deployed frontend/backend have not been exercised in a representative staging environment; no separate staging service or deploy manifest was found in the supplied repository. Keep `VISION_ENABLED` unset/false and both PRs in draft until those review checks pass.
 

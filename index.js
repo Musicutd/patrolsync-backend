@@ -8,6 +8,9 @@ const QRCode = require('qrcode');
 const PDFDocument = require('pdfkit');
 const crypto = require('crypto');
 require('dotenv').config();
+const { VISION_FLAG, VISION_FEATURE, VISION_PERMISSIONS } = require('./vision-access');
+const { registerVisionRoutes } = require('./vision-routes');
+const { resolveTenantEntitlement: resolveVisionEntitlement } = require('./vision-entitlement');
 
 const IS_PRODUCTION=String(process.env.NODE_ENV||'').toLowerCase()==='production';
 function normalizedOrigin(value){try{return new URL(String(value||'').trim()).origin}catch(_){return null}}
@@ -144,8 +147,9 @@ function scheduleBackgroundJob(name,intervalMs,initialDelayMs,fn){backgroundJobs
 ensureBackgroundJobSchema().catch(e=>console.error('Background job schema setup failed:',e.message));
 ensureLoadTestSchema().catch(e=>console.error('Load-test schema setup failed:',e.message));
 ensureFreeAccessCodeSchema().catch(e=>console.error('Free-access code schema setup failed:',e.message));
-ensurePublicLaunchDecisionSchema().catch(e=>console.error('Public-launch decision schema setup failed:',e.message));
-ensureLimitedLaunchSchema().catch(e=>console.error('Limited-launch schema setup failed:',e.message));
+const publicLaunchDecisionSchemaReady=ensurePublicLaunchDecisionSchema();
+publicLaunchDecisionSchemaReady.catch(e=>console.error('Public-launch decision schema setup failed:',e.message));
+publicLaunchDecisionSchemaReady.then(ensureLimitedLaunchSchema).catch(e=>console.error('Limited-launch schema setup failed:',e.message));
 function percentile(values,percentage){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b);return sorted[Math.min(sorted.length-1,Math.max(0,Math.ceil((percentage/100)*sorted.length)-1))]}
 function trimPerformanceSamples(now=Date.now()){const cutoff=now-PERFORMANCE_SAMPLE_WINDOW_MS;while(performanceSamples.length&&performanceSamples[0].finished_at<cutoff)performanceSamples.shift();if(performanceSamples.length>PERFORMANCE_MAX_SAMPLES)performanceSamples.splice(0,performanceSamples.length-PERFORMANCE_MAX_SAMPLES)}
 
@@ -357,6 +361,15 @@ async function requireAuth(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     req.auth = jwt.verify(token, JWT_SECRET);
+    // Subscriber requests may name their company for legacy clients, but that
+    // value must never select a different RLS tenant than the signed token.
+    const authenticatedTenant = Number(req.auth.tenant_id);
+    const requestedTenants = [req.query?.tenant_id, req.body?.tenant_id]
+      .filter(value => value !== undefined && value !== null && value !== '');
+    if (!Number.isInteger(authenticatedTenant) || authenticatedTenant < 1 ||
+        requestedTenants.some(value => !Number.isInteger(Number(value)) || Number(value) !== authenticatedTenant)) {
+      return res.status(403).json({ error: 'Tenant access denied' });
+    }
     const tenantState=await pool.query(`SELECT COALESCE(account_active,TRUE) active FROM tenants WHERE id=$1`,[req.auth.tenant_id]);
     if(!tenantState.rowCount||tenantState.rows[0].active===false)return res.status(403).json({error:'Company subscription is suspended. Contact PatrolSync support.'});
     if(req.auth.role==='client')return next();
@@ -371,7 +384,7 @@ async function requireAuth(req, res, next) {
   }
 }
 
-function permissionForPath(path=''){const rules=[['/api/dispatch','dispatch'],['/api/lone-worker','safety'],['/api/visitors','safety'],['/api/attendance','attendance'],['/api/timesheet','attendance'],['/api/shift','scheduling'],['/api/patrol','patrols'],['/api/checkpoint','patrols'],['/api/incident','incidents'],['/api/training','training'],['/api/certification','training'],['/api/assets','assets'],['/api/asset-custody','assets'],['/api/inspection','quality'],['/api/corrective','quality'],['/api/invoice','finance'],['/api/analytics','analytics'],['/api/service-contract','clients'],['/api/client-report','clients'],['/api/client-users','clients'],['/api/team-','communications'],['/api/communication-notifications','communications']];const found=rules.find(([prefix])=>path.startsWith(prefix));return found?found[1]:'administration';}
+function permissionForPath(path=''){const rules=[['/api/vision',VISION_PERMISSIONS.view],['/api/dispatch','dispatch'],['/api/lone-worker','safety'],['/api/visitors','safety'],['/api/attendance','attendance'],['/api/timesheet','attendance'],['/api/shift','scheduling'],['/api/patrol','patrols'],['/api/checkpoint','patrols'],['/api/incident','incidents'],['/api/training','training'],['/api/certification','training'],['/api/assets','assets'],['/api/asset-custody','assets'],['/api/inspection','quality'],['/api/corrective','quality'],['/api/invoice','finance'],['/api/analytics','analytics'],['/api/service-contract','clients'],['/api/client-report','clients'],['/api/client-users','clients'],['/api/team-','communications'],['/api/communication-notifications','communications']];const found=rules.find(([prefix])=>path.startsWith(prefix));return found?found[1]:'administration';}
 async function requireAdmin(req,res,next){if(!req.auth)return res.status(403).json({error:'Admin access required'});if(req.auth.role==='admin')return next();if(req.auth.role!=='staff')return res.status(403).json({error:'Admin access required'});try{const r=await pool.query(`SELECT permissions,account_active FROM users WHERE id=$1 AND tenant_id=$2 AND role='staff'`,[req.auth.user_id,req.auth.tenant_id]);if(!r.rowCount||r.rows[0].account_active===false)return res.status(403).json({error:'Staff account disabled'});const permissions=r.rows[0].permissions||[];if(req.method==='GET'&&['/api/users','/api/sites'].includes(req.path)){req.auth.permissions=permissions;return next();}const needed=permissionForPath(req.path);if(needed==='administration'||!permissions.includes(needed))return res.status(403).json({error:`Permission required: ${needed}`});req.auth.permissions=permissions;next()}catch(e){res.status(500).json({error:'Could not verify staff permissions'});}}
 function requireOwnerAdmin(req,res,next){if(!req.auth||req.auth.role!=='admin')return res.status(403).json({error:'Company administrator access required'});next();}
 async function requirePlatformAuth(req,res,next){const header=req.headers.authorization;if(!header?.startsWith('Bearer '))return res.status(401).json({error:'Platform authentication required'});try{const payload=jwt.verify(header.slice(7),PLATFORM_JWT_SECRET,{audience:'patrolsync-platform',issuer:'patrolsync'});if(payload.role!=='platform_admin'||!payload.session_id)throw new Error('Invalid platform role');const found=await pool.query(`SELECT a.id,a.email,a.display_name,a.active,s.revoked_at,s.expires_at FROM platform_admins a JOIN platform_auth_sessions s ON s.platform_admin_id=a.id AND s.id=$2 WHERE a.id=$1`,[payload.platform_admin_id,payload.session_id]);if(!found.rowCount||!found.rows[0].active||found.rows[0].revoked_at||new Date(found.rows[0].expires_at)<=new Date())return res.status(401).json({error:'Platform session expired or revoked'});req.platformAdmin=found.rows[0];req.platformSessionId=payload.session_id;pool.query(`UPDATE platform_auth_sessions SET last_seen_at=NOW() WHERE id=$1 AND last_seen_at<NOW()-INTERVAL '5 minutes'`,[payload.session_id]).catch(()=>{});next()}catch(e){res.status(401).json({error:'Invalid or expired platform session'})}}
@@ -509,7 +522,8 @@ async function ensureEntitlementSchema(){
     for(const featureCode of booleans)await pool.query(`INSERT INTO plan_features(plan_id,feature_id,enabled) SELECT $1,id,TRUE FROM feature_catalog WHERE code=$2 ON CONFLICT(plan_id,feature_id) DO UPDATE SET enabled=TRUE`,[planId,featureCode]);
   }
   await pool.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id,status,period_start,period_end,migration_source) SELECT t.id,p.id,COALESCE(NULLIF(t.subscription_status,''),'active'),date_trunc('month',NOW()),date_trunc('month',NOW())+INTERVAL '1 month','legacy_plan_backfill' FROM tenants t JOIN plan_catalog p ON p.code=COALESCE(NULLIF(t.plan,''),'starter') AND p.version=$1 ON CONFLICT(tenant_id) DO NOTHING`,[LEGACY_PLAN_VERSION]);
-  await pool.query(`INSERT INTO feature_flags(code,description,enabled_globally) VALUES('entitlement_engine_enforcement','Enforce database-backed plan entitlements',FALSE),('expansion_stage_1','Expansion Stage 1 subscriber experience',FALSE) ON CONFLICT(code) DO NOTHING`);
+  await pool.query(`INSERT INTO feature_catalog(code,name,category,unit,metered) VALUES($1,'PatrolSync Vision access','vision','boolean',FALSE) ON CONFLICT(code) DO NOTHING`,[VISION_FEATURE]);
+  await pool.query(`INSERT INTO feature_flags(code,description,enabled_globally) VALUES('entitlement_engine_enforcement','Enforce database-backed plan entitlements',FALSE),('expansion_stage_1','Expansion Stage 1 subscriber experience',FALSE),($1,'PatrolSync Vision tenant rollout',FALSE) ON CONFLICT(code) DO NOTHING`,[VISION_FLAG]);
   console.log(`Expansion entitlement schema ready in ${ENTITLEMENT_ENGINE_MODE} mode`);
 }
 let entitlementSchemaError=null;
@@ -528,10 +542,10 @@ async function requireEntitlementSchema(){
 }
 
 async function resolveTenantEntitlement(tenantId,featureCode,client=pool){
-  const result=await client.query(`SELECT ts.tenant_id,ts.status subscription_status,p.code plan_code,p.name plan_name,p.version plan_version,f.code feature_code,f.unit,COALESCE(o.enabled,pf.enabled,FALSE) enabled,COALESCE(o.included_quantity,pf.included_quantity) included_quantity,pf.soft_limit,COALESCE(o.included_quantity,pf.hard_limit) hard_limit,o.reason override_reason,o.expires_at override_expires_at FROM tenant_subscriptions ts JOIN plan_catalog p ON p.id=ts.plan_id JOIN feature_catalog f ON f.code=$2 LEFT JOIN plan_features pf ON pf.plan_id=ts.plan_id AND pf.feature_id=f.id LEFT JOIN tenant_entitlement_overrides o ON o.tenant_id=ts.tenant_id AND o.feature_id=f.id AND(o.expires_at IS NULL OR o.expires_at>NOW()) WHERE ts.tenant_id=$1`,[tenantId,featureCode]);
-  return result.rows[0]||null;
+  return resolveVisionEntitlement(tenantId,featureCode,client);
 }
 async function canUseFeature(tenantId,featureCode,client=pool){const entitlement=await resolveTenantEntitlement(tenantId,featureCode,client);return{allowed:Boolean(entitlement?.enabled&&['active','trialing'].includes(entitlement.subscription_status)),mode:ENTITLEMENT_ENGINE_MODE,entitlement};}
+registerVisionRoutes(app,{requireAuth,requireAdmin,requireEntitlementSchema,withTenant,resolveTenantEntitlement});
 async function recordUsageEvent({tenantId,featureCode,quantity=1,idempotencyKey,sourceObjectType=null,sourceObjectId=null,metadata={}}){
   if(!idempotencyKey)throw new Error('Usage idempotency key is required');
   return withTenant(tenantId,async client=>{try{
@@ -990,7 +1004,7 @@ async function ensureCrisisModeTables(){
   await pool.query(`CREATE TABLE IF NOT EXISTS crisis_actions(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,crisis_id BIGINT NOT NULL REFERENCES crisis_activations(id) ON DELETE CASCADE,title TEXT NOT NULL,description TEXT,priority TEXT NOT NULL DEFAULT 'high',status TEXT NOT NULL DEFAULT 'open',assigned_user_id INTEGER,due_at TIMESTAMPTZ,created_by_user_id INTEGER NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),completed_by_user_id INTEGER,completed_at TIMESTAMPTZ,completion_note TEXT,CONSTRAINT crisis_action_status CHECK(status IN('open','in_progress','completed','cancelled')),CONSTRAINT crisis_action_priority CHECK(priority IN('normal','high','critical')))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS crisis_updates(id BIGSERIAL PRIMARY KEY,tenant_id INTEGER NOT NULL,crisis_id BIGINT NOT NULL REFERENCES crisis_activations(id) ON DELETE CASCADE,update_type TEXT NOT NULL DEFAULT 'operational',message TEXT NOT NULL,created_by_user_id INTEGER NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),CONSTRAINT crisis_update_type CHECK(update_type IN('operational','communication','decision','status')))`);
   for(const table of ['crisis_activations','crisis_roles','crisis_actions','crisis_updates']){await pool.query(`ALTER TABLE ${table} ENABLE ROW LEVEL SECURITY`);await pool.query(`DROP POLICY IF EXISTS patrolsync_tenant_isolation ON ${table}`);await pool.query(`CREATE POLICY patrolsync_tenant_isolation ON ${table} USING (tenant_id=current_setting('app.current_tenant',TRUE)::int) WITH CHECK (tenant_id=current_setting('app.current_tenant',TRUE)::int)`)}
-  const tenantRole=quotedRoleFromTenantUrl();if(tenantRole){for(const table of ['crisis_activations','crisis_roles','crisis_actions','crisis_updates'])await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO ${tenantRole}`);await pool.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${tenantRole}`)}
+  const tenantRole=quotedRoleFromTenantUrl();if(tenantRole){for(const table of ['crisis_activations','crisis_roles','crisis_actions','crisis_updates']){await pool.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ${table} TO ${tenantRole}`);await pool.query(`GRANT USAGE,SELECT ON SEQUENCE ${table}_id_seq TO ${tenantRole}`)}}
   console.log('Crisis Mode tables ready');
 }
 const crisisModeSchemaReady=ensureCrisisModeTables().catch(error=>{console.error('Crisis Mode setup failed:',error.message);throw error});
@@ -2165,6 +2179,7 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
 // ------------------------ GUARD LOCATION ROUTES ------------------------
 
 app.post('/api/guard-locations', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Guard access required' });
   const { tenant_id, site_id, latitude, longitude } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || latitude === undefined || longitude === undefined) {
@@ -2172,6 +2187,17 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
   }
   try {
     const result = await withTenant(tenant_id, async (client) => {
+      if (site_id) {
+        const assignment = await client.query(
+          'SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3 LIMIT 1',
+          [tenant_id, user_id, site_id]
+        );
+        if (!assignment.rowCount) {
+          const error = new Error('Guard is not assigned to this site');
+          error.statusCode = 403;
+          throw error;
+        }
+      }
       const upserted = await client.query(
         `INSERT INTO guard_locations (tenant_id, user_id, site_id, latitude, longitude, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
@@ -2189,7 +2215,7 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
     });
     res.status(200).json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -3983,6 +4009,7 @@ const ticketPriorities=['low','normal','high','urgent'];
 const ticketStatuses=['open','in_progress','waiting_client','resolved','closed'];
 
 async function canAccessTicket(client,auth,ticketId){
+  if(auth.role!=='admin'&&auth.role!=='client')return null;
   const result=await client.query('SELECT * FROM service_tickets WHERE id=$1 AND tenant_id=$2',[ticketId,auth.tenant_id]);
   const ticket=result.rows[0];if(!ticket)return null;if(auth.role==='client'&&Number(ticket.site_id)!==Number(auth.site_id))return null;return ticket;
 }
@@ -5661,8 +5688,8 @@ app.patch('/api/corrective-actions/:id',requireAuth,requireAdmin,async(req,res)=
 
 // ------------------------ PHASE 4.9: STAFF ACCESS CONTROL ------------------------
 app.get('/api/staff-users',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.query.tenant_id);if(!t)return res.status(403).json({error:'Tenant access denied'});try{const r=await withTenant(t,c=>c.query(`SELECT id,email,job_title,permissions,account_active,created_at FROM users WHERE tenant_id=$1 AND role='staff' ORDER BY email`,[t]));res.json(r.rows)}catch(e){res.status(500).json({error:e.message})}});
-app.post('/api/staff-users',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.body.tenant_id),email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||''),permissions=req.body.permissions||[],valid=['scheduling','attendance','patrols','incidents','dispatch','safety','communications','training','assets','quality','clients','finance','analytics'];if(!t)return res.status(403).json({error:'Tenant access denied'});if(!email||password.length<8||!Array.isArray(permissions)||permissions.some(x=>!valid.includes(x)))return res.status(400).json({error:'Valid email, password of at least 8 characters and permissions are required'});try{const hash=await bcrypt.hash(password,10),r=await withTenant(t,c=>c.query(`INSERT INTO users(tenant_id,email,password_hash,role,job_title,permissions,account_active) VALUES($1,$2,$3,'staff',$4,$5,TRUE) RETURNING id,email,job_title,permissions,account_active`,[t,email,hash,String(req.body.job_title||'').trim()||null,JSON.stringify(permissions)]));res.status(201).json(r.rows[0])}catch(e){res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'Email already exists':e.message})}});
-app.patch('/api/staff-users/:id',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.body.tenant_id),permissions=req.body.permissions||[],valid=['scheduling','attendance','patrols','incidents','dispatch','safety','communications','training','assets','quality','clients','finance','analytics'];if(!t)return res.status(403).json({error:'Tenant access denied'});if(!Array.isArray(permissions)||permissions.some(x=>!valid.includes(x)))return res.status(400).json({error:'Invalid permissions'});try{const r=await withTenant(t,c=>c.query(`UPDATE users SET job_title=$3,permissions=$4,account_active=$5 WHERE id=$1 AND tenant_id=$2 AND role='staff' RETURNING id,email,job_title,permissions,account_active`,[req.params.id,t,String(req.body.job_title||'').trim()||null,JSON.stringify(permissions),req.body.account_active!==false]));if(!r.rowCount)return res.status(404).json({error:'Staff user not found'});res.json(r.rows[0])}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/staff-users',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.body.tenant_id),email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||''),permissions=req.body.permissions||[],valid=['scheduling','attendance','patrols','incidents','dispatch','safety','communications','training','assets','quality','clients','finance','analytics',VISION_PERMISSIONS.view];if(!t)return res.status(403).json({error:'Tenant access denied'});if(!email||password.length<8||!Array.isArray(permissions)||permissions.some(x=>!valid.includes(x)))return res.status(400).json({error:'Valid email, password of at least 8 characters and permissions are required'});try{const hash=await bcrypt.hash(password,10),r=await withTenant(t,c=>c.query(`INSERT INTO users(tenant_id,email,password_hash,role,job_title,permissions,account_active) VALUES($1,$2,$3,'staff',$4,$5,TRUE) RETURNING id,email,job_title,permissions,account_active`,[t,email,hash,String(req.body.job_title||'').trim()||null,JSON.stringify(permissions)]));res.status(201).json(r.rows[0])}catch(e){res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'Email already exists':e.message})}});
+app.patch('/api/staff-users/:id',requireAuth,requireOwnerAdmin,async(req,res)=>{const t=communicationTenant(req,req.body.tenant_id),permissions=req.body.permissions||[],valid=['scheduling','attendance','patrols','incidents','dispatch','safety','communications','training','assets','quality','clients','finance','analytics',VISION_PERMISSIONS.view];if(!t)return res.status(403).json({error:'Tenant access denied'});if(!Array.isArray(permissions)||permissions.some(x=>!valid.includes(x)))return res.status(400).json({error:'Invalid permissions'});try{const r=await withTenant(t,c=>c.query(`UPDATE users SET job_title=$3,permissions=$4,account_active=$5 WHERE id=$1 AND tenant_id=$2 AND role='staff' RETURNING id,email,job_title,permissions,account_active`,[req.params.id,t,String(req.body.job_title||'').trim()||null,JSON.stringify(permissions),req.body.account_active!==false]));if(!r.rowCount)return res.status(404).json({error:'Staff user not found'});res.json(r.rows[0])}catch(e){res.status(500).json({error:e.message})}});
 app.get('/api/staff-session',requireAuth,async(req,res)=>{if(req.auth.role!=='staff')return res.status(403).json({error:'Staff access required'});try{const r=await pool.query(`SELECT id,email,job_title,permissions,account_active FROM users WHERE id=$1 AND tenant_id=$2 AND role='staff'`,[req.auth.user_id,req.auth.tenant_id]);if(!r.rowCount||!r.rows[0].account_active)return res.status(403).json({error:'Staff account disabled'});res.json(r.rows[0])}catch(e){res.status(500).json({error:e.message})}});
 
 // ------------------------ PHASE 4.10: API & WEBHOOK INTEGRATIONS ------------------------

@@ -1,0 +1,804 @@
+'use strict';
+
+// Boots the real API against an empty, disposable CI database. Never point this at Render.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const net = require('node:net');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { setTimeout: delay } = require('node:timers/promises');
+const { Client } = require('pg');
+const jwt = require('jsonwebtoken');
+
+const TEST_DB = 'vision_startup_ci';
+const TEST_ROLE = 'vision_startup_reader';
+const TEST_PASSWORD = 'vision_startup_ci_only';
+// Review-only snapshot of the previously unprotected tables on a clean startup.
+// Any addition, removal, or rename must stop CI for a fresh security review.
+const EXPECTED_UNCOVERED_TABLES = Object.freeze([
+  'asset_custody',
+  'attendance_breaks',
+  'attendance_sessions',
+  'audit_logs',
+  'auth_sessions',
+  'client_report_runs',
+  'client_report_schedules',
+  'client_users',
+  'communication_notification_receipts',
+  'communication_notifications',
+  'contract_renewal_history',
+  'contract_renewals',
+  'corrective_actions',
+  'dispatch_jobs',
+  'email_deliveries',
+  'guard_availability',
+  'guard_certifications',
+  'guard_location_history',
+  'guard_locations',
+  'handover_logs',
+  'incident_activities',
+  'incident_photos',
+  'incidents',
+  'inspection_runs',
+  'inspection_templates',
+  'integration_api_keys',
+  'invoice_payments',
+  'invoices',
+  'leave_requests',
+  'lone_worker_alerts',
+  'lone_worker_checkins',
+  'lone_worker_settings',
+  'managed_assets',
+  'notifications',
+  'password_reset_tokens',
+  'patrol_alerts',
+  'patrol_route_checkpoints',
+  'patrol_routes',
+  'patrol_run_scans',
+  'patrol_runs',
+  'service_ticket_comments',
+  'service_tickets',
+  'shift_swap_requests',
+  'shift_templates',
+  'shifts',
+  'sos_alerts',
+  'system_events',
+  'team_conversation_reads',
+  'team_conversations',
+  'team_messages',
+  'timesheets',
+  'training_assignments',
+  'training_materials',
+  'webhook_deliveries',
+  'webhook_endpoints',
+]);
+// Prototype only: operations observed in reviewed withTenant() paths.
+// This is not a complete permission map for the application.
+const CORE_WORKFLOW_GRANTS = Object.freeze({
+  attendance_sessions: 'SELECT,INSERT,UPDATE',
+  attendance_breaks: 'SELECT,INSERT,UPDATE',
+  patrol_routes: 'SELECT,INSERT,UPDATE,DELETE',
+  patrol_route_checkpoints: 'SELECT,INSERT,UPDATE,DELETE',
+  patrol_runs: 'SELECT,INSERT,UPDATE',
+  patrol_run_scans: 'SELECT,INSERT',
+  incidents: 'SELECT,INSERT,UPDATE',
+  incident_activities: 'SELECT,INSERT',
+  incident_photos: 'SELECT,INSERT,DELETE'
+});
+const WORKFORCE_GRANTS = Object.freeze({
+  shifts: 'SELECT,INSERT,UPDATE,DELETE',
+  shift_templates: 'SELECT,INSERT,UPDATE,DELETE',
+  shift_swap_requests: 'SELECT,INSERT,UPDATE',
+  guard_availability: 'SELECT,INSERT,UPDATE',
+  leave_requests: 'SELECT,INSERT,UPDATE,DELETE',
+  timesheets: 'SELECT,INSERT,UPDATE'
+});
+const DISPATCH_SAFETY_GRANTS = Object.freeze({
+  dispatch_jobs: 'SELECT,INSERT,UPDATE',
+  sos_alerts: 'SELECT,INSERT,UPDATE',
+  patrol_alerts: 'SELECT,UPDATE',
+  notifications: 'SELECT,UPDATE,DELETE',
+  communication_notifications: 'SELECT,INSERT,UPDATE,DELETE'
+});
+const COMMUNICATION_LONE_WORKER_GRANTS = Object.freeze({
+  communication_notification_receipts: 'SELECT,INSERT,UPDATE',
+  team_conversations: 'SELECT,INSERT,UPDATE',
+  team_messages: 'SELECT,INSERT',
+  team_conversation_reads: 'SELECT,INSERT,UPDATE',
+  lone_worker_settings: 'SELECT,INSERT,UPDATE',
+  lone_worker_checkins: 'SELECT,INSERT',
+  lone_worker_alerts: 'SELECT,UPDATE'
+});
+const LOCATION_GRANTS = Object.freeze({
+  guard_locations: 'SELECT,INSERT,UPDATE',
+  guard_location_history: 'SELECT,INSERT'
+});
+const CLIENT_ACCESS_GRANTS = Object.freeze({
+  client_users: 'SELECT,INSERT,UPDATE,DELETE'
+});
+const SERVICE_TICKET_GRANTS = Object.freeze({
+  service_tickets: 'SELECT,UPDATE',
+  service_ticket_comments: 'SELECT'
+});
+
+async function freePort() {
+  const server = net.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
+async function main() {
+  const source = new URL(process.env.VISION_TEST_DATABASE_URL || '');
+  assert.ok(['127.0.0.1', 'localhost'].includes(source.hostname), 'CI database must be on loopback');
+  assert.equal(source.pathname, '/vision_ci', 'Refusing any database other than the CI fixture');
+  const admin = new Client({ connectionString: source.href });
+  const target = new URL(source.href);
+  target.pathname = `/${TEST_DB}`;
+  let child;
+  let output = '';
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${TEST_DB}`);
+    const db = new Client({ connectionString: target.href });
+    await db.connect();
+    try {
+      await db.query(`CREATE ROLE ${TEST_ROLE} LOGIN PASSWORD '${TEST_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`);
+      const fixture = fs.readFileSync(path.join(__dirname, '..', 'test', 'fixtures', 'vision-staging-base.sql'), 'utf8');
+      await db.query(fixture.replaceAll('vision_base_reader', TEST_ROLE));
+      await db.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
+      await db.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON tenants,sites,users,checkpoints,patrol_schedules,patrol_logs,alert_log,guard_assignments,service_contracts TO ${TEST_ROLE}`);
+      await db.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${TEST_ROLE}`);
+    } finally { await db.end(); }
+
+    const port = await freePort();
+    const restricted = new URL(target.href);
+    restricted.username = TEST_ROLE;
+    restricted.password = TEST_PASSWORD;
+    child = spawn(process.execPath, [
+      '--require', path.join(__dirname, '..', 'test', 'helpers', 'local-postgres-no-ssl.js'),
+      path.join(__dirname, '..', 'index.js')
+    ], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env, NODE_ENV: 'test', VISION_ENABLED: 'false',
+        DATABASE_URL: target.href, SYSTEM_DATABASE_URL: target.href,
+        TENANT_DATABASE_URL: restricted.href, VISION_TEST_DATABASE_URL: target.href,
+        VISION_TEST_TENANT_DATABASE_URL: restricted.href,
+        PORT: String(port), AI_ASSISTANT_ENABLED: 'false',
+        STRIPE_SECRET_KEY: '', OPENAI_API_KEY: '', BREVO_API_KEY: ''
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+      output = (output + chunk.toString()).slice(-20000);
+    });
+
+    let healthy = false;
+    let tables = 0;
+    let missingTables = [];
+    const sourceCode = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+    const expectedTables = new Set([...sourceCode.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
+      .map(match => match[1].toLowerCase()));
+    for (const name of ['tenants', 'sites', 'users', 'checkpoints', 'patrol_schedules', 'patrol_logs', 'alert_log']) {
+      expectedTables.add(name);
+    }
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline && child.exitCode === null) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1000) });
+        healthy = response.status === 200;
+        const count = new Client({ connectionString: target.href });
+        await count.connect();
+        try {
+          const found = new Set((await count.query(`SELECT tablename FROM pg_tables WHERE schemaname='public'`))
+            .rows.map(row => row.tablename));
+          tables = found.size;
+          missingTables = [...expectedTables].filter(name => !found.has(name)).sort();
+        } finally { await count.end(); }
+        if (healthy && missingTables.length === 0) break;
+      } catch (_) { /* Server is still starting. */ }
+      await delay(500);
+    }
+    assert.ok(healthy, `API health did not become ready. Output:\n${output}`);
+    assert.deepEqual(missingTables, [], `Missing startup tables: ${missingTables.join(', ')}. ${tables} tables initialized. Output:\n${output}`);
+    assert.doesNotMatch(output, /setup failed:|unhandled_rejection/i, `Startup error:\n${output}`);
+    const audit = new Client({ connectionString: target.href });
+    await audit.connect();
+    try {
+      // HTTP regression: legacy subscriber endpoints must reject a tenant_id
+      // different from the one in the signed token before selecting RLS context.
+      const account = await audit.query(`WITH own AS (
+        INSERT INTO tenants(name,slug) VALUES('HTTP One','vision-http-one') RETURNING id
+      ), other AS (
+        INSERT INTO tenants(name,slug) VALUES('HTTP Two','vision-http-two') RETURNING id
+      ), actor AS (
+        INSERT INTO users(tenant_id,email,role) SELECT id,'vision-http-admin@example.test','admin' FROM own RETURNING id,tenant_id
+      ) SELECT actor.id AS user_id, actor.tenant_id AS own_tenant_id, other.id AS other_tenant_id FROM actor CROSS JOIN other`);
+      const { user_id: userId, own_tenant_id: ownTenantId, other_tenant_id: otherTenantId } = account.rows[0];
+      const token = jwt.sign({ user_id: userId, tenant_id: ownTenantId, role: 'admin', email: 'vision-http-admin@example.test' },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const ownSites = await fetch(`http://127.0.0.1:${port}/api/sites?tenant_id=${ownTenantId}`, {
+        headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000)
+      });
+      assert.equal(ownSites.status, 200, 'A matching signed-in tenant must retain normal site access');
+      assert.deepEqual(await ownSites.json(), []);
+      const guard = await audit.query(`INSERT INTO users(tenant_id,email,role)
+        VALUES($1,'vision-http-guard@example.test','guard') RETURNING id`, [ownTenantId]);
+      const site = await audit.query(`INSERT INTO sites(tenant_id,name)
+        VALUES($1,'Unassigned CI Site') RETURNING id`, [ownTenantId]);
+      const clientToken = jwt.sign({ user_id: 9001, tenant_id: ownTenantId, role: 'client', site_id: site.rows[0].id },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const guardToken = jwt.sign({ user_id: guard.rows[0].id, tenant_id: ownTenantId, role: 'guard' },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      for (const [label, actorToken, expectedError] of [
+        ['administrator', token, 'Guard access required'],
+        ['client', clientToken, 'Guard access required'],
+        ['guard without site assignment', guardToken, 'Guard is not assigned to this site']
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${port}/api/guard-locations`, {
+          method: 'POST', headers: { Authorization: `Bearer ${actorToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tenant_id: ownTenantId, site_id: site.rows[0].id, latitude: 35.9, longitude: 14.5 }),
+          signal: AbortSignal.timeout(5000)
+        });
+        assert.equal(response.status, 403, `${label} must not submit a guard location`);
+        assert.equal((await response.json()).error, expectedError);
+      }
+      for (const [method, route, body] of [
+        ['GET', `/api/usage?tenant_id=${otherTenantId}`],
+        ['GET', `/api/notifications?tenant_id=${otherTenantId}`],
+        ['GET', `/api/sites?tenant_id=${ownTenantId}&tenant_id=${otherTenantId}`],
+        ['POST', '/api/sos', { tenant_id: otherTenantId, message: 'CI only' }]
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+          method, headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+          ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5000)
+        });
+        assert.equal(response.status, 403, `${method} ${route} must reject a foreign tenant`);
+        assert.equal((await response.json()).error, 'Tenant access denied');
+      }
+      console.log('Subscriber HTTP tenant binding: matching tenant allowed; forged query/body tenant IDs rejected.');
+      const coverage = await audit.query(`
+        SELECT c.relname AS table_name, c.relrowsecurity AS rls_enabled
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+          AND EXISTS (
+            SELECT 1 FROM pg_attribute a
+            WHERE a.attrelid = c.oid AND a.attname = 'tenant_id'
+              AND a.attnum > 0 AND NOT a.attisdropped
+          )
+        ORDER BY c.relname
+      `);
+      const uncovered = coverage.rows.filter(row => !row.rls_enabled).map(row => row.table_name);
+      console.log(`Tenant-keyed RLS coverage: ${coverage.rows.length - uncovered.length}/${coverage.rows.length}.`);
+      if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
+      assert.deepEqual(uncovered, EXPECTED_UNCOVERED_TABLES,
+        'Clean-startup RLS inventory changed; review table ownership before extending the prototype');
+      const preexistingProtected = coverage.rows.filter(row => row.rls_enabled).map(row => row.table_name);
+      const preexistingPolicies = await audit.query(`
+        SELECT tablename, policyname, cmd, roles::text AS roles, qual, with_check
+        FROM pg_policies WHERE schemaname='public' ORDER BY tablename,policyname
+      `);
+      const applicable = preexistingPolicies.rows.filter(row => preexistingProtected.includes(row.tablename)
+        && (row.roles.includes('public') || row.roles.includes(TEST_ROLE)));
+      const coveredByPolicy = new Set(applicable.map(row => row.tablename));
+      assert.deepEqual([...coveredByPolicy].sort(), preexistingProtected.sort(),
+        'Every pre-existing tenant-table RLS policy needs an applicable restricted-role rule');
+      for (const policy of applicable) {
+        const readPredicate = policy.qual || '';
+        const writePredicate = policy.with_check || readPredicate;
+        if (['ALL', 'SELECT', 'UPDATE', 'DELETE'].includes(policy.cmd.toUpperCase())) {
+          assert.ok(readPredicate.includes('tenant_id') && readPredicate.includes('app.current_tenant'),
+            `${policy.tablename}.${policy.policyname} lacks a tenant-bound read predicate`);
+        }
+        if (['ALL', 'INSERT', 'UPDATE'].includes(policy.cmd.toUpperCase())) {
+          assert.ok(writePredicate.includes('tenant_id') && writePredicate.includes('app.current_tenant'),
+            `${policy.tablename}.${policy.policyname} lacks a tenant-bound write predicate`);
+        }
+      }
+      console.log(`Existing RLS policy metadata: ${coveredByPolicy.size} tenant tables, ${applicable.length} applicable policies with tenant-bound predicates.`);
+      const privileges = await audit.query(`
+        SELECT c.relname AS table_name,
+          has_table_privilege($1, format('public.%I',c.relname), 'SELECT') AS can_select,
+          has_table_privilege($1, format('public.%I',c.relname), 'INSERT') AS can_insert,
+          has_table_privilege($1, format('public.%I',c.relname), 'UPDATE') AS can_update,
+          has_table_privilege($1, format('public.%I',c.relname), 'DELETE') AS can_delete
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='public' AND c.relkind IN ('r','p')
+          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid
+            AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
+        ORDER BY c.relname
+      `, [TEST_ROLE]);
+      for (const table of ['email_mfa_challenges', 'mfa_recovery_codes']) {
+        const access = privileges.rows.find(row => row.table_name === table);
+        assert.ok(access, `${table} must be present in the tenant-table inventory`);
+        assert.deepEqual([access.can_select, access.can_insert, access.can_update, access.can_delete],
+          [false, false, false, false], `${table} must remain owner-only for the restricted role`);
+      }
+      const readable = privileges.rows.filter(row => row.can_select);
+      const writable = privileges.rows.filter(row => row.can_insert && row.can_update && row.can_delete);
+      console.log(`Restricted-role tenant-table grants: ${readable.length}/${privileges.rowCount} readable; ${writable.length}/${privileges.rowCount} full CRUD.`);
+      console.log(`Tenant-keyed tables without restricted-role SELECT: ${privileges.rows.filter(row => !row.can_select).map(row => row.table_name).join(', ')}.`);
+      // Prototype the missing-table policy in this disposable CI database only.
+      // ROLLBACK ensures this test does not represent an applied migration.
+      await audit.query('BEGIN');
+      try {
+        for (const tableName of uncovered) {
+          const policies = await audit.query(`SELECT policyname FROM pg_policies WHERE schemaname='public' AND tablename=$1`, [tableName]);
+          assert.equal(policies.rowCount, 0, `${tableName} has an existing policy requiring manual review`);
+          const table = `"${tableName.replaceAll('"', '""')}"`;
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_tenant_isolation ON public.${table}
+            TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        const after = await audit.query(`
+          SELECT COUNT(*)::int AS total,
+                 COUNT(*) FILTER (WHERE c.relrowsecurity)::int AS protected
+          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE n.nspname='public' AND c.relkind IN ('r','p')
+            AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid
+              AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
+        `);
+        assert.equal(after.rows[0].protected, after.rows[0].total);
+        const addedPolicies = await audit.query(`
+          SELECT tablename, roles::text AS roles, qual, with_check
+          FROM pg_policies
+          WHERE schemaname='public' AND policyname='vision_ci_tenant_isolation'
+          ORDER BY tablename
+        `);
+        assert.deepEqual(addedPolicies.rows.map(row => row.tablename), EXPECTED_UNCOVERED_TABLES);
+        assert.ok(addedPolicies.rows.every(row => row.roles.includes(TEST_ROLE)
+          && row.qual?.includes('app.current_tenant')
+          && row.with_check?.includes('app.current_tenant')),
+        'Every added policy must be scoped to the restricted role and tenant context');
+        // Parent IDs are globally unique, but the existing single-column FKs
+        // do not prevent an own-tenant child from referencing another tenant's
+        // parent. Prototype matching composite FKs before child-table grants.
+        for (const [parent, child, childColumn] of [
+          ['communication_notifications', 'communication_notification_receipts', 'notification_id'],
+          ['team_conversations', 'team_messages', 'conversation_id'],
+          ['team_conversations', 'team_conversation_reads', 'conversation_id'],
+          ['lone_worker_settings', 'lone_worker_checkins', 'setting_id'],
+          ['lone_worker_settings', 'lone_worker_alerts', 'setting_id'],
+          ['crisis_activations', 'crisis_roles', 'crisis_id'],
+          ['crisis_activations', 'crisis_actions', 'crisis_id'],
+          ['crisis_activations', 'crisis_updates', 'crisis_id']
+        ]) {
+          const uniqueName = `vision_ci_${parent}_tenant_id_unique`;
+          if (!(await audit.query(`SELECT 1 FROM pg_constraint WHERE conname=$1`, [uniqueName])).rowCount) {
+            await audit.query(`ALTER TABLE public.${parent} ADD CONSTRAINT ${uniqueName} UNIQUE(tenant_id,id)`);
+          }
+          await audit.query(`ALTER TABLE public.${child} ADD CONSTRAINT vision_ci_${child}_tenant_parent_fk
+            FOREIGN KEY(tenant_id,${childColumn}) REFERENCES public.${parent}(tenant_id,id)`);
+        }
+        await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
+          FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_contracts ADD CONSTRAINT vision_ci_contracts_tenant_id_unique
+          UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_retention_snapshots ADD CONSTRAINT vision_ci_retention_tenant_contract_fk
+          FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_tickets ADD CONSTRAINT vision_ci_service_tickets_tenant_id_unique
+          UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_ticket_comments ADD CONSTRAINT vision_ci_ticket_comments_tenant_ticket_fk
+          FOREIGN KEY(tenant_id,ticket_id) REFERENCES public.service_tickets(tenant_id,id)`);
+        const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
+          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
+          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS };
+        for (const [table, operations] of Object.entries(reviewedGrants)) {
+          assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
+          await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
+          for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+            const granted = (await audit.query(`SELECT has_table_privilege($1,$2,$3) AS allowed`,
+              [TEST_ROLE, `public.${table}`, operation])).rows[0].allowed;
+            assert.equal(granted, operations.split(',').includes(operation),
+              `${table} ${operation} differs from reviewed core-workflow scope`);
+          }
+        }
+        console.log(`Disposable workflow grant prototype passed: ${Object.keys(reviewedGrants).length} tables; no blanket grant.`);
+        assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
+        const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
+        const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);
+        const oneId = first.rows[0].id, twoId = second.rows[0].id;
+        const oneSite = await audit.query(`INSERT INTO sites(tenant_id,name) VALUES($1,'CI One Site') RETURNING id`, [oneId]);
+        const twoSite = await audit.query(`INSERT INTO sites(tenant_id,name) VALUES($1,'CI Two Site') RETURNING id`, [twoId]);
+        const baselineUsers = await audit.query(`INSERT INTO users(tenant_id,email,role)
+          VALUES($1,'ci-baseline-one@example.test','guard'),($2,'ci-baseline-two@example.test','guard')
+          RETURNING id,tenant_id`, [oneId, twoId]);
+        const checkpoints = await audit.query(`INSERT INTO checkpoints(tenant_id,site_id,name,qr_code)
+          VALUES($1,$2,'CI checkpoint','VISION-CI-ONE'),($3,$4,'CI checkpoint','VISION-CI-TWO')
+          RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO patrol_schedules(tenant_id,site_id,schedule_type,config)
+          VALUES($1,$2,'fixed','{}'::jsonb),($3,$4,'fixed','{}'::jsonb)`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO patrol_logs(tenant_id,checkpoint_id,user_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, checkpoints.rows[0].id, baselineUsers.rows[0].id,
+            twoId, checkpoints.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO alert_log(tenant_id,checkpoint_id)
+          VALUES($1,$2),($3,$4)`, [oneId, checkpoints.rows[0].id, twoId, checkpoints.rows[1].id]);
+        await audit.query(`INSERT INTO guard_assignments(tenant_id,site_id,user_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        const contracts = await audit.query(`INSERT INTO service_contracts(tenant_id,site_id,reference_code,client_name,start_date)
+          VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
+                ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17') RETURNING id,tenant_id`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO visitor_records(tenant_id,site_id,full_name,purpose)
+          VALUES($1,$2,'CI one visitor','CI only'),($3,$4,'CI two visitor','CI only')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO proofscore_snapshots(tenant_id,site_id,period_start,period_end,score,grade)
+          VALUES($1,$2,'2026-09-01','2026-09-30',90,'A'),
+                ($3,$4,'2026-09-01','2026-09-30',90,'A')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO assurance_improvement_actions(tenant_id,site_id,component_key,title)
+          VALUES($1,$2,'ci','CI one action'),($3,$4,'ci','CI two action')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO assurance_risk_forecasts(tenant_id,site_id,risk_score,
+          breach_probability,risk_band)
+          VALUES($1,$2,10,10,'low'),($3,$4,10,10,'low')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,
+          horizon_days,risk_score,risk_band)
+          VALUES($1,$2,$3,30,10,'low'),($4,$5,$6,30,10,'low')`,
+          [oneId, oneSite.rows[0].id, contracts.rows[0].id,
+            twoId, twoSite.rows[0].id, contracts.rows[1].id]);
+        await audit.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,status)
+          VALUES($1,$2,'ci-one-hash','blocked'),($3,$4,'ci-two-hash','blocked')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO ai_assistant_policies(tenant_id,enabled)
+          VALUES($1,FALSE),($2,FALSE)`, [oneId, twoId]);
+        await audit.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name)
+          VALUES($1,$2,'CI certificate'),($3,$4,'CI certificate')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO coverage_autopilot_actions(tenant_id,shift_id,replacement_user_id,
+          recommendation_score,approved_by)
+          VALUES($1,101,$2,50,$2),($3,202,$4,50,$4)`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO pilot_operations_reviews(tenant_id,review_date,operational_status,
+          platform_health,admin_workflow,guard_workflow,client_workflow,offline_sync,
+          emergency_workflow,decision,summary)
+          VALUES($1,'2026-09-17','green','pass','pass','pass','pass','pass','pass','continue','CI only'),
+                ($2,'2026-09-17','green','pass','pass','pass','pass','pass','pass','continue','CI only')`,
+          [oneId, twoId]);
+        const incidents = await audit.query(`INSERT INTO incidents(tenant_id,site_id,user_id,description)
+          VALUES($1,$2,$3,'CI one incident'),($4,$5,$6,'CI two incident') RETURNING id,tenant_id`,
+          [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        const crises = await audit.query(`INSERT INTO crisis_activations(tenant_id,incident_id,site_id,title,
+          commander_user_id,activated_by_user_id,activation_reason)
+          VALUES($1,$2,$3,'CI one crisis',$4,$4,'CI only'),
+                ($5,$6,$7,'CI two crisis',$8,$8,'CI only') RETURNING id,tenant_id`,
+          [oneId, incidents.rows[0].id, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, incidents.rows[1].id, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO crisis_roles(tenant_id,crisis_id,role_name,user_id,assigned_by_user_id)
+          VALUES($1,$2,'commander',$3,$3),($4,$5,'commander',$6,$6)`,
+          [oneId, crises.rows[0].id, baselineUsers.rows[0].id,
+            twoId, crises.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO crisis_actions(tenant_id,crisis_id,title,created_by_user_id)
+          VALUES($1,$2,'CI one action',$3),($4,$5,'CI two action',$6)`,
+          [oneId, crises.rows[0].id, baselineUsers.rows[0].id,
+            twoId, crises.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO crisis_updates(tenant_id,crisis_id,message,created_by_user_id)
+          VALUES($1,$2,'CI one update',$3),($4,$5,'CI two update',$6)`,
+          [oneId, crises.rows[0].id, baselineUsers.rows[0].id,
+            twoId, crises.rows[1].id, baselineUsers.rows[1].id]);
+        const materials = await audit.query(`INSERT INTO training_materials(tenant_id,title,material_type,content)
+          VALUES($1,'CI one training','training','CI only'),($2,'CI two training','training','CI only')
+          RETURNING id,tenant_id`, [oneId, twoId]);
+        await audit.query(`INSERT INTO site_training_requirements(tenant_id,site_id,material_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, oneSite.rows[0].id, materials.rows[0].id,
+            twoId, twoSite.rows[0].id, materials.rows[1].id]);
+        const planId = (await audit.query(`INSERT INTO plan_catalog(code,name,version)
+          VALUES('vision_ci_plan','Disposable CI plan','1') RETURNING id`)).rows[0].id;
+        const featureId = (await audit.query(`INSERT INTO feature_catalog(code,name,category)
+          VALUES('vision_ci_feature','Disposable CI feature','ci') RETURNING id`)).rows[0].id;
+        const flagId = (await audit.query(`INSERT INTO feature_flags(code,description)
+          VALUES('vision_ci_isolation','Disposable isolation fixture') RETURNING id`)).rows[0].id;
+        await audit.query(`INSERT INTO tenant_subscriptions(tenant_id,plan_id)
+          VALUES($1,$3),($2,$3)`, [oneId, twoId, planId]);
+        await audit.query(`INSERT INTO tenant_entitlement_overrides(tenant_id,feature_id,enabled,reason)
+          VALUES($1,$3,TRUE,'CI only'),($2,$3,FALSE,'CI only')`, [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO usage_events(tenant_id,feature_id,quantity,idempotency_key)
+          VALUES($1,$3,1,'vision-ci-one'),($2,$3,1,'vision-ci-two')`, [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO usage_period_summaries(tenant_id,feature_id,period_start,period_end)
+          VALUES($1,$3,'2026-09-01','2026-09-30'),($2,$3,'2026-09-01','2026-09-30')`,
+          [oneId, twoId, featureId]);
+        await audit.query(`INSERT INTO feature_flag_tenants(tenant_id,flag_id,enabled)
+          VALUES($1,$3,TRUE),($2,$3,FALSE)`, [oneId, twoId, flagId]);
+        await audit.query(`INSERT INTO billing_checkout_sessions(id,tenant_id,plan_code,billing_interval,currency,recurring_amount,status)
+          VALUES('00000000-0000-4000-8000-000000000001',$1,'starter','month','EUR',1,'completed'),
+                ('00000000-0000-4000-8000-000000000002',$2,'starter','month','EUR',1,'completed')`,
+          [oneId, twoId]);
+        await audit.query(`INSERT INTO billing_webhook_events(stripe_event_id,tenant_id,event_type)
+          VALUES('vision-ci-one',$1,'ci.test'),('vision-ci-two',$2,'ci.test')`, [oneId, twoId]);
+        await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI Route'),($3,$4,'CI Route')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
+          VALUES($1,$2,100,'2026-09-16','08:00','16:00'),($3,$4,200,'2026-09-16','08:00','16:00')`,
+        [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO system_events(tenant_id,event_type,message) VALUES($1,'vision_ci','one'),($2,'vision_ci','two')`, [oneId, twoId]);
+        await audit.query(`INSERT INTO dispatch_jobs(tenant_id,reference_code,title,assigned_guard_id)
+          VALUES($1,'VISION-CI-ONE','CI dispatch',100),($2,'VISION-CI-TWO','CI dispatch',200)`, [oneId, twoId]);
+        await audit.query(`INSERT INTO sos_alerts(tenant_id,site_id,user_id)
+          VALUES($1,$2,100),($3,$4,200)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO guard_locations(tenant_id,user_id,site_id,latitude,longitude)
+          VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO guard_location_history(tenant_id,user_id,site_id,latitude,longitude)
+          VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'ci-one@example.test','ci-only'),($3,$4,'ci-two@example.test','ci-only')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const tickets = await audit.query(`INSERT INTO service_tickets(tenant_id,site_id,reference_code,subject,description)
+          VALUES($1,$2,'CI-ONE-TICKET','CI One ticket','CI only'),($3,$4,'CI-TWO-TICKET','CI Two ticket','CI only')
+          RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO service_ticket_comments(tenant_id,ticket_id,author_type,comment)
+          VALUES($1,$2,'admin','CI one comment'),($3,$4,'admin','CI two comment')`,
+          [oneId, tickets.rows[0].id, twoId, tickets.rows[1].id]);
+        const conversations = await audit.query(`INSERT INTO team_conversations(tenant_id,title,kind)
+          VALUES($1,'CI One Announcements','company'),($2,'CI Two Announcements','company') RETURNING id,tenant_id`, [oneId, twoId]);
+        const messages = await audit.query(`INSERT INTO communication_notifications(tenant_id,title,message)
+          VALUES($1,'CI One Notice','one'),($2,'CI Two Notice','two') RETURNING id,tenant_id`, [oneId, twoId]);
+        const settings = await audit.query(`INSERT INTO lone_worker_settings(tenant_id,user_id,site_id)
+          VALUES($1,100,$2),($3,200,$4) RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const otherConversationId = conversations.rows.find(row => Number(row.tenant_id) === twoId).id;
+        const otherNotificationId = messages.rows.find(row => Number(row.tenant_id) === twoId).id;
+        const otherSettingId = settings.rows.find(row => Number(row.tenant_id) === twoId).id;
+        await audit.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT,UPDATE ON public.system_events TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.patrol_routes_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.shifts_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.team_messages_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.lone_worker_checkins_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_users_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
+        const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
+        const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
+        const visibleShifts = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM shifts WHERE shift_date='2026-09-16'`)).rows[0].count);
+        const visibleDispatch = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM dispatch_jobs WHERE title='CI dispatch'`)).rows[0].count);
+        const visibleSos = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM sos_alerts`)).rows[0].count);
+        const visibleLocations = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_locations`)).rows[0].count);
+        const visibleLocationHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_location_history`)).rows[0].count);
+        const visibleClientUsers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_users`)).rows[0].count);
+        const visibleTickets = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_tickets`)).rows[0].count);
+        const visibleTicketComments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_ticket_comments`)).rows[0].count);
+        const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
+          'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
+        const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
+          'usage_events', 'usage_period_summaries', 'feature_flag_tenants',
+          'billing_checkout_sessions', 'billing_webhook_events', 'site_training_requirements'];
+        const crisisTables = ['crisis_activations', 'crisis_roles', 'crisis_actions', 'crisis_updates'];
+        const governanceTables = ['ai_assistant_audit', 'ai_assistant_policies',
+          'site_guard_requirements', 'coverage_autopilot_actions', 'pilot_operations_reviews'];
+        const assuranceTables = ['visitor_records', 'proofscore_snapshots',
+          'assurance_improvement_actions', 'assurance_risk_forecasts', 'client_retention_snapshots'];
+        const existingPolicyTables = [...baselineTables, ...entitlementTables,
+          ...crisisTables, ...governanceTables, ...assuranceTables];
+        const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
+          FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
+        for (const table of existingPolicyTables) {
+          assert.equal(await baselineCount(table), 0, `${table} must hide both tenants without context`);
+        }
+        assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
+        assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
+        assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
+        assert.equal(await visibleDispatch(), 0, 'Restricted role must see no dispatches without tenant context');
+        assert.equal(await visibleSos(), 0, 'Restricted role must see no SOS alerts without tenant context');
+        assert.equal(await visibleLocations(), 0, 'Restricted role must see no live locations without tenant context');
+        assert.equal(await visibleLocationHistory(), 0, 'Restricted role must see no location history without tenant context');
+        assert.equal(await visibleClientUsers(), 0, 'Restricted role must see no client accounts without tenant context');
+        assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
+        assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
+        await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
+        for (const table of existingPolicyTables) {
+          assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
+          if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews'].includes(table)) {
+            assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
+              WHERE tenant_id=$1`, [twoId])).rowCount, 0,
+            `${table} must not update tenant two from tenant one's context`);
+          }
+        }
+        await audit.query('SAVEPOINT vision_ci_governance_insert');
+        await assert.rejects(audit.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,status)
+          VALUES($1,$2,'ci-cross-hash','blocked')`, [twoId, baselineUsers.rows[0].id]),
+        error => error.code === '42501', 'AI audit must reject another tenant on insert');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_governance_insert');
+        await audit.query('RELEASE SAVEPOINT vision_ci_governance_insert');
+        await audit.query('SAVEPOINT vision_ci_existing_policy_write');
+        await assert.rejects(audit.query(`UPDATE service_contracts SET tenant_id=$1
+          WHERE tenant_id=$2`, [twoId, oneId]),
+        error => error.code === '42501', 'Existing service-contract policy must reject cross-tenant reassignment');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_existing_policy_write');
+        await audit.query('RELEASE SAVEPOINT vision_ci_existing_policy_write');
+        assert.equal(await visible(), 1, 'Tenant one must see only its own row');
+        assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
+        assert.equal(await visibleShifts(), 1, 'Tenant one must see only its own shift');
+        assert.equal(await visibleDispatch(), 1, 'Tenant one must see only its own dispatch');
+        assert.equal(await visibleSos(), 1, 'Tenant one must see only its own SOS alert');
+        assert.equal(await visibleLocations(), 1, 'Tenant one must see only its own live location');
+        assert.equal(await visibleLocationHistory(), 1, 'Tenant one must see only its own location history');
+        assert.equal(await visibleClientUsers(), 1, 'Tenant one must see only its own client account');
+        assert.equal(await visibleTickets(), 1, 'Tenant one must see only its own ticket');
+        assert.equal(await visibleTicketComments(), 1, 'Tenant one must see only its own ticket comment');
+        assert.equal((await audit.query(`UPDATE service_tickets SET status='closed' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE service_tickets SET status='in_progress' WHERE tenant_id=$1`, [oneId])).rowCount, 1);
+        await audit.query(`RESET ROLE`);
+        await audit.query('SAVEPOINT vision_ci_ticket_fk');
+        await assert.rejects(audit.query(`INSERT INTO service_ticket_comments(tenant_id,ticket_id,author_type,comment)
+          VALUES($1,$2,'admin','cross-tenant')`, [oneId, tickets.rows[1].id]),
+          error => error.code === '23503', 'Ticket comment must reject a ticket from another tenant');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_ticket_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_ticket_fk');
+        await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
+        assert.equal((await audit.query(`UPDATE client_users SET email='blocked@example.test' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`DELETE FROM client_users WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_client_site_fk');
+        await assert.rejects(audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'cross-site@example.test','ci-only')`, [oneId, twoSite.rows[0].id]),
+          error => error.code === '23503', 'Client account must reject another tenant site');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_client_site_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_client_site_fk');
+        assert.equal((await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+          VALUES($1,$2,'ci-one-extra@example.test','ci-only')`, [oneId, oneSite.rows[0].id])).rowCount, 1);
+        assert.equal((await audit.query(`UPDATE guard_locations SET latitude=0 WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        for (const [label, sql, params] of [
+          ['team message', `INSERT INTO team_messages(tenant_id,conversation_id,sender_user_id,sender_role,message)
+            VALUES($1,$2,100,'admin','CI cross-tenant')`, [oneId, otherConversationId]],
+          ['message receipt', `INSERT INTO communication_notification_receipts(tenant_id,notification_id,user_id)
+            VALUES($1,$2,100)`, [oneId, otherNotificationId]],
+          ['lone-worker check-in', `INSERT INTO lone_worker_checkins(tenant_id,setting_id,user_id,site_id)
+            VALUES($1,$2,100,$3)`, [oneId, otherSettingId, oneSite.rows[0].id]],
+          ['crisis update', `INSERT INTO crisis_updates(tenant_id,crisis_id,message,created_by_user_id)
+            VALUES($1,$2,'CI cross-tenant',$3)`, [oneId, crises.rows[1].id, baselineUsers.rows[0].id]],
+          ['client retention snapshot', `INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,
+            horizon_days,risk_score,risk_band) VALUES($1,$2,$3,30,10,'low')`,
+            [oneId, oneSite.rows[0].id, contracts.rows[1].id]]
+        ]) {
+          await audit.query('SAVEPOINT vision_ci_cross_tenant_fk');
+          await assert.rejects(audit.query(sql, params), error => error.code === '23503',
+            `${label} must reject a parent belonging to another tenant`);
+          await audit.query('ROLLBACK TO SAVEPOINT vision_ci_cross_tenant_fk');
+          await audit.query('RELEASE SAVEPOINT vision_ci_cross_tenant_fk');
+        }
+        assert.equal((await audit.query(`UPDATE dispatch_jobs SET status='accepted' WHERE tenant_id=$1 AND title='CI dispatch'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE sos_alerts SET status='resolved' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE patrol_routes SET active=FALSE WHERE tenant_id=$1 AND name='CI Route'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`DELETE FROM patrol_routes WHERE tenant_id=$1 AND name='CI Route'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE shifts SET notes='blocked' WHERE tenant_id=$1 AND shift_date='2026-09-16'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`DELETE FROM shifts WHERE tenant_id=$1 AND shift_date='2026-09-16'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI One Extra') RETURNING id`,
+          [oneId, oneSite.rows[0].id])).rowCount, 1);
+        assert.equal((await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
+          VALUES($1,$2,101,'2026-09-17','08:00','16:00') RETURNING id`, [oneId, oneSite.rows[0].id])).rowCount, 1);
+        assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
+        await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
+        for (const table of existingPolicyTables) {
+          assert.equal(await baselineCount(table), 1, `${table} must show only tenant two's row`);
+        }
+        assert.equal(await visible(), 1, 'Tenant two must see only its own row');
+        assert.equal(await visibleRoutes(), 1, 'Tenant two must see only its own route');
+        assert.equal(await visibleShifts(), 1, 'Tenant two must see only its own shift');
+        assert.equal(await visibleDispatch(), 1, 'Tenant two must see only its own dispatch');
+        assert.equal(await visibleSos(), 1, 'Tenant two must see only its own SOS alert');
+        assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
+        assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
+        assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');
+        console.log(`Existing RLS behavior passed for ${existingPolicyTables.length} tenant tables: no-context and cross-tenant reads/updates denied.`);
+        console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
+      } finally { await audit.query('ROLLBACK'); }
+      // Only after baseline inventory and rollback, prepare the disposable DB
+      // for one real HTTP write through the restricted tenant connection.
+      // This committed fixture is dropped with TEST_DB at the end of this run.
+      await audit.query('BEGIN');
+      try {
+        for (const table of ['guard_locations', 'guard_location_history']) {
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_location_tenant ON public.${table} TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        await audit.query(`GRANT SELECT,INSERT,UPDATE ON public.guard_locations TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT,INSERT ON public.guard_location_history TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.guard_locations_id_seq,public.guard_location_history_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`INSERT INTO guard_assignments(tenant_id,site_id,user_id)
+          VALUES($1,$2,$3)`, [ownTenantId, site.rows[0].id, guard.rows[0].id]);
+        await audit.query('COMMIT');
+      } catch (error) { await audit.query('ROLLBACK'); throw error; }
+      const assignedLocation = await fetch(`http://127.0.0.1:${port}/api/guard-locations`, {
+        method: 'POST', headers: { Authorization: `Bearer ${guardToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tenant_id: ownTenantId, site_id: site.rows[0].id, latitude: 35.9, longitude: 14.5 }),
+        signal: AbortSignal.timeout(5000)
+      });
+      assert.equal(assignedLocation.status, 200, `Assigned guard location should succeed: ${await assignedLocation.text()}`);
+      const locationRows = await audit.query(`SELECT
+        (SELECT COUNT(*)::int FROM guard_locations WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3) AS current_count,
+        (SELECT COUNT(*)::int FROM guard_location_history WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3) AS history_count`,
+        [ownTenantId, guard.rows[0].id, site.rows[0].id]);
+      assert.deepEqual(locationRows.rows[0], { current_count: 1, history_count: 1 });
+      console.log('Assigned guard HTTP location write passed; one current and one history row recorded in disposable CI.');
+      // Real ticket endpoints, with only their reviewed tables enabled for the
+      // restricted connection. All fixtures are in this disposable CI database.
+      await audit.query('BEGIN');
+      try {
+        for (const table of ['service_tickets', 'service_ticket_comments', 'client_users']) {
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_ticket_tenant ON public.${table} TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        await audit.query(`GRANT SELECT,UPDATE ON public.service_tickets TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT ON public.service_ticket_comments,public.client_users TO ${TEST_ROLE}`);
+        await audit.query('COMMIT');
+      } catch (error) { await audit.query('ROLLBACK'); throw error; }
+      const otherSite = await audit.query(`INSERT INTO sites(tenant_id,name)
+        VALUES($1,'Other CI Site') RETURNING id`, [otherTenantId]);
+      const otherAdmin = await audit.query(`INSERT INTO users(tenant_id,email,role)
+        VALUES($1,'vision-http-other-admin@example.test','admin') RETURNING id`, [otherTenantId]);
+      const clientAccount = await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+        VALUES($1,$2,'vision-http-client@example.test','ci-only') RETURNING id`, [ownTenantId, site.rows[0].id]);
+      const ownClientToken = jwt.sign({ tenant_id: ownTenantId, role: 'client',
+        site_id: site.rows[0].id, client_user_id: clientAccount.rows[0].id },
+      process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const otherAdminToken = jwt.sign({ user_id: otherAdmin.rows[0].id,
+        tenant_id: otherTenantId, role: 'admin' },
+      process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const tickets = await audit.query(`INSERT INTO service_tickets(tenant_id,site_id,reference_code,subject,description)
+        VALUES($1,$2,'VISION-HTTP-OWN','Own CI ticket','CI only'),
+              ($3,$4,'VISION-HTTP-OTHER','Other CI ticket','CI only') RETURNING id,tenant_id`,
+      [ownTenantId, site.rows[0].id, otherTenantId, otherSite.rows[0].id]);
+      const ownTicketId = tickets.rows.find(row => Number(row.tenant_id) === Number(ownTenantId)).id;
+      const otherTicketId = tickets.rows.find(row => Number(row.tenant_id) === Number(otherTenantId)).id;
+      const ticketRequest = (route, actorToken, method = 'GET', body) => fetch(`http://127.0.0.1:${port}${route}`, {
+        method, headers: { Authorization: `Bearer ${actorToken}`,
+          ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5000)
+      });
+      const clientTickets = await ticketRequest('/api/client-portal/service-tickets', ownClientToken);
+      assert.equal(clientTickets.status, 200);
+      assert.deepEqual((await clientTickets.json()).map(row => row.id), [ownTicketId]);
+      const adminTickets = await ticketRequest('/api/service-tickets', token);
+      assert.equal(adminTickets.status, 200);
+      assert.deepEqual((await adminTickets.json()).map(row => row.id), [ownTicketId]);
+      assert.equal((await ticketRequest(`/api/service-tickets/${otherTicketId}/comments`, ownClientToken)).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}/comments`, guardToken)).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}/comments`, guardToken, 'POST',
+        { comment: 'Guard must not write' })).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${otherTicketId}`, token, 'PATCH',
+        { status: 'closed' })).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}`, otherAdminToken, 'PATCH',
+        { status: 'closed' })).status, 404);
+      const ownPatch = await ticketRequest(`/api/service-tickets/${ownTicketId}`, token, 'PATCH',
+        { status: 'in_progress' });
+      assert.equal(ownPatch.status, 200, `Own-company ticket update failed: ${await ownPatch.text()}`);
+      const created = await ticketRequest('/api/client-portal/service-tickets', ownClientToken, 'POST',
+        { subject: 'Client CI request', description: 'Disposable CI only' });
+      assert.equal(created.status, 201, 'Own-site client ticket creation must succeed');
+      const createdTicket = await created.json();
+      assert.equal(Number(createdTicket.tenant_id), Number(ownTenantId));
+      assert.equal(Number(createdTicket.site_id), Number(site.rows[0].id));
+      assert.equal((await audit.query('SELECT COUNT(*)::int AS count FROM service_ticket_comments WHERE ticket_id=$1',
+        [createdTicket.id])).rows[0].count, 1);
+      console.log('Ticket HTTP isolation passed: client/admin own access, cross-tenant denial, guard denial, and own-site creation.');
+    } finally { await audit.end(); }
+    console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
+  } finally {
+    if (child && child.exitCode === null) {
+      child.kill('SIGTERM');
+      await Promise.race([new Promise(resolve => child.once('exit', resolve)), delay(3000)]);
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }
+    await admin.query(`DROP DATABASE IF EXISTS ${TEST_DB} WITH (FORCE)`);
+    await admin.query(`DROP ROLE IF EXISTS ${TEST_ROLE}`);
+    await admin.end();
+  }
+}
+
+main().catch(error => { console.error(error); process.exitCode = 1; });
+

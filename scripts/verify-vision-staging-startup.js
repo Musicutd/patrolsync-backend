@@ -276,6 +276,27 @@ async function main() {
       if (uncovered.length) console.log(`Tenant-keyed tables without RLS: ${uncovered.join(', ')}.`);
       assert.deepEqual(uncovered, EXPECTED_UNCOVERED_TABLES,
         'Clean-startup RLS inventory changed; review table ownership before extending the prototype');
+      const preexistingProtected = coverage.rows.filter(row => row.rls_enabled).map(row => row.table_name);
+      const preexistingPolicies = await audit.query(`
+        SELECT tablename, policyname, cmd, roles::text AS roles, qual, with_check
+        FROM pg_policies WHERE schemaname='public' ORDER BY tablename,policyname
+      `);
+      const applicable = preexistingPolicies.rows.filter(row => preexistingProtected.includes(row.tablename)
+        && (row.roles.includes('public') || row.roles.includes(TEST_ROLE)));
+      const coveredByPolicy = new Set(applicable.map(row => row.tablename));
+      assert.deepEqual([...coveredByPolicy].sort(), preexistingProtected.sort(),
+        'Every pre-existing tenant-table RLS policy needs an applicable restricted-role rule');
+      for (const policy of applicable) {
+        const readPredicate = policy.qual || '';
+        const writePredicate = policy.with_check || readPredicate;
+        assert.ok(readPredicate.includes('tenant_id') && readPredicate.includes('app.current_tenant'),
+          `${policy.tablename}.${policy.policyname} lacks a tenant-bound read predicate`);
+        if (['ALL', 'INSERT', 'UPDATE'].includes(policy.cmd.toUpperCase())) {
+          assert.ok(writePredicate.includes('tenant_id') && writePredicate.includes('app.current_tenant'),
+            `${policy.tablename}.${policy.policyname} lacks a tenant-bound write predicate`);
+        }
+      }
+      console.log(`Existing RLS policy metadata: ${coveredByPolicy.size} tenant tables, ${applicable.length} applicable policies with tenant-bound predicates.`);
       const privileges = await audit.query(`
         SELECT c.relname AS table_name,
           has_table_privilege($1, format('public.%I',c.relname), 'SELECT') AS can_select,

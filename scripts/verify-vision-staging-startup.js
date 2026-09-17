@@ -393,6 +393,29 @@ async function main() {
         const oneId = first.rows[0].id, twoId = second.rows[0].id;
         const oneSite = await audit.query(`INSERT INTO sites(tenant_id,name) VALUES($1,'CI One Site') RETURNING id`, [oneId]);
         const twoSite = await audit.query(`INSERT INTO sites(tenant_id,name) VALUES($1,'CI Two Site') RETURNING id`, [twoId]);
+        const baselineUsers = await audit.query(`INSERT INTO users(tenant_id,email,role)
+          VALUES($1,'ci-baseline-one@example.test','guard'),($2,'ci-baseline-two@example.test','guard')
+          RETURNING id,tenant_id`, [oneId, twoId]);
+        const checkpoints = await audit.query(`INSERT INTO checkpoints(tenant_id,site_id,name,qr_code)
+          VALUES($1,$2,'CI checkpoint','VISION-CI-ONE'),($3,$4,'CI checkpoint','VISION-CI-TWO')
+          RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO patrol_schedules(tenant_id,site_id,schedule_type,config)
+          VALUES($1,$2,'fixed','{}'::jsonb),($3,$4,'fixed','{}'::jsonb)`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO patrol_logs(tenant_id,checkpoint_id,user_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, checkpoints.rows[0].id, baselineUsers.rows[0].id,
+            twoId, checkpoints.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO alert_log(tenant_id,checkpoint_id)
+          VALUES($1,$2),($3,$4)`, [oneId, checkpoints.rows[0].id, twoId, checkpoints.rows[1].id]);
+        await audit.query(`INSERT INTO guard_assignments(tenant_id,site_id,user_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO service_contracts(tenant_id,site_id,reference_code,client_name,start_date)
+          VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
+                ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         await audit.query(`INSERT INTO patrol_routes(tenant_id,site_id,name) VALUES($1,$2,'CI Route'),($3,$4,'CI Route')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
@@ -443,6 +466,13 @@ async function main() {
         const visibleClientUsers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_users`)).rows[0].count);
         const visibleTickets = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_tickets`)).rows[0].count);
         const visibleTicketComments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_ticket_comments`)).rows[0].count);
+        const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
+          'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
+        const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
+          FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
+        for (const table of baselineTables) {
+          assert.equal(await baselineCount(table), 0, `${table} must hide both tenants without context`);
+        }
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
         assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
         assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
@@ -454,6 +484,18 @@ async function main() {
         assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
         assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
+        for (const table of baselineTables) {
+          assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
+          assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
+            WHERE tenant_id=$1`, [twoId])).rowCount, 0,
+          `${table} must not update tenant two from tenant one's context`);
+        }
+        await audit.query('SAVEPOINT vision_ci_existing_policy_write');
+        await assert.rejects(audit.query(`UPDATE service_contracts SET tenant_id=$1
+          WHERE tenant_id=$2`, [twoId, oneId]),
+        error => error.code === '42501', 'Existing service-contract policy must reject cross-tenant reassignment');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_existing_policy_write');
+        await audit.query('RELEASE SAVEPOINT vision_ci_existing_policy_write');
         assert.equal(await visible(), 1, 'Tenant one must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
         assert.equal(await visibleShifts(), 1, 'Tenant one must see only its own shift');
@@ -512,6 +554,9 @@ async function main() {
         assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
+        for (const table of baselineTables) {
+          assert.equal(await baselineCount(table), 1, `${table} must show only tenant two's row`);
+        }
         assert.equal(await visible(), 1, 'Tenant two must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant two must see only its own route');
         assert.equal(await visibleShifts(), 1, 'Tenant two must see only its own shift');
@@ -520,6 +565,7 @@ async function main() {
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');
+        console.log(`Existing RLS behavior passed for ${baselineTables.length} legacy tenant tables: no-context and cross-tenant reads/updates denied.`);
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
       // Only after baseline inventory and rollback, prepare the disposable DB

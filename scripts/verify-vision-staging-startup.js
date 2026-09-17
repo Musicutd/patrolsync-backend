@@ -529,6 +529,69 @@ async function main() {
         [ownTenantId, guard.rows[0].id, site.rows[0].id]);
       assert.deepEqual(locationRows.rows[0], { current_count: 1, history_count: 1 });
       console.log('Assigned guard HTTP location write passed; one current and one history row recorded in disposable CI.');
+      // Real ticket endpoints, with only their reviewed tables enabled for the
+      // restricted connection. All fixtures are in this disposable CI database.
+      await audit.query('BEGIN');
+      try {
+        for (const table of ['service_tickets', 'service_ticket_comments', 'client_users']) {
+          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
+          await audit.query(`CREATE POLICY vision_ci_ticket_tenant ON public.${table} TO ${TEST_ROLE}
+            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
+            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
+        }
+        await audit.query(`GRANT SELECT,UPDATE ON public.service_tickets TO ${TEST_ROLE}`);
+        await audit.query(`GRANT SELECT ON public.service_ticket_comments,public.client_users TO ${TEST_ROLE}`);
+        await audit.query('COMMIT');
+      } catch (error) { await audit.query('ROLLBACK'); throw error; }
+      const otherSite = await audit.query(`INSERT INTO sites(tenant_id,name)
+        VALUES($1,'Other CI Site') RETURNING id`, [otherTenantId]);
+      const otherAdmin = await audit.query(`INSERT INTO users(tenant_id,email,role)
+        VALUES($1,'vision-http-other-admin@example.test','admin') RETURNING id`, [otherTenantId]);
+      const clientAccount = await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
+        VALUES($1,$2,'vision-http-client@example.test','ci-only') RETURNING id`, [ownTenantId, site.rows[0].id]);
+      const ownClientToken = jwt.sign({ tenant_id: ownTenantId, role: 'client',
+        site_id: site.rows[0].id, client_user_id: clientAccount.rows[0].id },
+      process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const otherAdminToken = jwt.sign({ user_id: otherAdmin.rows[0].id,
+        tenant_id: otherTenantId, role: 'admin' },
+      process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const tickets = await audit.query(`INSERT INTO service_tickets(tenant_id,site_id,reference_code,subject,description)
+        VALUES($1,$2,'VISION-HTTP-OWN','Own CI ticket','CI only'),
+              ($3,$4,'VISION-HTTP-OTHER','Other CI ticket','CI only') RETURNING id,tenant_id`,
+      [ownTenantId, site.rows[0].id, otherTenantId, otherSite.rows[0].id]);
+      const ownTicketId = tickets.rows.find(row => Number(row.tenant_id) === Number(ownTenantId)).id;
+      const otherTicketId = tickets.rows.find(row => Number(row.tenant_id) === Number(otherTenantId)).id;
+      const ticketRequest = (route, actorToken, method = 'GET', body) => fetch(`http://127.0.0.1:${port}${route}`, {
+        method, headers: { Authorization: `Bearer ${actorToken}`,
+          ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5000)
+      });
+      const clientTickets = await ticketRequest('/api/client-portal/service-tickets', ownClientToken);
+      assert.equal(clientTickets.status, 200);
+      assert.deepEqual((await clientTickets.json()).map(row => row.id), [ownTicketId]);
+      const adminTickets = await ticketRequest('/api/service-tickets', token);
+      assert.equal(adminTickets.status, 200);
+      assert.deepEqual((await adminTickets.json()).map(row => row.id), [ownTicketId]);
+      assert.equal((await ticketRequest(`/api/service-tickets/${otherTicketId}/comments`, ownClientToken)).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}/comments`, guardToken)).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}/comments`, guardToken, 'POST',
+        { comment: 'Guard must not write' })).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${otherTicketId}`, token, 'PATCH',
+        { status: 'closed' })).status, 404);
+      assert.equal((await ticketRequest(`/api/service-tickets/${ownTicketId}`, otherAdminToken, 'PATCH',
+        { status: 'closed' })).status, 404);
+      const ownPatch = await ticketRequest(`/api/service-tickets/${ownTicketId}`, token, 'PATCH',
+        { status: 'in_progress' });
+      assert.equal(ownPatch.status, 200, `Own-company ticket update failed: ${await ownPatch.text()}`);
+      const created = await ticketRequest('/api/client-portal/service-tickets', ownClientToken, 'POST',
+        { subject: 'Client CI request', description: 'Disposable CI only' });
+      assert.equal(created.status, 201, 'Own-site client ticket creation must succeed');
+      const createdTicket = await created.json();
+      assert.equal(Number(createdTicket.tenant_id), Number(ownTenantId));
+      assert.equal(Number(createdTicket.site_id), Number(site.rows[0].id));
+      assert.equal((await audit.query('SELECT COUNT(*)::int AS count FROM service_ticket_comments WHERE ticket_id=$1',
+        [createdTicket.id])).rows[0].count, 1);
+      console.log('Ticket HTTP isolation passed: client/admin own access, cross-tenant denial, guard denial, and own-site creation.');
     } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {

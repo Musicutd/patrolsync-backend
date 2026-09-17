@@ -51,5 +51,10 @@ UNION ALL
 SELECT 'crisis_updates_to_activations', COUNT(*)::int,
        COUNT(*) FILTER (WHERE p.id IS NULL)::int,
        COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
-FROM crisis_updates c LEFT JOIN crisis_activations p ON p.id = c.crisis_id;
+FROM crisis_updates c LEFT JOIN crisis_activations p ON p.id = c.crisis_id
+UNION ALL
+SELECT 'retention_snapshots_to_contracts', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE p.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
+FROM client_retention_snapshots c LEFT JOIN service_contracts p ON p.id = c.contract_id;
 

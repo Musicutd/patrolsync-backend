@@ -289,8 +289,10 @@ async function main() {
       for (const policy of applicable) {
         const readPredicate = policy.qual || '';
         const writePredicate = policy.with_check || readPredicate;
-        assert.ok(readPredicate.includes('tenant_id') && readPredicate.includes('app.current_tenant'),
-          `${policy.tablename}.${policy.policyname} lacks a tenant-bound read predicate`);
+        if (['ALL', 'SELECT', 'UPDATE', 'DELETE'].includes(policy.cmd.toUpperCase())) {
+          assert.ok(readPredicate.includes('tenant_id') && readPredicate.includes('app.current_tenant'),
+            `${policy.tablename}.${policy.policyname} lacks a tenant-bound read predicate`);
+        }
         if (['ALL', 'INSERT', 'UPDATE'].includes(policy.cmd.toUpperCase())) {
           assert.ok(writePredicate.includes('tenant_id') && writePredicate.includes('app.current_tenant'),
             `${policy.tablename}.${policy.policyname} lacks a tenant-bound write predicate`);

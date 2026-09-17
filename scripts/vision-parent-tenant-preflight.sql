@@ -31,5 +31,10 @@ UNION ALL
 SELECT 'client_accounts_to_sites', COUNT(*)::int,
        COUNT(*) FILTER (WHERE s.id IS NULL)::int,
        COUNT(*) FILTER (WHERE s.id IS NOT NULL AND cu.tenant_id IS DISTINCT FROM s.tenant_id)::int
-FROM client_users cu LEFT JOIN sites s ON s.id = cu.site_id;
+FROM client_users cu LEFT JOIN sites s ON s.id = cu.site_id
+UNION ALL
+SELECT 'ticket_comments_to_tickets', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE t.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE t.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM t.tenant_id)::int
+FROM service_ticket_comments c LEFT JOIN service_tickets t ON t.id = c.ticket_id;
 

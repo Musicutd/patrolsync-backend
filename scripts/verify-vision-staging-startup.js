@@ -425,6 +425,24 @@ async function main() {
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,status)
+          VALUES($1,$2,'ci-one-hash','blocked'),($3,$4,'ci-two-hash','blocked')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO ai_assistant_policies(tenant_id,enabled)
+          VALUES($1,FALSE),($2,FALSE)`, [oneId, twoId]);
+        await audit.query(`INSERT INTO site_guard_requirements(tenant_id,site_id,cert_name)
+          VALUES($1,$2,'CI certificate'),($3,$4,'CI certificate')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO coverage_autopilot_actions(tenant_id,shift_id,replacement_user_id,
+          recommendation_score,approved_by)
+          VALUES($1,101,$2,50,$2),($3,202,$4,50,$4)`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO pilot_operations_reviews(tenant_id,review_date,operational_status,
+          platform_health,admin_workflow,guard_workflow,client_workflow,offline_sync,
+          emergency_workflow,decision,summary)
+          VALUES($1,'2026-09-17','green','pass','pass','pass','pass','pass','pass','continue','CI only'),
+                ($2,'2026-09-17','green','pass','pass','pass','pass','pass','pass','continue','CI only')`,
+          [oneId, twoId]);
         const incidents = await audit.query(`INSERT INTO incidents(tenant_id,site_id,user_id,description)
           VALUES($1,$2,$3,'CI one incident'),($4,$5,$6,'CI two incident') RETURNING id,tenant_id`,
           [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
@@ -533,7 +551,10 @@ async function main() {
           'usage_events', 'usage_period_summaries', 'feature_flag_tenants',
           'billing_checkout_sessions', 'billing_webhook_events', 'site_training_requirements'];
         const crisisTables = ['crisis_activations', 'crisis_roles', 'crisis_actions', 'crisis_updates'];
-        const existingPolicyTables = [...baselineTables, ...entitlementTables, ...crisisTables];
+        const governanceTables = ['ai_assistant_audit', 'ai_assistant_policies',
+          'site_guard_requirements', 'coverage_autopilot_actions', 'pilot_operations_reviews'];
+        const existingPolicyTables = [...baselineTables, ...entitlementTables,
+          ...crisisTables, ...governanceTables];
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -552,10 +573,18 @@ async function main() {
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
-          assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
-            WHERE tenant_id=$1`, [twoId])).rowCount, 0,
-          `${table} must not update tenant two from tenant one's context`);
+          if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews'].includes(table)) {
+            assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
+              WHERE tenant_id=$1`, [twoId])).rowCount, 0,
+            `${table} must not update tenant two from tenant one's context`);
+          }
         }
+        await audit.query('SAVEPOINT vision_ci_governance_insert');
+        await assert.rejects(audit.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,status)
+          VALUES($1,$2,'ci-cross-hash','blocked')`, [twoId, baselineUsers.rows[0].id]),
+        error => error.code === '42501', 'AI audit must reject another tenant on insert');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_governance_insert');
+        await audit.query('RELEASE SAVEPOINT vision_ci_governance_insert');
         await audit.query('SAVEPOINT vision_ci_existing_policy_write');
         await assert.rejects(audit.query(`UPDATE service_contracts SET tenant_id=$1
           WHERE tenant_id=$2`, [twoId, oneId]),

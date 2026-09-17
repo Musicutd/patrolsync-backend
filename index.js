@@ -4009,6 +4009,7 @@ const ticketPriorities=['low','normal','high','urgent'];
 const ticketStatuses=['open','in_progress','waiting_client','resolved','closed'];
 
 async function canAccessTicket(client,auth,ticketId){
+  if(auth.role!=='admin'&&auth.role!=='client')return null;
   const result=await client.query('SELECT * FROM service_tickets WHERE id=$1 AND tenant_id=$2',[ticketId,auth.tenant_id]);
   const ticket=result.rows[0];if(!ticket)return null;if(auth.role==='client'&&Number(ticket.site_id)!==Number(auth.site_id))return null;return ticket;
 }

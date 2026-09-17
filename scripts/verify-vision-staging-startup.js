@@ -311,6 +311,12 @@ async function main() {
             AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
         ORDER BY c.relname
       `, [TEST_ROLE]);
+      for (const table of ['email_mfa_challenges', 'mfa_recovery_codes']) {
+        const access = privileges.rows.find(row => row.table_name === table);
+        assert.ok(access, `${table} must be present in the tenant-table inventory`);
+        assert.deepEqual([access.can_select, access.can_insert, access.can_update, access.can_delete],
+          [false, false, false, false], `${table} must remain owner-only for the restricted role`);
+      }
       const readable = privileges.rows.filter(row => row.can_select);
       const writable = privileges.rows.filter(row => row.can_insert && row.can_update && row.can_delete);
       console.log(`Restricted-role tenant-table grants: ${readable.length}/${privileges.rowCount} readable; ${writable.length}/${privileges.rowCount} full CRUD.`);
@@ -416,6 +422,13 @@ async function main() {
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const materials = await audit.query(`INSERT INTO training_materials(tenant_id,title,material_type,content)
+          VALUES($1,'CI one training','training','CI only'),($2,'CI two training','training','CI only')
+          RETURNING id,tenant_id`, [oneId, twoId]);
+        await audit.query(`INSERT INTO site_training_requirements(tenant_id,site_id,material_id)
+          VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, oneSite.rows[0].id, materials.rows[0].id,
+            twoId, twoSite.rows[0].id, materials.rows[1].id]);
         const planId = (await audit.query(`INSERT INTO plan_catalog(code,name,version)
           VALUES('vision_ci_plan','Disposable CI plan','1') RETURNING id`)).rows[0].id;
         const featureId = (await audit.query(`INSERT INTO feature_catalog(code,name,category)
@@ -493,7 +506,7 @@ async function main() {
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
           'usage_events', 'usage_period_summaries', 'feature_flag_tenants',
-          'billing_checkout_sessions', 'billing_webhook_events'];
+          'billing_checkout_sessions', 'billing_webhook_events', 'site_training_requirements'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables];
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);

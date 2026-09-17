@@ -116,6 +116,10 @@ const LOCATION_GRANTS = Object.freeze({
 const CLIENT_ACCESS_GRANTS = Object.freeze({
   client_users: 'SELECT,INSERT,UPDATE,DELETE'
 });
+const SERVICE_TICKET_GRANTS = Object.freeze({
+  service_tickets: 'SELECT,UPDATE',
+  service_ticket_comments: 'SELECT'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -342,9 +346,13 @@ async function main() {
         await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
           FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_tickets ADD CONSTRAINT vision_ci_service_tickets_tenant_id_unique
+          UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_ticket_comments ADD CONSTRAINT vision_ci_ticket_comments_tenant_ticket_fk
+          FOREIGN KEY(tenant_id,ticket_id) REFERENCES public.service_tickets(tenant_id,id)`);
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
-          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS };
+          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -379,6 +387,12 @@ async function main() {
         await audit.query(`INSERT INTO client_users(tenant_id,site_id,email,password_hash)
           VALUES($1,$2,'ci-one@example.test','ci-only'),($3,$4,'ci-two@example.test','ci-only')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const tickets = await audit.query(`INSERT INTO service_tickets(tenant_id,site_id,reference_code,subject,description)
+          VALUES($1,$2,'CI-ONE-TICKET','CI One ticket','CI only'),($3,$4,'CI-TWO-TICKET','CI Two ticket','CI only')
+          RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO service_ticket_comments(tenant_id,ticket_id,author_type,comment)
+          VALUES($1,$2,'admin','CI one comment'),($3,$4,'admin','CI two comment')`,
+          [oneId, tickets.rows[0].id, twoId, tickets.rows[1].id]);
         const conversations = await audit.query(`INSERT INTO team_conversations(tenant_id,title,kind)
           VALUES($1,'CI One Announcements','company'),($2,'CI Two Announcements','company') RETURNING id,tenant_id`, [oneId, twoId]);
         const messages = await audit.query(`INSERT INTO communication_notifications(tenant_id,title,message)
@@ -404,6 +418,8 @@ async function main() {
         const visibleLocations = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_locations`)).rows[0].count);
         const visibleLocationHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_location_history`)).rows[0].count);
         const visibleClientUsers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_users`)).rows[0].count);
+        const visibleTickets = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_tickets`)).rows[0].count);
+        const visibleTicketComments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_ticket_comments`)).rows[0].count);
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
         assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
         assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
@@ -412,6 +428,8 @@ async function main() {
         assert.equal(await visibleLocations(), 0, 'Restricted role must see no live locations without tenant context');
         assert.equal(await visibleLocationHistory(), 0, 'Restricted role must see no location history without tenant context');
         assert.equal(await visibleClientUsers(), 0, 'Restricted role must see no client accounts without tenant context');
+        assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
+        assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         assert.equal(await visible(), 1, 'Tenant one must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
@@ -421,6 +439,18 @@ async function main() {
         assert.equal(await visibleLocations(), 1, 'Tenant one must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant one must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant one must see only its own client account');
+        assert.equal(await visibleTickets(), 1, 'Tenant one must see only its own ticket');
+        assert.equal(await visibleTicketComments(), 1, 'Tenant one must see only its own ticket comment');
+        assert.equal((await audit.query(`UPDATE service_tickets SET status='closed' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE service_tickets SET status='in_progress' WHERE tenant_id=$1`, [oneId])).rowCount, 1);
+        await audit.query(`RESET ROLE`);
+        await audit.query('SAVEPOINT vision_ci_ticket_fk');
+        await assert.rejects(audit.query(`INSERT INTO service_ticket_comments(tenant_id,ticket_id,author_type,comment)
+          VALUES($1,$2,'admin','cross-tenant')`, [oneId, tickets.rows[1].id]),
+          error => error.code === '23503', 'Ticket comment must reject a ticket from another tenant');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_ticket_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_ticket_fk');
+        await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         assert.equal((await audit.query(`UPDATE client_users SET email='blocked@example.test' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`DELETE FROM client_users WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         await audit.query('SAVEPOINT vision_ci_client_site_fk');

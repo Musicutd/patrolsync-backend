@@ -213,6 +213,27 @@ async function main() {
       });
       assert.equal(ownSites.status, 200, 'A matching signed-in tenant must retain normal site access');
       assert.deepEqual(await ownSites.json(), []);
+      const guard = await audit.query(`INSERT INTO users(tenant_id,email,role)
+        VALUES($1,'vision-http-guard@example.test','guard') RETURNING id`, [ownTenantId]);
+      const site = await audit.query(`INSERT INTO sites(tenant_id,name)
+        VALUES($1,'Unassigned CI Site') RETURNING id`, [ownTenantId]);
+      const clientToken = jwt.sign({ user_id: 9001, tenant_id: ownTenantId, role: 'client', site_id: site.rows[0].id },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      const guardToken = jwt.sign({ user_id: guard.rows[0].id, tenant_id: ownTenantId, role: 'guard' },
+        process.env.JWT_SECRET || 'patrolsync-dev-secret', { expiresIn: '5m' });
+      for (const [label, actorToken, expectedError] of [
+        ['administrator', token, 'Guard access required'],
+        ['client', clientToken, 'Guard access required'],
+        ['guard without site assignment', guardToken, 'Guard is not assigned to this site']
+      ]) {
+        const response = await fetch(`http://127.0.0.1:${port}/api/guard-locations`, {
+          method: 'POST', headers: { Authorization: `Bearer ${actorToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tenant_id: ownTenantId, site_id: site.rows[0].id, latitude: 35.9, longitude: 14.5 }),
+          signal: AbortSignal.timeout(5000)
+        });
+        assert.equal(response.status, 403, `${label} must not submit a guard location`);
+        assert.equal((await response.json()).error, expectedError);
+      }
       for (const [method, route, body] of [
         ['GET', `/api/usage?tenant_id=${otherTenantId}`],
         ['GET', `/api/notifications?tenant_id=${otherTenantId}`],

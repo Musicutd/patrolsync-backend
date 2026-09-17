@@ -109,6 +109,10 @@ const COMMUNICATION_LONE_WORKER_GRANTS = Object.freeze({
   lone_worker_checkins: 'SELECT,INSERT',
   lone_worker_alerts: 'SELECT,UPDATE'
 });
+const LOCATION_GRANTS = Object.freeze({
+  guard_locations: 'SELECT,INSERT,UPDATE',
+  guard_location_history: 'SELECT,INSERT'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -333,7 +337,7 @@ async function main() {
             FOREIGN KEY(tenant_id,${childColumn}) REFERENCES public.${parent}(tenant_id,id)`);
         }
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
-          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS };
+          ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS, ...LOCATION_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -361,6 +365,10 @@ async function main() {
           VALUES($1,'VISION-CI-ONE','CI dispatch',100),($2,'VISION-CI-TWO','CI dispatch',200)`, [oneId, twoId]);
         await audit.query(`INSERT INTO sos_alerts(tenant_id,site_id,user_id)
           VALUES($1,$2,100),($3,$4,200)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO guard_locations(tenant_id,user_id,site_id,latitude,longitude)
+          VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO guard_location_history(tenant_id,user_id,site_id,latitude,longitude)
+          VALUES($1,100,$2,35.9,14.5),($3,200,$4,35.8,14.4)`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         const conversations = await audit.query(`INSERT INTO team_conversations(tenant_id,title,kind)
           VALUES($1,'CI One Announcements','company'),($2,'CI Two Announcements','company') RETURNING id,tenant_id`, [oneId, twoId]);
         const messages = await audit.query(`INSERT INTO communication_notifications(tenant_id,title,message)
@@ -382,17 +390,24 @@ async function main() {
         const visibleShifts = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM shifts WHERE shift_date='2026-09-16'`)).rows[0].count);
         const visibleDispatch = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM dispatch_jobs WHERE title='CI dispatch'`)).rows[0].count);
         const visibleSos = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM sos_alerts`)).rows[0].count);
+        const visibleLocations = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_locations`)).rows[0].count);
+        const visibleLocationHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_location_history`)).rows[0].count);
         assert.equal(await visible(), 0, 'Restricted role must see no rows without tenant context');
         assert.equal(await visibleRoutes(), 0, 'Restricted role must see no routes without tenant context');
         assert.equal(await visibleShifts(), 0, 'Restricted role must see no shifts without tenant context');
         assert.equal(await visibleDispatch(), 0, 'Restricted role must see no dispatches without tenant context');
         assert.equal(await visibleSos(), 0, 'Restricted role must see no SOS alerts without tenant context');
+        assert.equal(await visibleLocations(), 0, 'Restricted role must see no live locations without tenant context');
+        assert.equal(await visibleLocationHistory(), 0, 'Restricted role must see no location history without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         assert.equal(await visible(), 1, 'Tenant one must see only its own row');
         assert.equal(await visibleRoutes(), 1, 'Tenant one must see only its own route');
         assert.equal(await visibleShifts(), 1, 'Tenant one must see only its own shift');
         assert.equal(await visibleDispatch(), 1, 'Tenant one must see only its own dispatch');
         assert.equal(await visibleSos(), 1, 'Tenant one must see only its own SOS alert');
+        assert.equal(await visibleLocations(), 1, 'Tenant one must see only its own live location');
+        assert.equal(await visibleLocationHistory(), 1, 'Tenant one must see only its own location history');
+        assert.equal((await audit.query(`UPDATE guard_locations SET latitude=0 WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         for (const [label, sql, params] of [
           ['team message', `INSERT INTO team_messages(tenant_id,conversation_id,sender_user_id,sender_role,message)
             VALUES($1,$2,100,'admin','CI cross-tenant')`, [oneId, otherConversationId]],
@@ -425,6 +440,8 @@ async function main() {
         assert.equal(await visibleShifts(), 1, 'Tenant two must see only its own shift');
         assert.equal(await visibleDispatch(), 1, 'Tenant two must see only its own dispatch');
         assert.equal(await visibleSos(), 1, 'Tenant two must see only its own SOS alert');
+        assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
+        assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
       // Only after baseline inventory and rollback, prepare the disposable DB

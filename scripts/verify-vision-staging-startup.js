@@ -378,6 +378,10 @@ async function main() {
         await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
           FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_contracts ADD CONSTRAINT vision_ci_contracts_tenant_id_unique
+          UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_retention_snapshots ADD CONSTRAINT vision_ci_retention_tenant_contract_fk
+          FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.service_tickets ADD CONSTRAINT vision_ci_service_tickets_tenant_id_unique
           UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.service_ticket_comments ADD CONSTRAINT vision_ci_ticket_comments_tenant_ticket_fk
@@ -421,10 +425,29 @@ async function main() {
           VALUES($1,$2,$3),($4,$5,$6)`,
           [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
             twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
-        await audit.query(`INSERT INTO service_contracts(tenant_id,site_id,reference_code,client_name,start_date)
+        const contracts = await audit.query(`INSERT INTO service_contracts(tenant_id,site_id,reference_code,client_name,start_date)
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
-                ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17')`,
+                ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17') RETURNING id,tenant_id`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO visitor_records(tenant_id,site_id,full_name,purpose)
+          VALUES($1,$2,'CI one visitor','CI only'),($3,$4,'CI two visitor','CI only')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO proofscore_snapshots(tenant_id,site_id,period_start,period_end,score,grade)
+          VALUES($1,$2,'2026-09-01','2026-09-30',90,'A'),
+                ($3,$4,'2026-09-01','2026-09-30',90,'A')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO assurance_improvement_actions(tenant_id,site_id,component_key,title)
+          VALUES($1,$2,'ci','CI one action'),($3,$4,'ci','CI two action')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO assurance_risk_forecasts(tenant_id,site_id,risk_score,
+          breach_probability,risk_band)
+          VALUES($1,$2,10,10,'low'),($3,$4,10,10,'low')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,
+          horizon_days,risk_score,risk_band)
+          VALUES($1,$2,$3,30,10,'low'),($4,$5,$6,30,10,'low')`,
+          [oneId, oneSite.rows[0].id, contracts.rows[0].id,
+            twoId, twoSite.rows[0].id, contracts.rows[1].id]);
         await audit.query(`INSERT INTO ai_assistant_audit(tenant_id,user_id,question_hash,status)
           VALUES($1,$2,'ci-one-hash','blocked'),($3,$4,'ci-two-hash','blocked')`,
           [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
@@ -553,8 +576,10 @@ async function main() {
         const crisisTables = ['crisis_activations', 'crisis_roles', 'crisis_actions', 'crisis_updates'];
         const governanceTables = ['ai_assistant_audit', 'ai_assistant_policies',
           'site_guard_requirements', 'coverage_autopilot_actions', 'pilot_operations_reviews'];
+        const assuranceTables = ['visitor_records', 'proofscore_snapshots',
+          'assurance_improvement_actions', 'assurance_risk_forecasts', 'client_retention_snapshots'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables,
-          ...crisisTables, ...governanceTables];
+          ...crisisTables, ...governanceTables, ...assuranceTables];
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -630,7 +655,10 @@ async function main() {
           ['lone-worker check-in', `INSERT INTO lone_worker_checkins(tenant_id,setting_id,user_id,site_id)
             VALUES($1,$2,100,$3)`, [oneId, otherSettingId, oneSite.rows[0].id]],
           ['crisis update', `INSERT INTO crisis_updates(tenant_id,crisis_id,message,created_by_user_id)
-            VALUES($1,$2,'CI cross-tenant',$3)`, [oneId, crises.rows[1].id, baselineUsers.rows[0].id]]
+            VALUES($1,$2,'CI cross-tenant',$3)`, [oneId, crises.rows[1].id, baselineUsers.rows[0].id]],
+          ['client retention snapshot', `INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,
+            horizon_days,risk_score,risk_band) VALUES($1,$2,$3,30,10,'low')`,
+            [oneId, oneSite.rows[0].id, contracts.rows[1].id]]
         ]) {
           await audit.query('SAVEPOINT vision_ci_cross_tenant_fk');
           await assert.rejects(audit.query(sql, params), error => error.code === '23503',

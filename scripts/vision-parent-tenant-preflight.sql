@@ -26,5 +26,10 @@ UNION ALL
 SELECT 'lone_worker_alerts', COUNT(*)::int,
        COUNT(*) FILTER (WHERE p.id IS NULL)::int,
        COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
-FROM lone_worker_alerts c LEFT JOIN lone_worker_settings p ON p.id = c.setting_id;
+FROM lone_worker_alerts c LEFT JOIN lone_worker_settings p ON p.id = c.setting_id
+UNION ALL
+SELECT 'client_accounts_to_sites', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE s.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE s.id IS NOT NULL AND cu.tenant_id IS DISTINCT FROM s.tenant_id)::int
+FROM client_users cu LEFT JOIN sites s ON s.id = cu.site_id;
 

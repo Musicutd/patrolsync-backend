@@ -2179,6 +2179,7 @@ app.patch('/api/sos/:id/resolve', requireAuth, async (req, res) => {
 // ------------------------ GUARD LOCATION ROUTES ------------------------
 
 app.post('/api/guard-locations', requireAuth, async (req, res) => {
+  if (req.auth.role !== 'guard') return res.status(403).json({ error: 'Guard access required' });
   const { tenant_id, site_id, latitude, longitude } = req.body;
   const user_id = req.auth.user_id;
   if (!tenant_id || latitude === undefined || longitude === undefined) {
@@ -2186,6 +2187,17 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
   }
   try {
     const result = await withTenant(tenant_id, async (client) => {
+      if (site_id) {
+        const assignment = await client.query(
+          'SELECT 1 FROM guard_assignments WHERE tenant_id=$1 AND user_id=$2 AND site_id=$3 LIMIT 1',
+          [tenant_id, user_id, site_id]
+        );
+        if (!assignment.rowCount) {
+          const error = new Error('Guard is not assigned to this site');
+          error.statusCode = 403;
+          throw error;
+        }
+      }
       const upserted = await client.query(
         `INSERT INTO guard_locations (tenant_id, user_id, site_id, latitude, longitude, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
@@ -2203,7 +2215,7 @@ app.post('/api/guard-locations', requireAuth, async (req, res) => {
     });
     res.status(200).json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 

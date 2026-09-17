@@ -36,5 +36,20 @@ UNION ALL
 SELECT 'ticket_comments_to_tickets', COUNT(*)::int,
        COUNT(*) FILTER (WHERE t.id IS NULL)::int,
        COUNT(*) FILTER (WHERE t.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM t.tenant_id)::int
-FROM service_ticket_comments c LEFT JOIN service_tickets t ON t.id = c.ticket_id;
+FROM service_ticket_comments c LEFT JOIN service_tickets t ON t.id = c.ticket_id
+UNION ALL
+SELECT 'crisis_roles_to_activations', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE p.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
+FROM crisis_roles c LEFT JOIN crisis_activations p ON p.id = c.crisis_id
+UNION ALL
+SELECT 'crisis_actions_to_activations', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE p.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
+FROM crisis_actions c LEFT JOIN crisis_activations p ON p.id = c.crisis_id
+UNION ALL
+SELECT 'crisis_updates_to_activations', COUNT(*)::int,
+       COUNT(*) FILTER (WHERE p.id IS NULL)::int,
+       COUNT(*) FILTER (WHERE p.id IS NOT NULL AND c.tenant_id IS DISTINCT FROM p.tenant_id)::int
+FROM crisis_updates c LEFT JOIN crisis_activations p ON p.id = c.crisis_id;
 

@@ -429,6 +429,20 @@ async function main() {
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17') RETURNING id,tenant_id`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
+          VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
+        const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
+          tenant_id,contract_id,site_id,period_start,period_end)
+          VALUES($1,$2,$3,'2026-09-01','2026-09-30'),
+                ($4,$5,$6,'2026-09-01','2026-09-30') RETURNING id,tenant_id`,
+          [oneId, contracts.rows[0].id, oneSite.rows[0].id,
+            twoId, contracts.rows[1].id, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO service_credit_decisions(
+          tenant_id,recommendation_id,previous_status,new_status,reason)
+          VALUES($1,$2,'draft','approved','CI only'),
+                ($3,$4,'draft','approved','CI only')`,
+          [oneId, creditRecommendations.rows[0].id,
+            twoId, creditRecommendations.rows[1].id]);
         await audit.query(`INSERT INTO visitor_records(tenant_id,site_id,full_name,purpose)
           VALUES($1,$2,'CI one visitor','CI only'),($3,$4,'CI two visitor','CI only')`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
@@ -578,8 +592,15 @@ async function main() {
           'site_guard_requirements', 'coverage_autopilot_actions', 'pilot_operations_reviews'];
         const assuranceTables = ['visitor_records', 'proofscore_snapshots',
           'assurance_improvement_actions', 'assurance_risk_forecasts', 'client_retention_snapshots'];
+        const serviceCreditTables = ['service_credit_rules', 'service_credit_recommendations',
+          'service_credit_decisions'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables,
-          ...crisisTables, ...governanceTables, ...assuranceTables];
+          ...crisisTables, ...governanceTables, ...assuranceTables, ...serviceCreditTables];
+        const remainingBehaviorTables = preexistingProtected
+          .filter(table => !existingPolicyTables.includes(table)).sort();
+        assert.equal(remainingBehaviorTables.length, 11,
+          'Pre-existing behavioral coverage inventory changed; review the remaining table set');
+        console.log(`Existing RLS behavior still untested (${remainingBehaviorTables.length}): ${remainingBehaviorTables.join(', ')}.`);
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -801,4 +822,3 @@ async function main() {
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });
-

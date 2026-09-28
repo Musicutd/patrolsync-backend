@@ -366,7 +366,8 @@ async function main() {
           ['lone_worker_settings', 'lone_worker_alerts', 'setting_id'],
           ['crisis_activations', 'crisis_roles', 'crisis_id'],
           ['crisis_activations', 'crisis_actions', 'crisis_id'],
-          ['crisis_activations', 'crisis_updates', 'crisis_id']
+          ['crisis_activations', 'crisis_updates', 'crisis_id'],
+          ['guard_trusted_devices', 'identity_verification_events', 'device_id']
         ]) {
           const uniqueName = `vision_ci_${parent}_tenant_id_unique`;
           if (!(await audit.query(`SELECT 1 FROM pg_constraint WHERE conname=$1`, [uniqueName])).rowCount) {
@@ -409,6 +410,19 @@ async function main() {
         const baselineUsers = await audit.query(`INSERT INTO users(tenant_id,email,role)
           VALUES($1,'ci-baseline-one@example.test','guard'),($2,'ci-baseline-two@example.test','guard')
           RETURNING id,tenant_id`, [oneId, twoId]);
+        await audit.query(`INSERT INTO identity_assurance_settings(tenant_id,enabled,consent_version)
+          VALUES($1,TRUE,'ci-v1'),($2,TRUE,'ci-v1')`, [oneId, twoId]);
+        const trustedDevices = await audit.query(`INSERT INTO guard_trusted_devices(
+          tenant_id,user_id,device_hash,device_name,consent_version,consented_at)
+          VALUES($1,$2,'ci-device-one','CI device one','ci-v1',NOW()),
+                ($3,$4,'ci-device-two','CI device two','ci-v1',NOW()) RETURNING id,tenant_id`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO identity_verification_events(
+          tenant_id,user_id,device_id,action_type,resource_type,outcome,enforcement_mode,reason)
+          VALUES($1,$2,$3,'patrol_scan','patrol_log','verified','observe','CI only'),
+                ($4,$5,$6,'patrol_scan','patrol_log','verified','observe','CI only')`,
+          [oneId, baselineUsers.rows[0].id, trustedDevices.rows[0].id,
+            twoId, baselineUsers.rows[1].id, trustedDevices.rows[1].id]);
         const checkpoints = await audit.query(`INSERT INTO checkpoints(tenant_id,site_id,name,qr_code)
           VALUES($1,$2,'CI checkpoint','VISION-CI-ONE'),($3,$4,'CI checkpoint','VISION-CI-TWO')
           RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
@@ -594,11 +608,14 @@ async function main() {
           'assurance_improvement_actions', 'assurance_risk_forecasts', 'client_retention_snapshots'];
         const serviceCreditTables = ['service_credit_rules', 'service_credit_recommendations',
           'service_credit_decisions'];
+        const identityTables = ['identity_assurance_settings', 'guard_trusted_devices',
+          'identity_verification_events'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables,
-          ...crisisTables, ...governanceTables, ...assuranceTables, ...serviceCreditTables];
+          ...crisisTables, ...governanceTables, ...assuranceTables, ...serviceCreditTables,
+          ...identityTables];
         const remainingBehaviorTables = preexistingProtected
           .filter(table => !existingPolicyTables.includes(table)).sort();
-        assert.equal(remainingBehaviorTables.length, 11,
+        assert.equal(remainingBehaviorTables.length, 8,
           'Pre-existing behavioral coverage inventory changed; review the remaining table set');
         console.log(`Existing RLS behavior still untested (${remainingBehaviorTables.length}): ${remainingBehaviorTables.join(', ')}.`);
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
@@ -679,7 +696,11 @@ async function main() {
             VALUES($1,$2,'CI cross-tenant',$3)`, [oneId, crises.rows[1].id, baselineUsers.rows[0].id]],
           ['client retention snapshot', `INSERT INTO client_retention_snapshots(tenant_id,site_id,contract_id,
             horizon_days,risk_score,risk_band) VALUES($1,$2,$3,30,10,'low')`,
-            [oneId, oneSite.rows[0].id, contracts.rows[1].id]]
+            [oneId, oneSite.rows[0].id, contracts.rows[1].id]],
+          ['identity verification event', `INSERT INTO identity_verification_events(
+            tenant_id,user_id,device_id,action_type,resource_type,outcome,enforcement_mode)
+            VALUES($1,$2,$3,'patrol_scan','patrol_log','verified','observe')`,
+            [oneId, baselineUsers.rows[0].id, trustedDevices.rows[1].id]]
         ]) {
           await audit.query('SAVEPOINT vision_ci_cross_tenant_fk');
           await assert.rejects(audit.query(sql, params), error => error.code === '23503',

@@ -1219,8 +1219,16 @@ async function main() {
           [oneId, oneSite.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`INSERT INTO shifts(tenant_id,site_id,user_id,shift_date,start_time,end_time)
           VALUES($1,$2,101,'2026-09-17','08:00','16:00') RETURNING id`, [oneId, oneSite.rows[0].id])).rowCount, 1);
-        assert.equal((await audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [twoId])).rowCount, 0);
-        assert.equal((await audit.query(`UPDATE system_events SET message='allowed' WHERE tenant_id=$1 AND event_type='vision_ci'`, [oneId])).rowCount, 1);
+        for (const tenantId of [oneId, twoId]) {
+          await audit.query('SAVEPOINT vision_ci_immutable_system_event');
+          await assert.rejects(
+            audit.query(`UPDATE system_events SET message='blocked' WHERE tenant_id=$1 AND event_type='vision_ci'`, [tenantId]),
+            error => error.code === '42501',
+            'Restricted tenant role must not modify immutable system events'
+          );
+          await audit.query('ROLLBACK TO SAVEPOINT vision_ci_immutable_system_event');
+          await audit.query('RELEASE SAVEPOINT vision_ci_immutable_system_event');
+        }
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(twoId)]);
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant two's row`);

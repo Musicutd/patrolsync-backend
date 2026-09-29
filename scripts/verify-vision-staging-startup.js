@@ -42,6 +42,7 @@ const EXPECTED_UNCOVERED_TABLES = Object.freeze([
   'inspection_runs',
   'inspection_templates',
   'integration_api_keys',
+  'invoice_lines',
   'invoice_payments',
   'invoices',
   'leave_requests',
@@ -143,6 +144,11 @@ const CLIENT_REPORT_GRANTS = Object.freeze({
 const RENEWAL_GRANTS = Object.freeze({
   contract_renewals: 'SELECT,INSERT,UPDATE',
   contract_renewal_history: 'SELECT,INSERT'
+});
+const BILLING_GRANTS = Object.freeze({
+  invoices: 'SELECT,INSERT,UPDATE',
+  invoice_lines: 'SELECT,INSERT',
+  invoice_payments: 'SELECT,INSERT'
 });
 
 async function freePort() {
@@ -456,6 +462,10 @@ async function main() {
         await audit.query(`ALTER TABLE public.contract_renewals ADD CONSTRAINT vision_ci_contract_renewals_tenant_owner_fk FOREIGN KEY(tenant_id,owner_user_id) REFERENCES public.users(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.contract_renewal_history ADD CONSTRAINT vision_ci_contract_history_tenant_renewal_fk FOREIGN KEY(tenant_id,renewal_id) REFERENCES public.contract_renewals(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.contract_renewal_history ADD CONSTRAINT vision_ci_contract_history_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.invoices ADD CONSTRAINT vision_ci_invoices_tenant_contract_fk FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.invoices ADD CONSTRAINT vision_ci_invoices_tenant_creator_fk FOREIGN KEY(tenant_id,created_by) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.invoice_payments ADD CONSTRAINT vision_ci_invoice_payments_tenant_invoice_fk FOREIGN KEY(tenant_id,invoice_id) REFERENCES public.invoices(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.invoice_payments ADD CONSTRAINT vision_ci_invoice_payments_tenant_recorder_fk FOREIGN KEY(tenant_id,recorded_by) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -470,7 +480,8 @@ async function main() {
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
           ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
-          ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS, ...RENEWAL_GRANTS };
+          ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS, ...RENEWAL_GRANTS,
+          ...BILLING_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -586,6 +597,20 @@ async function main() {
           VALUES($1,$2,'created',$3),($4,$5,'created',$6)`,
           [oneId, renewals.rows[0].id, baselineUsers.rows[0].id,
             twoId, renewals.rows[1].id, baselineUsers.rows[1].id]);
+        const invoices = await audit.query(`INSERT INTO invoices(
+          tenant_id,contract_id,invoice_number,period_start,period_end,due_date,total,created_by)
+          VALUES($1,$2,'CI-INVOICE-ONE','2026-09-01','2026-09-30','2026-10-30',100,$3),
+                ($4,$5,'CI-INVOICE-TWO','2026-09-01','2026-09-30','2026-10-30',100,$6)
+          RETURNING id,tenant_id`,
+          [oneId, contracts.rows[0].id, baselineUsers.rows[0].id,
+            twoId, contracts.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO invoice_lines(tenant_id,invoice_id,description,quantity,unit_rate,line_total)
+          VALUES($1,$2,'CI one line',1,100,100),($3,$4,'CI two line',1,100,100)`,
+          [oneId, invoices.rows[0].id, twoId, invoices.rows[1].id]);
+        await audit.query(`INSERT INTO invoice_payments(tenant_id,invoice_id,amount,payment_date,recorded_by)
+          VALUES($1,$2,25,'2026-09-29',$3),($4,$5,25,'2026-09-29',$6)`,
+          [oneId, invoices.rows[0].id, baselineUsers.rows[0].id,
+            twoId, invoices.rows[1].id, baselineUsers.rows[1].id]);
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -770,6 +795,9 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_runs_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewals_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewal_history_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoices_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_lines_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_payments_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -793,6 +821,9 @@ async function main() {
         const visibleReportRuns = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_report_runs`)).rows[0].count);
         const visibleRenewals = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM contract_renewals`)).rows[0].count);
         const visibleRenewalHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM contract_renewal_history`)).rows[0].count);
+        const visibleInvoices = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoices`)).rows[0].count);
+        const visibleInvoiceLines = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoice_lines`)).rows[0].count);
+        const visibleInvoicePayments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoice_payments`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -855,6 +886,9 @@ async function main() {
         assert.equal(await visibleReportRuns(), 0, 'Restricted role must see no report runs without tenant context');
         assert.equal(await visibleRenewals(), 0, 'Restricted role must see no contract renewals without tenant context');
         assert.equal(await visibleRenewalHistory(), 0, 'Restricted role must see no renewal history without tenant context');
+        assert.equal(await visibleInvoices(), 0, 'Restricted role must see no invoices without tenant context');
+        assert.equal(await visibleInvoiceLines(), 0, 'Restricted role must see no invoice lines without tenant context');
+        assert.equal(await visibleInvoicePayments(), 0, 'Restricted role must see no invoice payments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
@@ -900,6 +934,22 @@ async function main() {
         assert.equal(await visibleReportRuns(), 1, 'Tenant one must see only its own report run');
         assert.equal(await visibleRenewals(), 1, 'Tenant one must see only its own renewal');
         assert.equal(await visibleRenewalHistory(), 1, 'Tenant one must see only its own renewal history');
+        assert.equal(await visibleInvoices(), 1, 'Tenant one must see only its own invoice');
+        assert.equal(await visibleInvoiceLines(), 1, 'Tenant one must see only its own invoice line');
+        assert.equal(await visibleInvoicePayments(), 1, 'Tenant one must see only its own invoice payment');
+        assert.equal((await audit.query(`UPDATE invoices SET notes='blocked' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_invoice_line_fk');
+        await assert.rejects(audit.query(`INSERT INTO invoice_lines(tenant_id,invoice_id,description,quantity,unit_rate,line_total)
+          VALUES($1,$2,'cross-tenant',1,1,1)`, [oneId, invoices.rows[1].id]),
+        error => error.code === '23503', 'Invoice line must reject another tenant invoice');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_invoice_line_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_invoice_line_fk');
+        await audit.query('SAVEPOINT vision_ci_invoice_payment_fk');
+        await assert.rejects(audit.query(`INSERT INTO invoice_payments(tenant_id,invoice_id,amount,payment_date,recorded_by)
+          VALUES($1,$2,1,'2026-09-29',$3)`, [oneId, invoices.rows[1].id, baselineUsers.rows[0].id]),
+        error => error.code === '23503', 'Invoice payment must reject another tenant invoice');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_invoice_payment_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_invoice_payment_fk');
         assert.equal((await audit.query(`UPDATE contract_renewals SET status='negotiating' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         await audit.query('SAVEPOINT vision_ci_renewal_fk');
         await assert.rejects(audit.query(`INSERT INTO contract_renewal_history(tenant_id,renewal_id,action,user_id)
@@ -1073,6 +1123,9 @@ async function main() {
         assert.equal(await visibleReportRuns(), 1, 'Tenant two must see only its own report run');
         assert.equal(await visibleRenewals(), 1, 'Tenant two must see only its own renewal');
         assert.equal(await visibleRenewalHistory(), 1, 'Tenant two must see only its own renewal history');
+        assert.equal(await visibleInvoices(), 1, 'Tenant two must see only its own invoice');
+        assert.equal(await visibleInvoiceLines(), 1, 'Tenant two must see only its own invoice line');
+        assert.equal(await visibleInvoicePayments(), 1, 'Tenant two must see only its own invoice payment');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

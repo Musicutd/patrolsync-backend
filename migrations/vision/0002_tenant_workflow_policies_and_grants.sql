@@ -87,9 +87,16 @@ DECLARE
   sequence_name text;
 BEGIN
   FOREACH target_table IN ARRAY insert_tables LOOP
-    SELECT pg_get_serial_sequence(format('public.%I',target_table),'id') INTO sequence_name;
-    IF sequence_name IS NOT NULL THEN
-      EXECUTE format('GRANT USAGE,SELECT ON SEQUENCE %s TO {{TENANT_ROLE}}',sequence_name);
+    IF EXISTS (
+      SELECT 1
+      FROM pg_attribute
+      WHERE attrelid=to_regclass(format('public.%I',target_table))
+        AND attname='id' AND attnum>0 AND NOT attisdropped
+    ) THEN
+      SELECT pg_get_serial_sequence(format('public.%I',target_table),'id') INTO sequence_name;
+      IF sequence_name IS NOT NULL THEN
+        EXECUTE format('GRANT USAGE,SELECT ON SEQUENCE %s TO {{TENANT_ROLE}}',sequence_name);
+      END IF;
     END IF;
   END LOOP;
 END

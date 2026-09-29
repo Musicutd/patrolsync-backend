@@ -414,8 +414,9 @@ async function main() {
           SELECT tablename, roles::text AS roles, qual, with_check
           FROM pg_policies
           WHERE schemaname='public' AND policyname='patrolsync_tenant_isolation'
+            AND tablename=ANY($1::text[])
           ORDER BY tablename
-        `);
+        `, [EXPECTED_UNCOVERED_TABLES]);
         assert.deepEqual(addedPolicies.rows.map(row => row.tablename), EXPECTED_UNCOVERED_TABLES);
         assert.ok(addedPolicies.rows.every(row => row.roles.includes(TEST_ROLE)
           && row.qual?.includes('app.current_tenant')

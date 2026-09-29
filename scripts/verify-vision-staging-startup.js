@@ -1362,4 +1362,12 @@ async function main() {
   }
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+main().catch(error => {
+  console.error(error);
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    const annotation = String(error?.stack || error)
+      .replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+    console.error(`::error title=Disposable startup verification failed::${annotation}`);
+  }
+  process.exitCode = 1;
+});

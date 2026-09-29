@@ -379,6 +379,10 @@ async function main() {
         await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
           FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
+          await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
+            FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        }
         await audit.query(`ALTER TABLE public.service_contracts ADD CONSTRAINT vision_ci_contracts_tenant_id_unique
           UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_retention_snapshots ADD CONSTRAINT vision_ci_retention_tenant_contract_fk
@@ -423,6 +427,29 @@ async function main() {
                 ($4,$5,$6,'patrol_scan','patrol_log','verified','observe','CI only')`,
           [oneId, baselineUsers.rows[0].id, trustedDevices.rows[0].id,
             twoId, baselineUsers.rows[1].id, trustedDevices.rows[1].id]);
+        await audit.query(`INSERT INTO operations_risk_snapshots(
+          tenant_id,site_id,score,level,factors,recommendations)
+          VALUES($1,$2,10,'low','[]'::jsonb,'[]'::jsonb),
+                ($3,$4,10,'low','[]'::jsonb,'[]'::jsonb)`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO evidence_integrity_records(
+          tenant_id,evidence_type,evidence_id,source_hash,chain_hash,snapshot)
+          VALUES($1,'patrol_log','ci-one',repeat('1',64),repeat('2',64),'{}'::jsonb),
+                ($2,'patrol_log','ci-two',repeat('3',64),repeat('4',64),'{}'::jsonb)`,
+          [oneId, twoId]);
+        await audit.query(`INSERT INTO tender_proposals(
+          tenant_id,title,prospect_name,reference_code,executive_summary,scope)
+          VALUES($1,'CI one proposal','CI one prospect','CI-PROP-ONE','CI only','CI only'),
+                ($2,'CI two proposal','CI two prospect','CI-PROP-TWO','CI only','CI only')`,
+          [oneId, twoId]);
+        await audit.query(`INSERT INTO site_risk_twins(tenant_id,site_id,profile_name)
+          VALUES($1,$2,'CI one twin'),($3,$4,'CI two twin')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        await audit.query(`INSERT INTO site_risk_scenarios(
+          tenant_id,site_id,name,baseline_score,projected_score,projected_band)
+          VALUES($1,$2,'CI one scenario',10,20,'low'),
+                ($3,$4,'CI two scenario',10,20,'low')`,
+          [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         const checkpoints = await audit.query(`INSERT INTO checkpoints(tenant_id,site_id,name,qr_code)
           VALUES($1,$2,'CI checkpoint','VISION-CI-ONE'),($3,$4,'CI checkpoint','VISION-CI-TWO')
           RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
@@ -610,12 +637,14 @@ async function main() {
           'service_credit_decisions'];
         const identityTables = ['identity_assurance_settings', 'guard_trusted_devices',
           'identity_verification_events'];
+        const intelligenceTables = ['operations_risk_snapshots', 'evidence_integrity_records',
+          'tender_proposals', 'site_risk_twins', 'site_risk_scenarios'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables,
           ...crisisTables, ...governanceTables, ...assuranceTables, ...serviceCreditTables,
-          ...identityTables];
+          ...identityTables, ...intelligenceTables];
         const remainingBehaviorTables = preexistingProtected
           .filter(table => !existingPolicyTables.includes(table)).sort();
-        assert.equal(remainingBehaviorTables.length, 8,
+        assert.equal(remainingBehaviorTables.length, 3,
           'Pre-existing behavioral coverage inventory changed; review the remaining table set');
         console.log(`Existing RLS behavior still untested (${remainingBehaviorTables.length}): ${remainingBehaviorTables.join(', ')}.`);
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
@@ -700,7 +729,11 @@ async function main() {
           ['identity verification event', `INSERT INTO identity_verification_events(
             tenant_id,user_id,device_id,action_type,resource_type,outcome,enforcement_mode)
             VALUES($1,$2,$3,'patrol_scan','patrol_log','verified','observe')`,
-            [oneId, baselineUsers.rows[0].id, trustedDevices.rows[1].id]]
+            [oneId, baselineUsers.rows[0].id, trustedDevices.rows[1].id]],
+          ['risk scenario', `INSERT INTO site_risk_scenarios(
+            tenant_id,site_id,name,baseline_score,projected_score,projected_band)
+            VALUES($1,$2,'CI cross-tenant scenario',10,20,'low')`,
+            [oneId, twoSite.rows[0].id]]
         ]) {
           await audit.query('SAVEPOINT vision_ci_cross_tenant_fk');
           await assert.rejects(audit.query(sql, params), error => error.code === '23503',

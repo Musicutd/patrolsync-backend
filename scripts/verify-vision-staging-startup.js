@@ -610,8 +610,8 @@ async function main() {
           VALUES($1,'equipment','CI one asset','CI-ASSET-ONE',$2),
                 ($3,'equipment','CI two asset','CI-ASSET-TWO',$4)
           RETURNING id,tenant_id`, [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
-        await audit.query(`INSERT INTO asset_custody(tenant_id,asset_id,user_id,issued_by_user_id)
-          VALUES($1,$2,$3,$3),($4,$5,$6,$6)`,
+        await audit.query(`INSERT INTO asset_custody(tenant_id,asset_id,user_id,issued_by_user_id,status)
+          VALUES($1,$2,$3,$3,'issued'),($4,$5,$6,$6,'returned')`,
           [oneId, assets.rows[0].id, baselineUsers.rows[0].id,
             twoId, assets.rows[1].id, baselineUsers.rows[1].id]);
         await audit.query(`INSERT INTO site_training_requirements(tenant_id,site_id,material_id)

@@ -553,9 +553,9 @@ async function main() {
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17') RETURNING id,tenant_id`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
         const reportSchedules = await audit.query(`INSERT INTO client_report_schedules(
-          tenant_id,contract_id,recipient_email,next_run_date,created_by)
-          VALUES($1,$2,'ci-one@example.test','2026-10-01',$3),
-                ($4,$5,'ci-two@example.test','2026-10-01',$6)
+          tenant_id,contract_id,recipient_email,frequency,next_run_date,created_by)
+          VALUES($1,$2,'ci-one@example.test','monthly','2026-10-01',$3),
+                ($4,$5,'ci-two@example.test','monthly','2026-10-01',$6)
           RETURNING id,tenant_id`,
           [oneId, contracts.rows[0].id, baselineUsers.rows[0].id,
             twoId, contracts.rows[1].id, baselineUsers.rows[1].id]);
@@ -882,8 +882,8 @@ async function main() {
         await audit.query('ROLLBACK TO SAVEPOINT vision_ci_report_fk');
         await audit.query('RELEASE SAVEPOINT vision_ci_report_fk');
         assert.equal((await audit.query(`INSERT INTO client_report_schedules(
-          tenant_id,contract_id,recipient_email,next_run_date)
-          VALUES($1,$2,'ci-one-extra@example.test','2026-11-01')`,
+          tenant_id,contract_id,recipient_email,frequency,next_run_date)
+          VALUES($1,$2,'ci-one-extra@example.test','monthly','2026-11-01')`,
         [oneId, contracts.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`UPDATE inspection_runs SET status='submitted' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE corrective_actions SET status='resolved' WHERE tenant_id=$1`, [twoId])).rowCount, 0);

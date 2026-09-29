@@ -120,6 +120,9 @@ const SERVICE_TICKET_GRANTS = Object.freeze({
   service_tickets: 'SELECT,UPDATE',
   service_ticket_comments: 'SELECT'
 });
+const HANDOVER_GRANTS = Object.freeze({
+  handover_logs: 'SELECT,INSERT,UPDATE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -379,6 +382,13 @@ async function main() {
         await audit.query(`ALTER TABLE public.sites ADD CONSTRAINT vision_ci_sites_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_users ADD CONSTRAINT vision_ci_client_users_tenant_site_fk
           FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.users ADD CONSTRAINT vision_ci_users_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.handover_logs ADD CONSTRAINT vision_ci_handovers_tenant_site_fk
+          FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        for (const column of ['from_user_id', 'to_user_id', 'acknowledged_by', 'resolved_by']) {
+          await audit.query(`ALTER TABLE public.handover_logs ADD CONSTRAINT vision_ci_handovers_tenant_${column}_fk
+            FOREIGN KEY(tenant_id,${column}) REFERENCES public.users(tenant_id,id)`);
+        }
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -393,7 +403,8 @@ async function main() {
           FOREIGN KEY(tenant_id,ticket_id) REFERENCES public.service_tickets(tenant_id,id)`);
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
-          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS };
+          ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
+          ...HANDOVER_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -476,6 +487,10 @@ async function main() {
           VALUES($1,$2),($3,$4)`, [oneId, checkpoints.rows[0].id, twoId, checkpoints.rows[1].id]);
         await audit.query(`INSERT INTO guard_assignments(tenant_id,site_id,user_id)
           VALUES($1,$2,$3),($4,$5,$6)`,
+          [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO handover_logs(tenant_id,site_id,from_user_id,summary)
+          VALUES($1,$2,$3,'CI one handover'),($4,$5,$6,'CI two handover')`,
           [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
             twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
         const contracts = await audit.query(`INSERT INTO service_contracts(tenant_id,site_id,reference_code,client_name,start_date)
@@ -624,6 +639,7 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.team_messages_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.lone_worker_checkins_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_users_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.handover_logs_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -635,6 +651,7 @@ async function main() {
         const visibleClientUsers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_users`)).rows[0].count);
         const visibleTickets = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_tickets`)).rows[0].count);
         const visibleTicketComments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM service_ticket_comments`)).rows[0].count);
+        const visibleHandovers = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM handover_logs`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -685,6 +702,7 @@ async function main() {
         assert.equal(await visibleClientUsers(), 0, 'Restricted role must see no client accounts without tenant context');
         assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
         assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
+        assert.equal(await visibleHandovers(), 0, 'Restricted role must see no handovers without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
@@ -718,6 +736,21 @@ async function main() {
         assert.equal(await visibleClientUsers(), 1, 'Tenant one must see only its own client account');
         assert.equal(await visibleTickets(), 1, 'Tenant one must see only its own ticket');
         assert.equal(await visibleTicketComments(), 1, 'Tenant one must see only its own ticket comment');
+        assert.equal(await visibleHandovers(), 1, 'Tenant one must see only its own handover');
+        assert.equal((await audit.query(`UPDATE handover_logs SET status='acknowledged'
+          WHERE tenant_id=$1`, [twoId])).rowCount, 0,
+        'Tenant one must not update tenant two handovers');
+        await audit.query('SAVEPOINT vision_ci_handover_fk');
+        await assert.rejects(audit.query(`INSERT INTO handover_logs(tenant_id,site_id,from_user_id,summary)
+          VALUES($1,$2,$3,'CI cross-tenant handover')`,
+        [oneId, twoSite.rows[0].id, baselineUsers.rows[0].id]),
+        error => error.code === '23503', 'Handover must reject another tenant site');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_handover_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_handover_fk');
+        assert.equal((await audit.query(`INSERT INTO handover_logs(tenant_id,site_id,from_user_id,summary)
+          VALUES($1,$2,$3,'CI one extra handover')`,
+        [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id])).rowCount, 1,
+        'Tenant one must be able to create its own handover');
         assert.equal((await audit.query(`UPDATE service_tickets SET status='closed' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE service_tickets SET status='in_progress' WHERE tenant_id=$1`, [oneId])).rowCount, 1);
         await audit.query(`RESET ROLE`);
@@ -787,6 +820,7 @@ async function main() {
         assert.equal(await visibleShifts(), 1, 'Tenant two must see only its own shift');
         assert.equal(await visibleDispatch(), 1, 'Tenant two must see only its own dispatch');
         assert.equal(await visibleSos(), 1, 'Tenant two must see only its own SOS alert');
+        assert.equal(await visibleHandovers(), 1, 'Tenant two must see only its own handover');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

@@ -1424,6 +1424,15 @@ async function main() {
       assert.equal(rollbackState.rows[0].policies, 0, 'Rollback must remove migration 0002 policies');
       assert.equal(rollbackState.rows[0].rls_enabled, rollbackState.rows[0].total,
         'Rollback must leave RLS enabled as a fail-closed boundary');
+      const rollbackPrivileges = await audit.query(`SELECT COUNT(*)::int AS count
+        FROM unnest($2::text[]) AS target(table_name)
+        WHERE has_table_privilege($1,format('public.%I',target.table_name),'SELECT')
+          OR has_table_privilege($1,format('public.%I',target.table_name),'INSERT')
+          OR has_table_privilege($1,format('public.%I',target.table_name),'UPDATE')
+          OR has_table_privilege($1,format('public.%I',target.table_name),'DELETE')`,
+      [TEST_ROLE, EXPECTED_UNCOVERED_TABLES]);
+      assert.equal(rollbackPrivileges.rows[0].count, 0,
+        'Rollback must revoke all migrated restricted-role table privileges');
       const rollbackConstraints = await audit.query(`SELECT COUNT(*)::int AS count FROM pg_constraint
         WHERE conname LIKE 'patrolsync\\_%\\_tenant\\_%' ESCAPE '\\'`);
       assert.equal(rollbackConstraints.rows[0].count, 0, 'Rollback must remove migration 0003 constraints');

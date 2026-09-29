@@ -150,6 +150,11 @@ const BILLING_GRANTS = Object.freeze({
   invoice_lines: 'SELECT,INSERT',
   invoice_payments: 'SELECT,INSERT'
 });
+const INTEGRATION_OWNER_ONLY_TABLES = Object.freeze([
+  'integration_api_keys',
+  'webhook_endpoints',
+  'webhook_deliveries'
+]);
 
 async function freePort() {
   const server = net.createServer();
@@ -466,6 +471,9 @@ async function main() {
         await audit.query(`ALTER TABLE public.invoices ADD CONSTRAINT vision_ci_invoices_tenant_creator_fk FOREIGN KEY(tenant_id,created_by) REFERENCES public.users(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.invoice_payments ADD CONSTRAINT vision_ci_invoice_payments_tenant_invoice_fk FOREIGN KEY(tenant_id,invoice_id) REFERENCES public.invoices(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.invoice_payments ADD CONSTRAINT vision_ci_invoice_payments_tenant_recorder_fk FOREIGN KEY(tenant_id,recorded_by) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.webhook_endpoints ADD CONSTRAINT vision_ci_webhook_endpoints_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.webhook_deliveries ADD CONSTRAINT vision_ci_webhook_deliveries_tenant_webhook_fk FOREIGN KEY(tenant_id,webhook_id) REFERENCES public.webhook_endpoints(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.integration_api_keys ADD CONSTRAINT vision_ci_integration_keys_tenant_creator_fk FOREIGN KEY(tenant_id,created_by_user_id) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -490,6 +498,14 @@ async function main() {
               [TEST_ROLE, `public.${table}`, operation])).rows[0].allowed;
             assert.equal(granted, operations.split(',').includes(operation),
               `${table} ${operation} differs from reviewed core-workflow scope`);
+          }
+        }
+        for (const table of INTEGRATION_OWNER_ONLY_TABLES) {
+          assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} must remain in the reviewed inventory`);
+          for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+            const granted = (await audit.query(`SELECT has_table_privilege($1,$2,$3) AS allowed`,
+              [TEST_ROLE, `public.${table}`, operation])).rows[0].allowed;
+            assert.equal(granted, false, `${table} must remain owner-only for ${operation}`);
           }
         }
         console.log(`Disposable workflow grant prototype passed: ${Object.keys(reviewedGrants).length} tables; no blanket grant.`);
@@ -611,6 +627,22 @@ async function main() {
           VALUES($1,$2,25,'2026-09-29',$3),($4,$5,25,'2026-09-29',$6)`,
           [oneId, invoices.rows[0].id, baselineUsers.rows[0].id,
             twoId, invoices.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO integration_api_keys(tenant_id,name,key_prefix,key_hash,created_by_user_id)
+          VALUES($1,'CI one key','ci_one','ci-one-hash',$2),($3,'CI two key','ci_two','ci-two-hash',$4)`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        const webhooks = await audit.query(`INSERT INTO webhook_endpoints(tenant_id,name,url,secret)
+          VALUES($1,'CI one webhook','https://one.example.test/hook','ci-one-secret'),
+                ($2,'CI two webhook','https://two.example.test/hook','ci-two-secret')
+          RETURNING id,tenant_id`, [oneId, twoId]);
+        await audit.query(`INSERT INTO webhook_deliveries(tenant_id,webhook_id,event_type,payload)
+          VALUES($1,$2,'ci.test','{}'::jsonb),($3,$4,'ci.test','{}'::jsonb)`,
+          [oneId, webhooks.rows[0].id, twoId, webhooks.rows[1].id]);
+        await audit.query('SAVEPOINT vision_ci_webhook_fk');
+        await assert.rejects(audit.query(`INSERT INTO webhook_deliveries(tenant_id,webhook_id,event_type,payload)
+          VALUES($1,$2,'ci.cross','{}'::jsonb)`, [oneId, webhooks.rows[1].id]),
+        error => error.code === '23503', 'Webhook delivery must reject another tenant endpoint');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_webhook_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_webhook_fk');
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -858,7 +890,17 @@ async function main() {
             await audit.query('RELEASE SAVEPOINT vision_ci_owner_security');
           }
         };
+        const assertIntegrationOwnerOnly = async context => {
+          for (const table of INTEGRATION_OWNER_ONLY_TABLES) {
+            await audit.query('SAVEPOINT vision_ci_integration_owner_only');
+            await assert.rejects(audit.query(`SELECT tenant_id FROM public.${table} LIMIT 1`),
+              error => error.code === '42501', `${table} must deny the restricted role ${context}`);
+            await audit.query('ROLLBACK TO SAVEPOINT vision_ci_integration_owner_only');
+            await audit.query('RELEASE SAVEPOINT vision_ci_integration_owner_only');
+          }
+        };
         await assertOwnerSecurityDenied('without tenant context');
+        await assertIntegrationOwnerOnly('without tenant context');
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -891,6 +933,7 @@ async function main() {
         assert.equal(await visibleInvoicePayments(), 0, 'Restricted role must see no invoice payments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
+        await assertIntegrationOwnerOnly('even with tenant context');
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
           if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews',

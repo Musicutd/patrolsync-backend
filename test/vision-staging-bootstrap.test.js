@@ -9,7 +9,8 @@ const valid = {
   RENDER_SERVICE_ID: 'srv-dal8ne3l550s73ck8l40',
   RENDER_GIT_BRANCH: 'feature/vision-v01-scaffold',
   VISION_ENABLED: 'false',
-  SYSTEM_DATABASE_URL: 'postgresql://patrolsync_vision_staging_db_user:owner-secret@dpg-dal8lpbm8hqs73f9nsk0-a.frankfurt-postgres.render.com/patrolsync_vision_staging_db',
+  STAGING_DATABASE_OWNER: 'patrolsyncvisionstagingdb_3s99_user',
+  SYSTEM_DATABASE_URL: 'postgresql://patrolsyncvisionstagingdb_3s99_user:owner-secret@dpg-dal8lpbm8hqs73f9nsk0-a.frankfurt-postgres.render.com/patrolsync_vision_staging_db',
   STAGING_TENANT_ROLE_PASSWORD: 'staging-role-password-longer-than-32-chars'
 };
 
@@ -20,8 +21,10 @@ test('only the approved staging service and database can bootstrap', () => {
     ['RENDER_GIT_BRANCH', 'main'],
     ['VISION_ENABLED', 'true'],
     ['PATROLSYNC_STAGING_BOOTSTRAP', 'yes'],
+    ['STAGING_DATABASE_OWNER', 'patrolsync_vision_staging_db_user'],
+    ['STAGING_DATABASE_OWNER', 'patrolsyncvisionstagingdb_other_user'],
     ['SYSTEM_DATABASE_URL', 'postgresql://patrolsync_db_user:secret@dpg-production-a.frankfurt-postgres.render.com/patrolsync_db'],
-    ['SYSTEM_DATABASE_URL', 'postgresql://patrolsync_vision_staging_db_user:secret@dpg-production-a.frankfurt-postgres.render.com/patrolsync_vision_staging_db'],
+    ['SYSTEM_DATABASE_URL', 'postgresql://patrolsyncvisionstagingdb_3s99_user:secret@dpg-production-a.frankfurt-postgres.render.com/patrolsync_vision_staging_db'],
     ['STAGING_TENANT_ROLE_PASSWORD', 'short']
   ]) {
     assert.throws(() => validateTarget({ ...valid, [key]: value }), key);

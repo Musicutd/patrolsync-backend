@@ -8,7 +8,6 @@ const path = require('node:path');
 const STAGING_SERVICE_ID = 'srv-dal8ne3l550s73ck8l40';
 const STAGING_BRANCH = 'feature/vision-v01-scaffold';
 const STAGING_DATABASE = 'patrolsync_vision_staging_db';
-const STAGING_OWNER = 'patrolsync_vision_staging_db_user';
 const STAGING_HOST = 'dpg-dal8lpbm8hqs73f9nsk0-a';
 const TENANT_ROLE = 'patrolsync_vision_staging_tenant';
 const REQUIRED_TABLES = [
@@ -25,9 +24,13 @@ function validateStagingConnection(env) {
   let url;
   try { url = new URL(env.SYSTEM_DATABASE_URL || ''); }
   catch (_) { throw new Error('A staging-only SYSTEM_DATABASE_URL is required'); }
+  const expectedOwner = String(env.STAGING_DATABASE_OWNER || '').trim();
+  if (!/^patrolsyncvisionstagingdb_[a-z0-9]+_user$/.test(expectedOwner)) {
+    throw new Error('The rotated staging database owner identity is required');
+  }
   if (!['postgres:', 'postgresql:'].includes(url.protocol) ||
       url.pathname !== `/${STAGING_DATABASE}` ||
-      decodeURIComponent(url.username) !== STAGING_OWNER ||
+      decodeURIComponent(url.username) !== expectedOwner ||
       !(url.hostname === STAGING_HOST || url.hostname.startsWith(`${STAGING_HOST}.`)) ||
       !url.password) {
     throw new Error('Database connection does not identify the dedicated Vision staging instance');
@@ -36,7 +39,7 @@ function validateStagingConnection(env) {
   if (rolePassword.length < 32 || rolePassword.length > 256 || /[\r\n]/.test(rolePassword)) {
     throw new Error('A separate 32–256 character staging tenant-role password is required');
   }
-  return { connectionString: url.href, rolePassword };
+  return { connectionString: url.href, rolePassword, expectedOwner };
 }
 
 function validateTarget(env) {
@@ -49,14 +52,14 @@ function validateTarget(env) {
 function quoteLiteral(value) { return `'${String(value).replaceAll("'", "''")}'`; }
 
 async function bootstrap(env = process.env) {
-  const { connectionString, rolePassword } = validateTarget(env);
+  const { connectionString, rolePassword, expectedOwner } = validateTarget(env);
   const { Client } = require('pg');
   const client = new Client({ connectionString, ssl: { rejectUnauthorized: false } });
   await client.connect();
   try {
     await client.query('BEGIN');
     const identity = (await client.query('SELECT current_database() AS db, current_user AS role')).rows[0];
-    if (identity.db !== STAGING_DATABASE || identity.role !== STAGING_OWNER) {
+    if (identity.db !== STAGING_DATABASE || identity.role !== expectedOwner) {
       throw new Error('Connected database identity differs from the approved staging target');
     }
     const existing = await client.query("SELECT tablename, rowsecurity FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename");

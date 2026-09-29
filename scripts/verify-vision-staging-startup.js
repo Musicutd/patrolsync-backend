@@ -271,6 +271,30 @@ async function verifyControlledMigrations(databaseUrl) {
   });
 }
 
+async function verifyControlledRollback(databaseUrl) {
+  const script = path.join(__dirname, 'verify-controlled-vision-rollback.js');
+  await new Promise((resolve, reject) => {
+    const verification = spawn(process.execPath, [script], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env,
+        VERIFY_ROLLBACK_ENVIRONMENT: 'ci',
+        VERIFY_ROLLBACK_CONFIRMATION: 'VERIFY PATROLSYNC CI VISION ROLLBACK',
+        VERIFY_ROLLBACK_DATABASE_URL: databaseUrl,
+        VERIFY_ROLLBACK_TENANT_ROLE: TEST_ROLE
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let verificationOutput = '';
+    for (const stream of [verification.stdout, verification.stderr]) stream.on('data', chunk => {
+      verificationOutput = (verificationOutput + chunk.toString()).slice(-20000);
+    });
+    verification.once('error', reject);
+    verification.once('exit', code => code === 0 ? resolve() : reject(new Error(
+      `Controlled rollback verification exited ${code}. Output:\n${verificationOutput}`)));
+  });
+}
+
 async function main() {
   const source = new URL(process.env.VISION_TEST_DATABASE_URL || '');
   assert.ok(['127.0.0.1', 'localhost'].includes(source.hostname), 'CI database must be on loopback');
@@ -1434,6 +1458,7 @@ async function main() {
         [createdTicket.id])).rows[0].count, 1);
       console.log('Ticket HTTP isolation passed: client/admin own access, cross-tenant denial, guard denial, and own-site creation.');
       await runControlledRollback(target.href);
+      await verifyControlledRollback(target.href);
       const rollbackLedger = await audit.query('SELECT version FROM patrolsync_schema_migrations ORDER BY version');
       assert.deepEqual(rollbackLedger.rows.map(row => row.version), ['0001_migration_foundation']);
       const rollbackState = await audit.query(`

@@ -1,0 +1,65 @@
+name: Vision staging controlled rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact 40-character commit SHA selected for rollback
+        required: true
+        type: string
+      confirmation:
+        description: Type ROLL BACK REVIEWED VISION MIGRATIONS ON ISOLATED STAGING
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vision-staging-controlled-migration
+  cancel-in-progress: false
+
+jobs:
+  rollback-and-verify:
+    if: >-
+      ${{ github.ref == 'refs/heads/feature/vision-v01-scaffold' &&
+          inputs.confirmation == 'ROLL BACK REVIEWED VISION MIGRATIONS ON ISOLATED STAGING' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: vision-staging-migration
+    env:
+      ROLLBACK_ENVIRONMENT: staging
+      ROLLBACK_CONFIRMATION: ROLL BACK PATROLSYNC STAGING VISION MIGRATIONS
+      ROLLBACK_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+      ROLLBACK_TENANT_ROLE: ${{ vars.VISION_STAGING_TENANT_ROLE }}
+      VERIFY_ROLLBACK_ENVIRONMENT: staging
+      VERIFY_ROLLBACK_CONFIRMATION: VERIFY PATROLSYNC STAGING VISION ROLLBACK
+      VERIFY_ROLLBACK_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+      VERIFY_ROLLBACK_TENANT_ROLE: ${{ vars.VISION_STAGING_TENANT_ROLE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin execution to the reviewed commit
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [ "$EXPECTED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::expected_commit must exactly match the selected 40-character workflow commit SHA."
+            exit 1
+          fi
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Require protected staging configuration
+        shell: bash
+        run: |
+          if [ -z "$ROLLBACK_DATABASE_URL" ] || [ -z "$ROLLBACK_TENANT_ROLE" ]; then
+            echo "::error::Protected staging database URL and tenant role are required."
+            exit 1
+          fi
+      - name: Roll back reviewed Vision migrations
+        run: npm run rollback:vision
+      - name: Read-only rollback verification
+        run: npm run verify:vision-rollback

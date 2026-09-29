@@ -311,7 +311,7 @@ async function main() {
             AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)
         ORDER BY c.relname
       `, [TEST_ROLE]);
-      for (const table of ['email_mfa_challenges', 'mfa_recovery_codes']) {
+      for (const table of ['platform_load_tests', 'email_mfa_challenges', 'mfa_recovery_codes']) {
         const access = privileges.rows.find(row => row.table_name === table);
         assert.ok(access, `${table} must be present in the tenant-table inventory`);
         assert.deepEqual([access.can_select, access.can_insert, access.can_update, access.can_delete],
@@ -414,6 +414,18 @@ async function main() {
         const baselineUsers = await audit.query(`INSERT INTO users(tenant_id,email,role)
           VALUES($1,'ci-baseline-one@example.test','guard'),($2,'ci-baseline-two@example.test','guard')
           RETURNING id,tenant_id`, [oneId, twoId]);
+        await audit.query(`INSERT INTO platform_load_tests(
+          tenant_id,scenario,concurrency,duration_seconds,status,instance_id)
+          VALUES($1,'CI owner-only',1,1,'completed','ci-one'),
+                ($2,'CI owner-only',1,1,'completed','ci-two')`, [oneId, twoId]);
+        await audit.query(`INSERT INTO email_mfa_challenges(
+          tenant_id,user_id,purpose,token_hash,code_hash,expires_at)
+          VALUES($1,$2,'login','ci-token-one','ci-code-one',NOW()+INTERVAL '5 minutes'),
+                ($3,$4,'login','ci-token-two','ci-code-two',NOW()+INTERVAL '5 minutes')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO mfa_recovery_codes(tenant_id,user_id,code_hash)
+          VALUES($1,$2,'ci-recovery-one'),($3,$4,'ci-recovery-two')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
         await audit.query(`INSERT INTO identity_assurance_settings(tenant_id,enabled,consent_version)
           VALUES($1,TRUE,'ci-v1'),($2,TRUE,'ci-v1')`, [oneId, twoId]);
         const trustedDevices = await audit.query(`INSERT INTO guard_trusted_devices(
@@ -639,14 +651,25 @@ async function main() {
           'identity_verification_events'];
         const intelligenceTables = ['operations_risk_snapshots', 'evidence_integrity_records',
           'tender_proposals', 'site_risk_twins', 'site_risk_scenarios'];
+        const ownerSecurityTables = ['email_mfa_challenges', 'mfa_recovery_codes',
+          'platform_load_tests'];
         const existingPolicyTables = [...baselineTables, ...entitlementTables,
           ...crisisTables, ...governanceTables, ...assuranceTables, ...serviceCreditTables,
           ...identityTables, ...intelligenceTables];
         const remainingBehaviorTables = preexistingProtected
           .filter(table => !existingPolicyTables.includes(table)).sort();
-        assert.equal(remainingBehaviorTables.length, 3,
+        assert.deepEqual(remainingBehaviorTables, ownerSecurityTables,
           'Pre-existing behavioral coverage inventory changed; review the remaining table set');
-        console.log(`Existing RLS behavior still untested (${remainingBehaviorTables.length}): ${remainingBehaviorTables.join(', ')}.`);
+        const assertOwnerSecurityDenied = async context => {
+          for (const table of ownerSecurityTables) {
+            await audit.query('SAVEPOINT vision_ci_owner_security');
+            await assert.rejects(audit.query(`SELECT tenant_id FROM public.${table} LIMIT 1`),
+              error => error.code === '42501', `${table} must deny the restricted role ${context}`);
+            await audit.query('ROLLBACK TO SAVEPOINT vision_ci_owner_security');
+            await audit.query('RELEASE SAVEPOINT vision_ci_owner_security');
+          }
+        };
+        await assertOwnerSecurityDenied('without tenant context');
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -663,6 +686,7 @@ async function main() {
         assert.equal(await visibleTickets(), 0, 'Restricted role must see no tickets without tenant context');
         assert.equal(await visibleTicketComments(), 0, 'Restricted role must see no ticket comments without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
+        await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
           if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews',
@@ -767,6 +791,7 @@ async function main() {
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');
         console.log(`Existing RLS behavior passed for ${existingPolicyTables.length} tenant tables: no-context and cross-tenant reads/updates denied.`);
+        console.log(`Owner/security RLS behavior passed for ${ownerSecurityTables.length} tenant tables: restricted-role access denied with and without tenant context.`);
         console.log(`Disposable RLS policy prototype passed: ${after.rows[0].protected}/${after.rows[0].total} tenant-keyed tables; cross-tenant route/shift access denied, own inserts allowed.`);
       } finally { await audit.query('ROLLBACK'); }
       // Only after baseline inventory and rollback, prepare the disposable DB

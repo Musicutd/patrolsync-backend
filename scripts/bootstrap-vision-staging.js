@@ -64,10 +64,15 @@ async function bootstrap(env = process.env) {
   await client.connect();
   try {
     await client.query('BEGIN');
-    const identity = (await client.query('SELECT current_database() AS db, current_user AS role')).rows[0];
+    const identity = (await client.query(`SELECT current_database() AS db,
+      session_user AS login_role,
+      current_user AS active_role,
+      pg_get_userbyid(datdba) AS database_owner
+      FROM pg_database WHERE datname = current_database()`)).rows[0];
     const failedConnectedIdentityChecks = [];
     if (identity.db !== STAGING_DATABASE) failedConnectedIdentityChecks.push('database');
-    if (identity.role !== expectedOwner) failedConnectedIdentityChecks.push('owner');
+    if (identity.login_role !== expectedOwner) failedConnectedIdentityChecks.push('login-owner');
+    if (identity.active_role !== identity.database_owner) failedConnectedIdentityChecks.push('active-database-owner');
     if (failedConnectedIdentityChecks.length > 0) {
       throw new Error(`Connected database identity differs from the approved staging target (failed checks: ${failedConnectedIdentityChecks.join(', ')})`);
     }

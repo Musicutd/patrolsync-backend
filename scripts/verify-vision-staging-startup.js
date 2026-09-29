@@ -176,6 +176,30 @@ async function freePort() {
   return port;
 }
 
+async function runControlledMigrations(databaseUrl) {
+  const script = path.join(__dirname, 'run-controlled-migrations.js');
+  await new Promise((resolve, reject) => {
+    const migration = spawn(process.execPath, [script], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env,
+        MIGRATION_ENVIRONMENT: 'ci',
+        MIGRATION_CONFIRMATION: 'APPLY PATROLSYNC CI MIGRATIONS',
+        MIGRATION_DATABASE_URL: databaseUrl,
+        MIGRATION_TENANT_ROLE: TEST_ROLE
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let migrationOutput = '';
+    for (const stream of [migration.stdout, migration.stderr]) stream.on('data', chunk => {
+      migrationOutput = (migrationOutput + chunk.toString()).slice(-20000);
+    });
+    migration.once('error', reject);
+    migration.once('exit', code => code === 0 ? resolve() : reject(new Error(
+      `Controlled migration runner exited ${code}. Output:\n${migrationOutput}`)));
+  });
+}
+
 async function main() {
   const source = new URL(process.env.VISION_TEST_DATABASE_URL || '');
   assert.ok(['127.0.0.1', 'localhost'].includes(source.hostname), 'CI database must be on loopback');
@@ -196,7 +220,6 @@ async function main() {
       await db.query(fixture.replaceAll('vision_base_reader', TEST_ROLE));
       await db.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
       await db.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON tenants,sites,users,checkpoints,patrol_schedules,patrol_logs,alert_log,guard_assignments,service_contracts TO ${TEST_ROLE}`);
-      await db.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA public TO ${TEST_ROLE}`);
     } finally { await db.end(); }
 
     const port = await freePort();
@@ -346,6 +369,13 @@ async function main() {
         }
       }
       console.log(`Existing RLS policy metadata: ${coveredByPolicy.size} tenant tables, ${applicable.length} applicable policies with tenant-bound predicates.`);
+      await runControlledMigrations(target.href);
+      await runControlledMigrations(target.href);
+      const migrationLedger = await audit.query(`SELECT version FROM patrolsync_schema_migrations ORDER BY version`);
+      assert.deepEqual(migrationLedger.rows.map(row => row.version), [
+        '0001_migration_foundation',
+        '0002_tenant_workflow_policies_and_grants'
+      ], 'Controlled migrations must be applied exactly once and remain repeatable');
       const privileges = await audit.query(`
         SELECT c.relname AS table_name,
           has_table_privilege($1, format('public.%I',c.relname), 'SELECT') AS can_select,
@@ -368,20 +398,9 @@ async function main() {
       const writable = privileges.rows.filter(row => row.can_insert && row.can_update && row.can_delete);
       console.log(`Restricted-role tenant-table grants: ${readable.length}/${privileges.rowCount} readable; ${writable.length}/${privileges.rowCount} full CRUD.`);
       console.log(`Tenant-keyed tables without restricted-role SELECT: ${privileges.rows.filter(row => !row.can_select).map(row => row.table_name).join(', ')}.`);
-      // Prototype the missing-table policy in this disposable CI database only.
-      // ROLLBACK ensures this test does not represent an applied migration.
+      // Parent/child constraint prototypes remain disposable until migration 0003.
       await audit.query('BEGIN');
       try {
-        for (const tableName of uncovered) {
-          const policies = await audit.query(`SELECT policyname FROM pg_policies WHERE schemaname='public' AND tablename=$1`, [tableName]);
-          assert.equal(policies.rowCount, 0, `${tableName} has an existing policy requiring manual review`);
-          const table = `"${tableName.replaceAll('"', '""')}"`;
-          await audit.query(`ALTER TABLE public.${table} ENABLE ROW LEVEL SECURITY`);
-          await audit.query(`CREATE POLICY vision_ci_tenant_isolation ON public.${table}
-            TO ${TEST_ROLE}
-            USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)
-            WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::integer)`);
-        }
         const after = await audit.query(`
           SELECT COUNT(*)::int AS total,
                  COUNT(*) FILTER (WHERE c.relrowsecurity)::int AS protected
@@ -394,7 +413,7 @@ async function main() {
         const addedPolicies = await audit.query(`
           SELECT tablename, roles::text AS roles, qual, with_check
           FROM pg_policies
-          WHERE schemaname='public' AND policyname='vision_ci_tenant_isolation'
+          WHERE schemaname='public' AND policyname='patrolsync_tenant_isolation'
           ORDER BY tablename
         `);
         assert.deepEqual(addedPolicies.rows.map(row => row.tablename), EXPECTED_UNCOVERED_TABLES);
@@ -514,7 +533,6 @@ async function main() {
           ...CERTIFICATION_DELIVERY_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
-          await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
           for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
             const granted = (await audit.query(`SELECT has_table_privilege($1,$2,$3) AS allowed`,
               [TEST_ROLE, `public.${table}`, operation])).rows[0].allowed;
@@ -530,7 +548,7 @@ async function main() {
             assert.equal(granted, false, `${table} must remain owner-only for ${operation}`);
           }
         }
-        console.log(`Disposable workflow grant prototype passed: ${Object.keys(reviewedGrants).length} tables; no blanket grant.`);
+        console.log(`Controlled workflow grants passed: ${Object.keys(reviewedGrants).length} tables; no blanket grant.`);
         assert.ok(uncovered.includes('system_events'), 'Representative previously unprotected table was not found');
         const first = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI One','vision-ci-one') RETURNING id`);
         const second = await audit.query(`INSERT INTO tenants(name,slug) VALUES('CI Two','vision-ci-two') RETURNING id`);
@@ -856,30 +874,6 @@ async function main() {
         const otherConversationId = conversations.rows.find(row => Number(row.tenant_id) === twoId).id;
         const otherNotificationId = messages.rows.find(row => Number(row.tenant_id) === twoId).id;
         const otherSettingId = settings.rows.find(row => Number(row.tenant_id) === twoId).id;
-        await audit.query(`GRANT USAGE ON SCHEMA public TO ${TEST_ROLE}`);
-        await audit.query(`GRANT SELECT,UPDATE ON public.system_events TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.patrol_routes_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.shifts_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.team_messages_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.lone_worker_checkins_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_users_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.handover_logs_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.training_materials_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.training_assignments_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.managed_assets_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.asset_custody_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_templates_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_runs_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.corrective_actions_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_schedules_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_runs_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewals_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewal_history_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoices_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_lines_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_payments_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.system_events_id_seq TO ${TEST_ROLE}`);
-        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.guard_certifications_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);

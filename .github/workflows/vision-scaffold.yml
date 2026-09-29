@@ -36,6 +36,17 @@ jobs:
       - run: node --check vision-routes.js
       - run: node --check vision-entitlement.js
       - run: node --test
+      - name: Verify controlled migration ledger is repeatable
+        env:
+          MIGRATION_ENVIRONMENT: ci
+          MIGRATION_CONFIRMATION: APPLY PATROLSYNC CI MIGRATIONS
+          MIGRATION_DATABASE_URL: postgres://postgres:vision_ci_only@127.0.0.1:5432/vision_ci
+          MIGRATION_TENANT_ROLE: vision_migration_reader
+        run: |
+          psql "$MIGRATION_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE vision_migration_reader NOLOGIN"
+          node scripts/run-controlled-migrations.js
+          node scripts/run-controlled-migrations.js
+          test "$(psql "$MIGRATION_DATABASE_URL" -Atc 'SELECT COUNT(*) FROM patrolsync_schema_migrations')" = "1"
       - name: Repeat clean-database startup to detect initialization races
         run: |
           node scripts/verify-vision-staging-startup.js

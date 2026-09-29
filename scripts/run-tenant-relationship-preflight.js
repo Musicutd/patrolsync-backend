@@ -54,7 +54,6 @@ async function main() {
     const failures = results.filter(row => row.orphaned !== 0 || row.cross_tenant !== 0);
     console.log(JSON.stringify({
       environment,
-      database: target.pathname.slice(1),
       relationshipsChecked: results.length,
       totalChildRows: results.reduce((sum, row) => sum + row.total, 0),
       failures

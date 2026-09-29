@@ -22,3 +22,10 @@ Before applying relationship migrations to staging, run the aggregate-only prefl
 `PREFLIGHT_DATABASE_URL`. It starts a read-only transaction, derives all 59 relationships
 from migration `0003`, reports counts only, and fails on orphaned or cross-tenant references.
 It intentionally refuses database names that do not contain `staging`.
+
+The manual GitHub Actions workflow `Vision staging read-only preflight` provides the
+preferred remote execution path. Store the external staging connection only as
+`VISION_STAGING_DATABASE_URL` in the protected `vision-staging-readonly` GitHub
+environment, require reviewer approval on that environment, and type
+`RUN READ ONLY PREFLIGHT` when dispatching. The workflow has read-only repository
+permissions and cannot invoke the migration or rollback runners.

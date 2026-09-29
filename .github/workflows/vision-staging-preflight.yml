@@ -1,0 +1,43 @@
+name: Vision staging read-only preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type RUN READ ONLY PREFLIGHT
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vision-staging-read-only-preflight
+  cancel-in-progress: false
+
+jobs:
+  tenant-relationships:
+    if: ${{ inputs.confirmation == 'RUN READ ONLY PREFLIGHT' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: vision-staging-readonly
+    env:
+      PREFLIGHT_ENVIRONMENT: staging
+      PREFLIGHT_CONFIRMATION: RUN PATROLSYNC STAGING READ ONLY PREFLIGHT
+      PREFLIGHT_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Require an encrypted staging database connection
+        shell: bash
+        run: |
+          if [ -z "$PREFLIGHT_DATABASE_URL" ]; then
+            echo "::error::VISION_STAGING_DATABASE_URL is not configured in the protected vision-staging-readonly environment."
+            exit 1
+          fi
+      - name: Run aggregate-only tenant relationship preflight
+        run: npm run preflight:tenant-relationships

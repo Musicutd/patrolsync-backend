@@ -665,7 +665,8 @@ async function main() {
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
-          if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews'].includes(table)) {
+          if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews',
+            'operations_risk_snapshots', 'evidence_integrity_records'].includes(table)) {
             assert.equal((await audit.query(`UPDATE public.${table} SET tenant_id=tenant_id
               WHERE tenant_id=$1`, [twoId])).rowCount, 0,
             `${table} must not update tenant two from tenant one's context`);

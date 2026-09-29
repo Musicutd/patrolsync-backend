@@ -28,12 +28,18 @@ function validateStagingConnection(env) {
   if (!/^patrolsyncvisionstagingdb_[a-z0-9]+_user$/.test(expectedOwner)) {
     throw new Error('The rotated staging database owner identity is required');
   }
-  if (!['postgres:', 'postgresql:'].includes(url.protocol) ||
-      url.pathname !== `/${STAGING_DATABASE}` ||
-      decodeURIComponent(url.username) !== expectedOwner ||
-      !(url.hostname === STAGING_HOST || url.hostname.startsWith(`${STAGING_HOST}.`)) ||
-      !url.password) {
-    throw new Error('Database connection does not identify the dedicated Vision staging instance');
+  const identityChecks = {
+    protocol: ['postgres:', 'postgresql:'].includes(url.protocol),
+    database: url.pathname === `/${STAGING_DATABASE}`,
+    owner: decodeURIComponent(url.username) === expectedOwner,
+    host: url.hostname === STAGING_HOST || url.hostname.startsWith(`${STAGING_HOST}.`),
+    password: Boolean(url.password)
+  };
+  const failedIdentityChecks = Object.entries(identityChecks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name);
+  if (failedIdentityChecks.length > 0) {
+    throw new Error(`Database connection does not identify the dedicated Vision staging instance (failed checks: ${failedIdentityChecks.join(', ')})`);
   }
   const rolePassword = env.STAGING_TENANT_ROLE_PASSWORD || '';
   if (rolePassword.length < 32 || rolePassword.length > 256 || /[\r\n]/.test(rolePassword)) {

@@ -140,6 +140,10 @@ const CLIENT_REPORT_GRANTS = Object.freeze({
   client_report_schedules: 'SELECT,INSERT,UPDATE',
   client_report_runs: 'SELECT,INSERT,UPDATE'
 });
+const RENEWAL_GRANTS = Object.freeze({
+  contract_renewals: 'SELECT,INSERT,UPDATE',
+  contract_renewal_history: 'SELECT,INSERT'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -445,6 +449,13 @@ async function main() {
         await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_schedule_fk FOREIGN KEY(tenant_id,schedule_id) REFERENCES public.client_report_schedules(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_contract_fk FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_deliverer_fk FOREIGN KEY(tenant_id,delivered_by) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.contract_renewals ADD CONSTRAINT vision_ci_contract_renewals_tenant_id_unique UNIQUE(tenant_id,id)`);
+        for (const column of ['contract_id', 'completed_contract_id']) {
+          await audit.query(`ALTER TABLE public.contract_renewals ADD CONSTRAINT vision_ci_contract_renewals_tenant_${column}_fk FOREIGN KEY(tenant_id,${column}) REFERENCES public.service_contracts(tenant_id,id)`);
+        }
+        await audit.query(`ALTER TABLE public.contract_renewals ADD CONSTRAINT vision_ci_contract_renewals_tenant_owner_fk FOREIGN KEY(tenant_id,owner_user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.contract_renewal_history ADD CONSTRAINT vision_ci_contract_history_tenant_renewal_fk FOREIGN KEY(tenant_id,renewal_id) REFERENCES public.contract_renewals(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.contract_renewal_history ADD CONSTRAINT vision_ci_contract_history_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -459,7 +470,7 @@ async function main() {
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
           ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
-          ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS };
+          ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS, ...RENEWAL_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -565,6 +576,16 @@ async function main() {
                 ($4,$5,$6,'2026-09-01','2026-09-30','ci-two@example.test')`,
           [oneId, reportSchedules.rows[0].id, contracts.rows[0].id,
             twoId, reportSchedules.rows[1].id, contracts.rows[1].id]);
+        const renewals = await audit.query(`INSERT INTO contract_renewals(
+          tenant_id,contract_id,owner_user_id,proposed_start_date)
+          VALUES($1,$2,$3,'2026-10-01'),($4,$5,$6,'2026-10-01')
+          RETURNING id,tenant_id`,
+          [oneId, contracts.rows[0].id, baselineUsers.rows[0].id,
+            twoId, contracts.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO contract_renewal_history(tenant_id,renewal_id,action,user_id)
+          VALUES($1,$2,'created',$3),($4,$5,'created',$6)`,
+          [oneId, renewals.rows[0].id, baselineUsers.rows[0].id,
+            twoId, renewals.rows[1].id, baselineUsers.rows[1].id]);
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -747,6 +768,8 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.corrective_actions_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_schedules_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_runs_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewals_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.contract_renewal_history_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -768,6 +791,8 @@ async function main() {
         const visibleCorrectiveActions = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM corrective_actions`)).rows[0].count);
         const visibleReportSchedules = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_report_schedules`)).rows[0].count);
         const visibleReportRuns = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_report_runs`)).rows[0].count);
+        const visibleRenewals = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM contract_renewals`)).rows[0].count);
+        const visibleRenewalHistory = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM contract_renewal_history`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -828,6 +853,8 @@ async function main() {
         assert.equal(await visibleCorrectiveActions(), 0, 'Restricted role must see no corrective actions without tenant context');
         assert.equal(await visibleReportSchedules(), 0, 'Restricted role must see no report schedules without tenant context');
         assert.equal(await visibleReportRuns(), 0, 'Restricted role must see no report runs without tenant context');
+        assert.equal(await visibleRenewals(), 0, 'Restricted role must see no contract renewals without tenant context');
+        assert.equal(await visibleRenewalHistory(), 0, 'Restricted role must see no renewal history without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
@@ -871,6 +898,15 @@ async function main() {
         assert.equal(await visibleCorrectiveActions(), 1, 'Tenant one must see only its own corrective action');
         assert.equal(await visibleReportSchedules(), 1, 'Tenant one must see only its own report schedule');
         assert.equal(await visibleReportRuns(), 1, 'Tenant one must see only its own report run');
+        assert.equal(await visibleRenewals(), 1, 'Tenant one must see only its own renewal');
+        assert.equal(await visibleRenewalHistory(), 1, 'Tenant one must see only its own renewal history');
+        assert.equal((await audit.query(`UPDATE contract_renewals SET status='negotiating' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_renewal_fk');
+        await assert.rejects(audit.query(`INSERT INTO contract_renewal_history(tenant_id,renewal_id,action,user_id)
+          VALUES($1,$2,'cross-tenant',$3)`, [oneId, renewals.rows[1].id, baselineUsers.rows[0].id]),
+        error => error.code === '23503', 'Renewal history must reject another tenant renewal');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_renewal_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_renewal_fk');
         assert.equal((await audit.query(`UPDATE client_report_schedules SET active=FALSE WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE client_report_runs SET status='delivered' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         await audit.query('SAVEPOINT vision_ci_report_fk');
@@ -1035,6 +1071,8 @@ async function main() {
         assert.equal(await visibleCorrectiveActions(), 1, 'Tenant two must see only its own corrective action');
         assert.equal(await visibleReportSchedules(), 1, 'Tenant two must see only its own report schedule');
         assert.equal(await visibleReportRuns(), 1, 'Tenant two must see only its own report run');
+        assert.equal(await visibleRenewals(), 1, 'Tenant two must see only its own renewal');
+        assert.equal(await visibleRenewalHistory(), 1, 'Tenant two must see only its own renewal history');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

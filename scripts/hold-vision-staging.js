@@ -14,6 +14,10 @@ async function main() {
     const result = await require('./verify-vision-staging-baseline').verify();
     console.log(`Vision staging read-only audit passed: ${result.tables} RLS tables, ${result.policies} policies, restricted login, empty data. API remains inactive.`);
   }
+  if (process.env.PATROLSYNC_STAGING_EXPAND === 'EXPAND_REVIEWED_EXISTING_SCHEMA') {
+    const result = await require('./expand-vision-staging-schema').expand();
+    console.log(`Vision staging schema expanded by ${result.added} tables (${result.tables} total); access remains revoked and API inactive.`);
+  }
   http.createServer((request, response) => {
     response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end('PatrolSync Vision staging is not initialized');

@@ -155,6 +155,14 @@ const INTEGRATION_OWNER_ONLY_TABLES = Object.freeze([
   'webhook_endpoints',
   'webhook_deliveries'
 ]);
+const SECURITY_OPERATIONS_GRANTS = Object.freeze({
+  audit_logs: 'SELECT',
+  system_events: 'SELECT,INSERT'
+});
+const SECURITY_OWNER_ONLY_TABLES = Object.freeze([
+  'auth_sessions',
+  'password_reset_tokens'
+]);
 
 async function freePort() {
   const server = net.createServer();
@@ -474,6 +482,9 @@ async function main() {
         await audit.query(`ALTER TABLE public.webhook_endpoints ADD CONSTRAINT vision_ci_webhook_endpoints_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.webhook_deliveries ADD CONSTRAINT vision_ci_webhook_deliveries_tenant_webhook_fk FOREIGN KEY(tenant_id,webhook_id) REFERENCES public.webhook_endpoints(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.integration_api_keys ADD CONSTRAINT vision_ci_integration_keys_tenant_creator_fk FOREIGN KEY(tenant_id,created_by_user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.auth_sessions ADD CONSTRAINT vision_ci_auth_sessions_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.password_reset_tokens ADD CONSTRAINT vision_ci_password_resets_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.audit_logs ADD CONSTRAINT vision_ci_audit_logs_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -489,7 +500,7 @@ async function main() {
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
           ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
           ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS, ...RENEWAL_GRANTS,
-          ...BILLING_GRANTS };
+          ...BILLING_GRANTS, ...SECURITY_OPERATIONS_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -500,7 +511,7 @@ async function main() {
               `${table} ${operation} differs from reviewed core-workflow scope`);
           }
         }
-        for (const table of INTEGRATION_OWNER_ONLY_TABLES) {
+        for (const table of [...INTEGRATION_OWNER_ONLY_TABLES, ...SECURITY_OWNER_ONLY_TABLES]) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} must remain in the reviewed inventory`);
           for (const operation of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
             const granted = (await audit.query(`SELECT has_table_privilege($1,$2,$3) AS allowed`,
@@ -643,6 +654,21 @@ async function main() {
         error => error.code === '23503', 'Webhook delivery must reject another tenant endpoint');
         await audit.query('ROLLBACK TO SAVEPOINT vision_ci_webhook_fk');
         await audit.query('RELEASE SAVEPOINT vision_ci_webhook_fk');
+        await audit.query(`INSERT INTO auth_sessions(id,tenant_id,user_id,role,expires_at)
+          VALUES('00000000-0000-4000-8000-000000000001',$1,$2,'guard',NOW()+INTERVAL '1 hour'),
+                ('00000000-0000-4000-8000-000000000002',$3,$4,'guard',NOW()+INTERVAL '1 hour')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO password_reset_tokens(tenant_id,user_id,token_hash,expires_at)
+          VALUES($1,$2,'ci-reset-one',NOW()+INTERVAL '30 minutes'),
+                ($3,$4,'ci-reset-two',NOW()+INTERVAL '30 minutes')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO audit_logs(tenant_id,user_id,user_email,user_role,action,resource)
+          VALUES($1,$2,'ci-one@example.test','guard','VIEW','ci-security'),
+                ($3,$4,'ci-two@example.test','guard','VIEW','ci-security')`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO system_events(tenant_id,event_type,severity,message)
+          VALUES($1,'ci_security','info','CI one security event'),
+                ($2,'ci_security','info','CI two security event')`, [oneId, twoId]);
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -830,6 +856,7 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoices_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_lines_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_payments_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.system_events_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -856,6 +883,8 @@ async function main() {
         const visibleInvoices = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoices`)).rows[0].count);
         const visibleInvoiceLines = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoice_lines`)).rows[0].count);
         const visibleInvoicePayments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoice_payments`)).rows[0].count);
+        const visibleAuditLogs = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM audit_logs WHERE resource='ci-security'`)).rows[0].count);
+        const visibleSecurityEvents = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='ci_security'`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -890,8 +919,8 @@ async function main() {
             await audit.query('RELEASE SAVEPOINT vision_ci_owner_security');
           }
         };
-        const assertIntegrationOwnerOnly = async context => {
-          for (const table of INTEGRATION_OWNER_ONLY_TABLES) {
+        const assertReviewedOwnerOnly = async context => {
+          for (const table of [...INTEGRATION_OWNER_ONLY_TABLES, ...SECURITY_OWNER_ONLY_TABLES]) {
             await audit.query('SAVEPOINT vision_ci_integration_owner_only');
             await assert.rejects(audit.query(`SELECT tenant_id FROM public.${table} LIMIT 1`),
               error => error.code === '42501', `${table} must deny the restricted role ${context}`);
@@ -900,7 +929,7 @@ async function main() {
           }
         };
         await assertOwnerSecurityDenied('without tenant context');
-        await assertIntegrationOwnerOnly('without tenant context');
+        await assertReviewedOwnerOnly('without tenant context');
         const baselineCount = async table => Number((await audit.query(`SELECT COUNT(*)::int AS count
           FROM public.${table} WHERE tenant_id IN ($1,$2)`, [oneId, twoId])).rows[0].count);
         for (const table of existingPolicyTables) {
@@ -931,9 +960,11 @@ async function main() {
         assert.equal(await visibleInvoices(), 0, 'Restricted role must see no invoices without tenant context');
         assert.equal(await visibleInvoiceLines(), 0, 'Restricted role must see no invoice lines without tenant context');
         assert.equal(await visibleInvoicePayments(), 0, 'Restricted role must see no invoice payments without tenant context');
+        assert.equal(await visibleAuditLogs(), 0, 'Restricted role must see no audit logs without tenant context');
+        assert.equal(await visibleSecurityEvents(), 0, 'Restricted role must see no security events without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
-        await assertIntegrationOwnerOnly('even with tenant context');
+        await assertReviewedOwnerOnly('even with tenant context');
         for (const table of existingPolicyTables) {
           assert.equal(await baselineCount(table), 1, `${table} must show only tenant one's row`);
           if (!['ai_assistant_audit', 'coverage_autopilot_actions', 'pilot_operations_reviews',
@@ -980,6 +1011,16 @@ async function main() {
         assert.equal(await visibleInvoices(), 1, 'Tenant one must see only its own invoice');
         assert.equal(await visibleInvoiceLines(), 1, 'Tenant one must see only its own invoice line');
         assert.equal(await visibleInvoicePayments(), 1, 'Tenant one must see only its own invoice payment');
+        assert.equal(await visibleAuditLogs(), 1, 'Tenant one must see only its own audit log');
+        assert.equal(await visibleSecurityEvents(), 1, 'Tenant one must see only its own security event');
+        assert.equal((await audit.query(`INSERT INTO system_events(tenant_id,event_type,severity,message)
+          VALUES($1,'ci_security','info','CI one appended event')`, [oneId])).rowCount, 1);
+        await audit.query('SAVEPOINT vision_ci_system_event_cross_tenant');
+        await assert.rejects(audit.query(`INSERT INTO system_events(tenant_id,event_type,severity,message)
+          VALUES($1,'ci_security','warning','blocked')`, [twoId]),
+        error => error.code === '42501', 'System events must reject another tenant on insert');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_system_event_cross_tenant');
+        await audit.query('RELEASE SAVEPOINT vision_ci_system_event_cross_tenant');
         assert.equal((await audit.query(`UPDATE invoices SET notes='blocked' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         await audit.query('SAVEPOINT vision_ci_invoice_line_fk');
         await assert.rejects(audit.query(`INSERT INTO invoice_lines(tenant_id,invoice_id,description,quantity,unit_rate,line_total)
@@ -1169,6 +1210,8 @@ async function main() {
         assert.equal(await visibleInvoices(), 1, 'Tenant two must see only its own invoice');
         assert.equal(await visibleInvoiceLines(), 1, 'Tenant two must see only its own invoice line');
         assert.equal(await visibleInvoicePayments(), 1, 'Tenant two must see only its own invoice payment');
+        assert.equal(await visibleAuditLogs(), 1, 'Tenant two must see only its own audit log');
+        assert.equal(await visibleSecurityEvents(), 1, 'Tenant two must see only its own security event');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

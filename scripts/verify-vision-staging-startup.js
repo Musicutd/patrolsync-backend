@@ -437,6 +437,8 @@ async function main() {
         }
         await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_run_fk FOREIGN KEY(tenant_id,inspection_run_id) REFERENCES public.inspection_runs(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_assignee_fk FOREIGN KEY(tenant_id,assigned_user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.service_contracts ADD CONSTRAINT vision_ci_contracts_tenant_id_unique
+          UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_id_unique UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_contract_fk FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_creator_fk FOREIGN KEY(tenant_id,created_by) REFERENCES public.users(tenant_id,id)`);
@@ -447,8 +449,6 @@ async function main() {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
         }
-        await audit.query(`ALTER TABLE public.service_contracts ADD CONSTRAINT vision_ci_contracts_tenant_id_unique
-          UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.client_retention_snapshots ADD CONSTRAINT vision_ci_retention_tenant_contract_fk
           FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.service_tickets ADD CONSTRAINT vision_ci_service_tickets_tenant_id_unique

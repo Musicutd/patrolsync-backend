@@ -131,6 +131,11 @@ const ASSET_GRANTS = Object.freeze({
   managed_assets: 'SELECT,INSERT,UPDATE',
   asset_custody: 'SELECT,INSERT,UPDATE'
 });
+const QUALITY_GRANTS = Object.freeze({
+  inspection_templates: 'SELECT,INSERT',
+  inspection_runs: 'SELECT,INSERT,UPDATE',
+  corrective_actions: 'SELECT,INSERT,UPDATE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -417,6 +422,17 @@ async function main() {
           await audit.query(`ALTER TABLE public.asset_custody ADD CONSTRAINT vision_ci_asset_custody_tenant_${column}_fk
             FOREIGN KEY(tenant_id,${column}) REFERENCES public.users(tenant_id,id)`);
         }
+        await audit.query(`ALTER TABLE public.inspection_templates ADD CONSTRAINT vision_ci_inspection_templates_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.inspection_templates ADD CONSTRAINT vision_ci_inspection_templates_tenant_site_fk FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.inspection_templates ADD CONSTRAINT vision_ci_inspection_templates_tenant_creator_fk FOREIGN KEY(tenant_id,created_by_user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.inspection_runs ADD CONSTRAINT vision_ci_inspection_runs_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.inspection_runs ADD CONSTRAINT vision_ci_inspection_runs_tenant_template_fk FOREIGN KEY(tenant_id,template_id) REFERENCES public.inspection_templates(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.inspection_runs ADD CONSTRAINT vision_ci_inspection_runs_tenant_site_fk FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
+        for (const column of ['assigned_user_id', 'created_by_user_id']) {
+          await audit.query(`ALTER TABLE public.inspection_runs ADD CONSTRAINT vision_ci_inspection_runs_tenant_${column}_fk FOREIGN KEY(tenant_id,${column}) REFERENCES public.users(tenant_id,id)`);
+        }
+        await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_run_fk FOREIGN KEY(tenant_id,inspection_run_id) REFERENCES public.inspection_runs(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_assignee_fk FOREIGN KEY(tenant_id,assigned_user_id) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -432,7 +448,8 @@ async function main() {
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
-          ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS };
+          ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
+          ...QUALITY_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -614,6 +631,23 @@ async function main() {
           VALUES($1,$2,$3,$3,'issued'),($4,$5,$6,$6,'returned')`,
           [oneId, assets.rows[0].id, baselineUsers.rows[0].id,
             twoId, assets.rows[1].id, baselineUsers.rows[1].id]);
+        const inspectionTemplates = await audit.query(`INSERT INTO inspection_templates(
+          tenant_id,title,site_id,questions,created_by_user_id)
+          VALUES($1,'CI one inspection',$2,'[{"text":"Check one"}]'::jsonb,$3),
+                ($4,'CI two inspection',$5,'[{"text":"Check two"}]'::jsonb,$6)
+          RETURNING id,tenant_id`,
+          [oneId, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        const inspectionRuns = await audit.query(`INSERT INTO inspection_runs(
+          tenant_id,template_id,site_id,assigned_user_id,scheduled_for,created_by_user_id)
+          VALUES($1,$2,$3,$4,NOW(),$4),($5,$6,$7,$8,NOW(),$8)
+          RETURNING id,tenant_id`,
+          [oneId, inspectionTemplates.rows[0].id, oneSite.rows[0].id, baselineUsers.rows[0].id,
+            twoId, inspectionTemplates.rows[1].id, twoSite.rows[0].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO corrective_actions(tenant_id,inspection_run_id,title,assigned_user_id)
+          VALUES($1,$2,'CI one correction',$3),($4,$5,'CI two correction',$6)`,
+          [oneId, inspectionRuns.rows[0].id, baselineUsers.rows[0].id,
+            twoId, inspectionRuns.rows[1].id, baselineUsers.rows[1].id]);
         await audit.query(`INSERT INTO site_training_requirements(tenant_id,site_id,material_id)
           VALUES($1,$2,$3),($4,$5,$6)`,
           [oneId, oneSite.rows[0].id, materials.rows[0].id,
@@ -685,6 +719,9 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.training_assignments_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.managed_assets_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.asset_custody_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_templates_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_runs_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.corrective_actions_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -701,6 +738,9 @@ async function main() {
         const visibleTrainingAssignments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM training_assignments`)).rows[0].count);
         const visibleAssets = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM managed_assets`)).rows[0].count);
         const visibleAssetCustody = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM asset_custody`)).rows[0].count);
+        const visibleInspectionTemplates = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM inspection_templates`)).rows[0].count);
+        const visibleInspectionRuns = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM inspection_runs`)).rows[0].count);
+        const visibleCorrectiveActions = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM corrective_actions`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -756,6 +796,9 @@ async function main() {
         assert.equal(await visibleTrainingAssignments(), 0, 'Restricted role must see no training assignments without tenant context');
         assert.equal(await visibleAssets(), 0, 'Restricted role must see no assets without tenant context');
         assert.equal(await visibleAssetCustody(), 0, 'Restricted role must see no asset custody without tenant context');
+        assert.equal(await visibleInspectionTemplates(), 0, 'Restricted role must see no inspection templates without tenant context');
+        assert.equal(await visibleInspectionRuns(), 0, 'Restricted role must see no inspection runs without tenant context');
+        assert.equal(await visibleCorrectiveActions(), 0, 'Restricted role must see no corrective actions without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
@@ -794,6 +837,20 @@ async function main() {
         assert.equal(await visibleTrainingAssignments(), 1, 'Tenant one must see only its own training assignment');
         assert.equal(await visibleAssets(), 1, 'Tenant one must see only its own asset');
         assert.equal(await visibleAssetCustody(), 1, 'Tenant one must see only its own asset custody');
+        assert.equal(await visibleInspectionTemplates(), 1, 'Tenant one must see only its own inspection template');
+        assert.equal(await visibleInspectionRuns(), 1, 'Tenant one must see only its own inspection run');
+        assert.equal(await visibleCorrectiveActions(), 1, 'Tenant one must see only its own corrective action');
+        assert.equal((await audit.query(`UPDATE inspection_runs SET status='submitted' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE corrective_actions SET status='resolved' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_quality_fk');
+        await assert.rejects(audit.query(`INSERT INTO inspection_runs(tenant_id,template_id,site_id,assigned_user_id,scheduled_for)
+          VALUES($1,$2,$3,$4,NOW())`, [oneId, inspectionTemplates.rows[1].id, oneSite.rows[0].id, baselineUsers.rows[0].id]),
+        error => error.code === '23503', 'Inspection run must reject another tenant template');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_quality_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_quality_fk');
+        assert.equal((await audit.query(`INSERT INTO inspection_templates(tenant_id,title,site_id,questions)
+          VALUES($1,'CI one extra inspection',$2,'[{"text":"Check"}]'::jsonb)`,
+        [oneId, oneSite.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`UPDATE managed_assets SET condition='damaged'
           WHERE tenant_id=$1`, [twoId])).rowCount, 0,
         'Tenant one must not update tenant two assets');
@@ -928,6 +985,9 @@ async function main() {
         assert.equal(await visibleTrainingAssignments(), 1, 'Tenant two must see only its own training assignment');
         assert.equal(await visibleAssets(), 1, 'Tenant two must see only its own asset');
         assert.equal(await visibleAssetCustody(), 1, 'Tenant two must see only its own asset custody');
+        assert.equal(await visibleInspectionTemplates(), 1, 'Tenant two must see only its own inspection template');
+        assert.equal(await visibleInspectionRuns(), 1, 'Tenant two must see only its own inspection run');
+        assert.equal(await visibleCorrectiveActions(), 1, 'Tenant two must see only its own corrective action');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

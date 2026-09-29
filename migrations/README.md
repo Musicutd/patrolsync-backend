@@ -29,3 +29,12 @@ preferred remote execution path. Store the external staging connection only as
 environment, require reviewer approval on that environment, and type
 `RUN READ ONLY PREFLIGHT` when dispatching. The workflow has read-only repository
 permissions and cannot invoke the migration or rollback runners.
+
+The separate `Vision staging controlled migration` workflow is preparation only and
+must not be dispatched until the read-only staging preflight passes and recovery is
+approved. It is restricted to the V01 review branch, requires the exact selected commit
+SHA plus a long confirmation phrase, and uses the protected
+`vision-staging-migration` environment. That environment must contain the encrypted
+`VISION_STAGING_DATABASE_URL` secret, a `VISION_STAGING_TENANT_ROLE` variable, and a
+required human reviewer. The job runs preflight, migration, and read-only verification
+in that order. It does not deploy the API, enable Vision, or change the 503 holding command.

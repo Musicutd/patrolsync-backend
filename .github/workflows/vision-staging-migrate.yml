@@ -1,0 +1,70 @@
+name: Vision staging controlled migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact 40-character commit SHA selected for staging
+        required: true
+        type: string
+      confirmation:
+        description: Type APPLY REVIEWED VISION MIGRATIONS TO ISOLATED STAGING
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vision-staging-controlled-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate-and-verify:
+    if: >-
+      ${{ github.ref == 'refs/heads/feature/vision-v01-scaffold' &&
+          inputs.confirmation == 'APPLY REVIEWED VISION MIGRATIONS TO ISOLATED STAGING' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: vision-staging-migration
+    env:
+      PREFLIGHT_ENVIRONMENT: staging
+      PREFLIGHT_CONFIRMATION: RUN PATROLSYNC STAGING READ ONLY PREFLIGHT
+      PREFLIGHT_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+      MIGRATION_ENVIRONMENT: staging
+      MIGRATION_CONFIRMATION: APPLY PATROLSYNC STAGING MIGRATIONS
+      MIGRATION_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+      MIGRATION_TENANT_ROLE: ${{ vars.VISION_STAGING_TENANT_ROLE }}
+      VERIFY_ENVIRONMENT: staging
+      VERIFY_CONFIRMATION: VERIFY PATROLSYNC STAGING VISION MIGRATIONS
+      VERIFY_DATABASE_URL: ${{ secrets.VISION_STAGING_DATABASE_URL }}
+      VERIFY_TENANT_ROLE: ${{ vars.VISION_STAGING_TENANT_ROLE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pin execution to the reviewed commit
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [ "$EXPECTED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::expected_commit must exactly match the selected 40-character workflow commit SHA."
+            exit 1
+          fi
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Require protected staging configuration
+        shell: bash
+        run: |
+          if [ -z "$MIGRATION_DATABASE_URL" ] || [ -z "$MIGRATION_TENANT_ROLE" ]; then
+            echo "::error::Protected staging database URL and tenant role are required."
+            exit 1
+          fi
+      - name: Read-only relationship preflight
+        run: npm run preflight:tenant-relationships
+      - name: Apply reviewed controlled migrations
+        run: npm run migrate:vision
+      - name: Read-only post-migration verification
+        run: npm run verify:vision-migrations

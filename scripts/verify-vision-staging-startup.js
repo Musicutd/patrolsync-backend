@@ -163,6 +163,10 @@ const SECURITY_OWNER_ONLY_TABLES = Object.freeze([
   'auth_sessions',
   'password_reset_tokens'
 ]);
+const CERTIFICATION_DELIVERY_GRANTS = Object.freeze({
+  guard_certifications: 'SELECT,INSERT,UPDATE',
+  email_deliveries: 'SELECT,UPDATE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -485,6 +489,12 @@ async function main() {
         await audit.query(`ALTER TABLE public.auth_sessions ADD CONSTRAINT vision_ci_auth_sessions_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.password_reset_tokens ADD CONSTRAINT vision_ci_password_resets_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.audit_logs ADD CONSTRAINT vision_ci_audit_logs_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.guard_certifications ADD CONSTRAINT vision_ci_guard_certifications_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.guard_certifications ADD CONSTRAINT vision_ci_guard_certifications_tenant_user_fk FOREIGN KEY(tenant_id,user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.guard_certifications ADD CONSTRAINT vision_ci_guard_certifications_tenant_archiver_fk FOREIGN KEY(tenant_id,archived_by_user_id) REFERENCES public.users(tenant_id,id)`);
+        for (const column of ['replacement_for_id', 'replaced_by_id']) {
+          await audit.query(`ALTER TABLE public.guard_certifications ADD CONSTRAINT vision_ci_guard_certifications_tenant_${column}_fk FOREIGN KEY(tenant_id,${column}) REFERENCES public.guard_certifications(tenant_id,id)`);
+        }
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -500,7 +510,8 @@ async function main() {
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
           ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
           ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS, ...RENEWAL_GRANTS,
-          ...BILLING_GRANTS, ...SECURITY_OPERATIONS_GRANTS };
+          ...BILLING_GRANTS, ...SECURITY_OPERATIONS_GRANTS,
+          ...CERTIFICATION_DELIVERY_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -669,6 +680,17 @@ async function main() {
         await audit.query(`INSERT INTO system_events(tenant_id,event_type,severity,message)
           VALUES($1,'ci_security','info','CI one security event'),
                 ($2,'ci_security','info','CI two security event')`, [oneId, twoId]);
+        const certifications = await audit.query(`INSERT INTO guard_certifications(
+          tenant_id,user_id,cert_name,cert_number,issue_date,expiry_date)
+          VALUES($1,$2,'CI Licence','CI-ONE','2026-01-01','2027-01-01'),
+                ($3,$4,'CI Licence','CI-TWO','2026-01-01','2027-01-01')
+          RETURNING id,tenant_id`,
+          [oneId, baselineUsers.rows[0].id, twoId, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO email_deliveries(
+          tenant_id,event_type,entity_type,idempotency_key,recipient_email,subject,status)
+          VALUES($1,'ci.test','test','ci-email-one','ci-one@example.test','CI one','failed'),
+                ($2,'ci.test','test','ci-email-two','ci-two@example.test','CI two','failed')`,
+          [oneId, twoId]);
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -857,6 +879,7 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_lines_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.invoice_payments_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.system_events_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.guard_certifications_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -885,6 +908,8 @@ async function main() {
         const visibleInvoicePayments = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM invoice_payments`)).rows[0].count);
         const visibleAuditLogs = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM audit_logs WHERE resource='ci-security'`)).rows[0].count);
         const visibleSecurityEvents = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='ci_security'`)).rows[0].count);
+        const visibleCertifications = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM guard_certifications WHERE cert_name='CI Licence'`)).rows[0].count);
+        const visibleEmailDeliveries = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM email_deliveries WHERE event_type='ci.test'`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -962,6 +987,8 @@ async function main() {
         assert.equal(await visibleInvoicePayments(), 0, 'Restricted role must see no invoice payments without tenant context');
         assert.equal(await visibleAuditLogs(), 0, 'Restricted role must see no audit logs without tenant context');
         assert.equal(await visibleSecurityEvents(), 0, 'Restricted role must see no security events without tenant context');
+        assert.equal(await visibleCertifications(), 0, 'Restricted role must see no certifications without tenant context');
+        assert.equal(await visibleEmailDeliveries(), 0, 'Restricted role must see no email deliveries without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         await assertReviewedOwnerOnly('even with tenant context');
@@ -1013,6 +1040,19 @@ async function main() {
         assert.equal(await visibleInvoicePayments(), 1, 'Tenant one must see only its own invoice payment');
         assert.equal(await visibleAuditLogs(), 1, 'Tenant one must see only its own audit log');
         assert.equal(await visibleSecurityEvents(), 1, 'Tenant one must see only its own security event');
+        assert.equal(await visibleCertifications(), 1, 'Tenant one must see only its own certification');
+        assert.equal(await visibleEmailDeliveries(), 1, 'Tenant one must see only its own email delivery');
+        assert.equal((await audit.query(`UPDATE guard_certifications SET cert_number='blocked' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE email_deliveries SET status='queued' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE email_deliveries SET status='queued' WHERE tenant_id=$1 AND event_type='ci.test'`, [oneId])).rowCount, 1);
+        await audit.query('SAVEPOINT vision_ci_certification_user_fk');
+        await assert.rejects(audit.query(`INSERT INTO guard_certifications(
+          tenant_id,user_id,cert_name,cert_number,issue_date,expiry_date)
+          VALUES($1,$2,'CI Cross','CI-CROSS','2026-01-01','2027-01-01')`,
+        [oneId, baselineUsers.rows[1].id]),
+        error => error.code === '23503', 'Certification must reject another tenant user');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_certification_user_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_certification_user_fk');
         assert.equal((await audit.query(`INSERT INTO system_events(tenant_id,event_type,severity,message)
           VALUES($1,'ci_security','info','CI one appended event')`, [oneId])).rowCount, 1);
         await audit.query('SAVEPOINT vision_ci_system_event_cross_tenant');
@@ -1212,6 +1252,8 @@ async function main() {
         assert.equal(await visibleInvoicePayments(), 1, 'Tenant two must see only its own invoice payment');
         assert.equal(await visibleAuditLogs(), 1, 'Tenant two must see only its own audit log');
         assert.equal(await visibleSecurityEvents(), 1, 'Tenant two must see only its own security event');
+        assert.equal(await visibleCertifications(), 1, 'Tenant two must see only its own certification');
+        assert.equal(await visibleEmailDeliveries(), 1, 'Tenant two must see only its own email delivery');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

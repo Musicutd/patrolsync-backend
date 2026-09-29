@@ -200,6 +200,29 @@ async function runControlledMigrations(databaseUrl) {
   });
 }
 
+async function runRelationshipPreflight(databaseUrl) {
+  const script = path.join(__dirname, 'run-tenant-relationship-preflight.js');
+  await new Promise((resolve, reject) => {
+    const preflight = spawn(process.execPath, [script], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env,
+        PREFLIGHT_ENVIRONMENT: 'ci',
+        PREFLIGHT_CONFIRMATION: 'RUN PATROLSYNC CI READ ONLY PREFLIGHT',
+        PREFLIGHT_DATABASE_URL: databaseUrl
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let preflightOutput = '';
+    for (const stream of [preflight.stdout, preflight.stderr]) stream.on('data', chunk => {
+      preflightOutput = (preflightOutput + chunk.toString()).slice(-20000);
+    });
+    preflight.once('error', reject);
+    preflight.once('exit', code => code === 0 ? resolve() : reject(new Error(
+      `Read-only relationship preflight exited ${code}. Output:\n${preflightOutput}`)));
+  });
+}
+
 async function main() {
   const source = new URL(process.env.VISION_TEST_DATABASE_URL || '');
   assert.ok(['127.0.0.1', 'localhost'].includes(source.hostname), 'CI database must be on loopback');
@@ -369,6 +392,7 @@ async function main() {
         }
       }
       console.log(`Existing RLS policy metadata: ${coveredByPolicy.size} tenant tables, ${applicable.length} applicable policies with tenant-bound predicates.`);
+      await runRelationshipPreflight(target.href);
       await runControlledMigrations(target.href);
       await runControlledMigrations(target.href);
       const migrationLedger = await audit.query(`SELECT version FROM patrolsync_schema_migrations ORDER BY version`);

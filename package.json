@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "test": "node --test",
-    "migrate:vision": "node scripts/run-controlled-migrations.js"
+    "migrate:vision": "node scripts/run-controlled-migrations.js",
+    "preflight:tenant-relationships": "node scripts/run-tenant-relationship-preflight.js"
   },
   "dependencies": {
     "express": "^4.19.2",

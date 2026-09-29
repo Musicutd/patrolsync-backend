@@ -15,3 +15,10 @@ The runner is fail-closed:
 - each migration is transactional.
 
 Do not run the staging path until its migration SQL, preflight evidence, rollback procedure, and disposable-database acceptance have all been reviewed.
+
+Before applying relationship migrations to staging, run the aggregate-only preflight with
+`PREFLIGHT_ENVIRONMENT=staging`, confirmation text
+`RUN PATROLSYNC STAGING READ ONLY PREFLIGHT`, and the staging-only database URL in
+`PREFLIGHT_DATABASE_URL`. It starts a read-only transaction, derives all 59 relationships
+from migration `0003`, reports counts only, and fails on orphaned or cross-tenant references.
+It intentionally refuses database names that do not contain `staging`.

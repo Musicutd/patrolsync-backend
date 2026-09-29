@@ -136,6 +136,10 @@ const QUALITY_GRANTS = Object.freeze({
   inspection_runs: 'SELECT,INSERT,UPDATE',
   corrective_actions: 'SELECT,INSERT,UPDATE'
 });
+const CLIENT_REPORT_GRANTS = Object.freeze({
+  client_report_schedules: 'SELECT,INSERT,UPDATE',
+  client_report_runs: 'SELECT,INSERT,UPDATE'
+});
 
 async function freePort() {
   const server = net.createServer();
@@ -433,6 +437,12 @@ async function main() {
         }
         await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_run_fk FOREIGN KEY(tenant_id,inspection_run_id) REFERENCES public.inspection_runs(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.corrective_actions ADD CONSTRAINT vision_ci_corrective_actions_tenant_assignee_fk FOREIGN KEY(tenant_id,assigned_user_id) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_id_unique UNIQUE(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_contract_fk FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_schedules ADD CONSTRAINT vision_ci_report_schedules_tenant_creator_fk FOREIGN KEY(tenant_id,created_by) REFERENCES public.users(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_schedule_fk FOREIGN KEY(tenant_id,schedule_id) REFERENCES public.client_report_schedules(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_contract_fk FOREIGN KEY(tenant_id,contract_id) REFERENCES public.service_contracts(tenant_id,id)`);
+        await audit.query(`ALTER TABLE public.client_report_runs ADD CONSTRAINT vision_ci_report_runs_tenant_deliverer_fk FOREIGN KEY(tenant_id,delivered_by) REFERENCES public.users(tenant_id,id)`);
         for (const table of ['operations_risk_snapshots', 'site_risk_twins', 'site_risk_scenarios']) {
           await audit.query(`ALTER TABLE public.${table} ADD CONSTRAINT vision_ci_${table}_tenant_site_fk
             FOREIGN KEY(tenant_id,site_id) REFERENCES public.sites(tenant_id,id)`);
@@ -449,7 +459,7 @@ async function main() {
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,
           ...HANDOVER_GRANTS, ...TRAINING_GRANTS, ...ASSET_GRANTS,
-          ...QUALITY_GRANTS };
+          ...QUALITY_GRANTS, ...CLIENT_REPORT_GRANTS };
         for (const [table, operations] of Object.entries(reviewedGrants)) {
           assert.ok(EXPECTED_UNCOVERED_TABLES.includes(table), `${table} needs separate review before adding a grant`);
           await audit.query(`GRANT ${operations} ON public."${table}" TO ${TEST_ROLE}`);
@@ -542,6 +552,19 @@ async function main() {
           VALUES($1,$2,'CI-CONTRACT-ONE','CI only','2026-09-17'),
                 ($3,$4,'CI-CONTRACT-TWO','CI only','2026-09-17') RETURNING id,tenant_id`,
           [oneId, oneSite.rows[0].id, twoId, twoSite.rows[0].id]);
+        const reportSchedules = await audit.query(`INSERT INTO client_report_schedules(
+          tenant_id,contract_id,recipient_email,next_run_date,created_by)
+          VALUES($1,$2,'ci-one@example.test','2026-10-01',$3),
+                ($4,$5,'ci-two@example.test','2026-10-01',$6)
+          RETURNING id,tenant_id`,
+          [oneId, contracts.rows[0].id, baselineUsers.rows[0].id,
+            twoId, contracts.rows[1].id, baselineUsers.rows[1].id]);
+        await audit.query(`INSERT INTO client_report_runs(
+          tenant_id,schedule_id,contract_id,period_start,period_end,recipient_email)
+          VALUES($1,$2,$3,'2026-09-01','2026-09-30','ci-one@example.test'),
+                ($4,$5,$6,'2026-09-01','2026-09-30','ci-two@example.test')`,
+          [oneId, reportSchedules.rows[0].id, contracts.rows[0].id,
+            twoId, reportSchedules.rows[1].id, contracts.rows[1].id]);
         await audit.query(`INSERT INTO service_credit_rules(tenant_id,contract_id)
           VALUES($1,$2),($3,$4)`, [oneId, contracts.rows[0].id, twoId, contracts.rows[1].id]);
         const creditRecommendations = await audit.query(`INSERT INTO service_credit_recommendations(
@@ -722,6 +745,8 @@ async function main() {
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_templates_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.inspection_runs_id_seq TO ${TEST_ROLE}`);
         await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.corrective_actions_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_schedules_id_seq TO ${TEST_ROLE}`);
+        await audit.query(`GRANT USAGE,SELECT ON SEQUENCE public.client_report_runs_id_seq TO ${TEST_ROLE}`);
         await audit.query(`SET LOCAL ROLE ${TEST_ROLE}`);
         const visible = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM system_events WHERE event_type='vision_ci'`)).rows[0].count);
         const visibleRoutes = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM patrol_routes WHERE name='CI Route'`)).rows[0].count);
@@ -741,6 +766,8 @@ async function main() {
         const visibleInspectionTemplates = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM inspection_templates`)).rows[0].count);
         const visibleInspectionRuns = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM inspection_runs`)).rows[0].count);
         const visibleCorrectiveActions = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM corrective_actions`)).rows[0].count);
+        const visibleReportSchedules = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_report_schedules`)).rows[0].count);
+        const visibleReportRuns = async () => Number((await audit.query(`SELECT COUNT(*)::int AS count FROM client_report_runs`)).rows[0].count);
         const baselineTables = ['sites', 'users', 'checkpoints', 'patrol_schedules',
           'patrol_logs', 'alert_log', 'guard_assignments', 'service_contracts'];
         const entitlementTables = ['tenant_subscriptions', 'tenant_entitlement_overrides',
@@ -799,6 +826,8 @@ async function main() {
         assert.equal(await visibleInspectionTemplates(), 0, 'Restricted role must see no inspection templates without tenant context');
         assert.equal(await visibleInspectionRuns(), 0, 'Restricted role must see no inspection runs without tenant context');
         assert.equal(await visibleCorrectiveActions(), 0, 'Restricted role must see no corrective actions without tenant context');
+        assert.equal(await visibleReportSchedules(), 0, 'Restricted role must see no report schedules without tenant context');
+        assert.equal(await visibleReportRuns(), 0, 'Restricted role must see no report runs without tenant context');
         await audit.query(`SELECT set_config('app.current_tenant',$1,true)`, [String(oneId)]);
         await assertOwnerSecurityDenied('even with tenant context');
         for (const table of existingPolicyTables) {
@@ -840,6 +869,22 @@ async function main() {
         assert.equal(await visibleInspectionTemplates(), 1, 'Tenant one must see only its own inspection template');
         assert.equal(await visibleInspectionRuns(), 1, 'Tenant one must see only its own inspection run');
         assert.equal(await visibleCorrectiveActions(), 1, 'Tenant one must see only its own corrective action');
+        assert.equal(await visibleReportSchedules(), 1, 'Tenant one must see only its own report schedule');
+        assert.equal(await visibleReportRuns(), 1, 'Tenant one must see only its own report run');
+        assert.equal((await audit.query(`UPDATE client_report_schedules SET active=FALSE WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        assert.equal((await audit.query(`UPDATE client_report_runs SET status='delivered' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
+        await audit.query('SAVEPOINT vision_ci_report_fk');
+        await assert.rejects(audit.query(`INSERT INTO client_report_runs(
+          tenant_id,schedule_id,contract_id,period_start,period_end)
+          VALUES($1,$2,$3,'2026-08-01','2026-08-31')`,
+        [oneId, reportSchedules.rows[1].id, contracts.rows[0].id]),
+        error => error.code === '23503', 'Client report run must reject another tenant schedule');
+        await audit.query('ROLLBACK TO SAVEPOINT vision_ci_report_fk');
+        await audit.query('RELEASE SAVEPOINT vision_ci_report_fk');
+        assert.equal((await audit.query(`INSERT INTO client_report_schedules(
+          tenant_id,contract_id,recipient_email,next_run_date)
+          VALUES($1,$2,'ci-one-extra@example.test','2026-11-01')`,
+        [oneId, contracts.rows[0].id])).rowCount, 1);
         assert.equal((await audit.query(`UPDATE inspection_runs SET status='submitted' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         assert.equal((await audit.query(`UPDATE corrective_actions SET status='resolved' WHERE tenant_id=$1`, [twoId])).rowCount, 0);
         await audit.query('SAVEPOINT vision_ci_quality_fk');
@@ -988,6 +1033,8 @@ async function main() {
         assert.equal(await visibleInspectionTemplates(), 1, 'Tenant two must see only its own inspection template');
         assert.equal(await visibleInspectionRuns(), 1, 'Tenant two must see only its own inspection run');
         assert.equal(await visibleCorrectiveActions(), 1, 'Tenant two must see only its own corrective action');
+        assert.equal(await visibleReportSchedules(), 1, 'Tenant two must see only its own report schedule');
+        assert.equal(await visibleReportRuns(), 1, 'Tenant two must see only its own report run');
         assert.equal(await visibleLocations(), 1, 'Tenant two must see only its own live location');
         assert.equal(await visibleLocationHistory(), 1, 'Tenant two must see only its own location history');
         assert.equal(await visibleClientUsers(), 1, 'Tenant two must see only its own client account');

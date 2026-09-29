@@ -223,6 +223,30 @@ async function runRelationshipPreflight(databaseUrl) {
   });
 }
 
+async function runControlledRollback(databaseUrl) {
+  const script = path.join(__dirname, 'run-controlled-vision-rollback.js');
+  await new Promise((resolve, reject) => {
+    const rollback = spawn(process.execPath, [script], {
+      cwd: path.join(__dirname, '..'),
+      env: {
+        ...process.env,
+        ROLLBACK_ENVIRONMENT: 'ci',
+        ROLLBACK_CONFIRMATION: 'ROLL BACK PATROLSYNC CI VISION MIGRATIONS',
+        ROLLBACK_DATABASE_URL: databaseUrl,
+        ROLLBACK_TENANT_ROLE: TEST_ROLE
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let rollbackOutput = '';
+    for (const stream of [rollback.stdout, rollback.stderr]) stream.on('data', chunk => {
+      rollbackOutput = (rollbackOutput + chunk.toString()).slice(-20000);
+    });
+    rollback.once('error', reject);
+    rollback.once('exit', code => code === 0 ? resolve() : reject(new Error(
+      `Controlled rollback exited ${code}. Output:\n${rollbackOutput}`)));
+  });
+}
+
 async function main() {
   const source = new URL(process.env.VISION_TEST_DATABASE_URL || '');
   assert.ok(['127.0.0.1', 'localhost'].includes(source.hostname), 'CI database must be on loopback');
@@ -1384,6 +1408,26 @@ async function main() {
       assert.equal((await audit.query('SELECT COUNT(*)::int AS count FROM service_ticket_comments WHERE ticket_id=$1',
         [createdTicket.id])).rows[0].count, 1);
       console.log('Ticket HTTP isolation passed: client/admin own access, cross-tenant denial, guard denial, and own-site creation.');
+      await runControlledRollback(target.href);
+      const rollbackLedger = await audit.query('SELECT version FROM patrolsync_schema_migrations ORDER BY version');
+      assert.deepEqual(rollbackLedger.rows.map(row => row.version), ['0001_migration_foundation']);
+      const rollbackState = await audit.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE p.policyname='patrolsync_tenant_isolation')::int AS policies,
+          COUNT(*) FILTER (WHERE c.relrowsecurity)::int AS rls_enabled,
+          COUNT(*)::int AS total
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid=c.relnamespace
+        LEFT JOIN pg_policies p ON p.schemaname=n.nspname AND p.tablename=c.relname
+        WHERE n.nspname='public' AND c.relname=ANY($1::text[])
+      `, [EXPECTED_UNCOVERED_TABLES]);
+      assert.equal(rollbackState.rows[0].policies, 0, 'Rollback must remove migration 0002 policies');
+      assert.equal(rollbackState.rows[0].rls_enabled, rollbackState.rows[0].total,
+        'Rollback must leave RLS enabled as a fail-closed boundary');
+      const rollbackConstraints = await audit.query(`SELECT COUNT(*)::int AS count FROM pg_constraint
+        WHERE conname LIKE 'patrolsync\\_%\\_tenant\\_%' ESCAPE '\\'`);
+      assert.equal(rollbackConstraints.rows[0].count, 0, 'Rollback must remove migration 0003 constraints');
+      console.log('Controlled rollback passed: ledger restored to foundation; migrated access revoked; RLS remains fail-closed.');
     } finally { await audit.end(); }
     console.log(`Disposable startup passed: HTTP /health 200, ${tables} public tables, Vision disabled.`);
   } finally {

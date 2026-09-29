@@ -374,7 +374,8 @@ async function main() {
       const migrationLedger = await audit.query(`SELECT version FROM patrolsync_schema_migrations ORDER BY version`);
       assert.deepEqual(migrationLedger.rows.map(row => row.version), [
         '0001_migration_foundation',
-        '0002_tenant_workflow_policies_and_grants'
+        '0002_tenant_workflow_policies_and_grants',
+        '0003_tenant_parent_child_constraints'
       ], 'Controlled migrations must be applied exactly once and remain repeatable');
       const privileges = await audit.query(`
         SELECT c.relname AS table_name,
@@ -422,9 +423,10 @@ async function main() {
           && row.qual?.includes('app.current_tenant')
           && row.with_check?.includes('app.current_tenant')),
         'Every added policy must be scoped to the restricted role and tenant context');
-        // Parent IDs are globally unique, but the existing single-column FKs
-        // do not prevent an own-tenant child from referencing another tenant's
-        // parent. Prototype matching composite FKs before child-table grants.
+        // Migration 0003 now owns these constraints. Keep the former prototype
+        // disabled temporarily so the behavioral assertions below prove the
+        // migrated constraints rather than transaction-local test setup.
+        if (false) {
         for (const [parent, child, childColumn] of [
           ['communication_notifications', 'communication_notification_receipts', 'notification_id'],
           ['team_conversations', 'team_messages', 'conversation_id'],
@@ -525,6 +527,7 @@ async function main() {
           UNIQUE(tenant_id,id)`);
         await audit.query(`ALTER TABLE public.service_ticket_comments ADD CONSTRAINT vision_ci_ticket_comments_tenant_ticket_fk
           FOREIGN KEY(tenant_id,ticket_id) REFERENCES public.service_tickets(tenant_id,id)`);
+        }
         const reviewedGrants = { ...CORE_WORKFLOW_GRANTS, ...WORKFORCE_GRANTS,
           ...DISPATCH_SAFETY_GRANTS, ...COMMUNICATION_LONE_WORKER_GRANTS,
           ...LOCATION_GRANTS, ...CLIENT_ACCESS_GRANTS, ...SERVICE_TICKET_GRANTS,

@@ -23,6 +23,11 @@ async function main() {
     const result = await require('./migrate-vision-staging').migrate();
     console.log(`Vision staging controlled migrations complete: ${result.migrations}; API remains inactive.`);
   }
+  if (!process.env.PATROLSYNC_STAGING_EXPAND && !process.env.PATROLSYNC_STAGING_MIGRATE &&
+      process.env.PATROLSYNC_STAGING_MIGRATION_VERIFY === 'VERIFY_REVIEWED_VISION_MIGRATIONS') {
+    const result = await require('./verify-vision-staging-migrations').verify();
+    console.log(`Vision staging migration audit passed: ${result.migrations} migrations, ${result.policies} policies, ${result.tenantForeignKeys} tenant foreign keys; API remains inactive.`);
+  }
   http.createServer((request, response) => {
     response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end('PatrolSync Vision staging is not initialized');

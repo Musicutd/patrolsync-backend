@@ -50,7 +50,8 @@ for (const match of policySource.matchAll(/GRANT\s+([A-Z,]+)\s+ON\s+([\s\S]*?)\s
 }
 
 async function main() {
-  const client = new Client({ connectionString, application_name: 'patrolsync-migration-verifier' });
+  const client = new Client({ connectionString, application_name: 'patrolsync-migration-verifier',
+    ...(environment === 'staging' ? { ssl: { rejectUnauthorized: false } } : {}) });
   await client.connect();
   try {
     await client.query('BEGIN READ ONLY');

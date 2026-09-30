@@ -38,7 +38,8 @@ const files = fs.readdirSync(migrationsDir)
 if (!files.length) throw new Error('No controlled Vision migrations were found');
 
 async function main() {
-  const client = new Client({ connectionString });
+  const client = new Client({ connectionString,
+    ...(environment === 'staging' ? { ssl: { rejectUnauthorized: false } } : {}) });
   await client.connect();
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('patrolsync-controlled-migrations'))`);

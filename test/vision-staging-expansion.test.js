@@ -40,3 +40,8 @@ test('parsers fail closed for incomplete or dynamic source', () => {
   assert.throws(() => sourceTableDefinitions('`CREATE TABLE IF NOT EXISTS unsafe (id ${type})`'), /Dynamic/);
   assert.throws(() => orderDefinitions(['missing'], new Map()), /missing reviewed/);
 });
+
+test('hold service never runs expansion and migration triggers in the same process', () => {
+  const source = require('node:fs').readFileSync(path.join(__dirname, '..', 'scripts', 'hold-vision-staging.js'), 'utf8');
+  assert.match(source, /if \(!process\.env\.PATROLSYNC_STAGING_EXPAND &&\s*process\.env\.PATROLSYNC_STAGING_MIGRATE/);
+});

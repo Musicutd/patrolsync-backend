@@ -114,16 +114,20 @@ async function expand(env = process.env) {
     if (!role?.rolcanlogin || role.rolsuper || role.rolbypassrls || role.rolcreaterole || role.rolcreatedb) {
       throw new Error('Refusing to expand without the restricted staging tenant role');
     }
-    const counts = await Promise.all(BASELINE_TABLES.map(table => client.query(`SELECT COUNT(*)::int AS count FROM ${table}`)));
-    if (counts.some(result => result.rows[0].count !== 0)) {
-      throw new Error('Refusing to expand a baseline containing data');
+    for (const table of BASELINE_TABLES) {
+      const count = await client.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+      if (count.rows[0].count !== 0) throw new Error('Refusing to expand a baseline containing data');
     }
     for (const { sql } of ordered) await client.query(sql);
     for (const sql of extraColumns) await client.query(sql);
     for (const table of ordered.map(item => item.table)) {
       await client.query(`REVOKE ALL PRIVILEGES ON TABLE ${table} FROM PUBLIC, patrolsync_vision_staging_tenant`);
-      const sequence = (await client.query('SELECT pg_get_serial_sequence($1,\'id\') AS name', [`public.${table}`])).rows[0].name;
-      if (sequence) await client.query(`REVOKE ALL PRIVILEGES ON SEQUENCE ${sequence} FROM PUBLIC, patrolsync_vision_staging_tenant`);
+      const idColumn = await client.query(`SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=$1 AND column_name='id'`, [table]);
+      if (idColumn.rowCount) {
+        const sequence = (await client.query('SELECT pg_get_serial_sequence($1,\'id\') AS name', [`public.${table}`])).rows[0].name;
+        if (sequence) await client.query(`REVOKE ALL PRIVILEGES ON SEQUENCE ${sequence} FROM PUBLIC, patrolsync_vision_staging_tenant`);
+      }
     }
     const finalTables = await client.query("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename");
     const expected = [...new Set([...BASELINE_TABLES, ...inventory])].sort();

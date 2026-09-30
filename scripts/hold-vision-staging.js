@@ -28,6 +28,12 @@ async function main() {
     const result = await require('./verify-vision-staging-migrations').verify();
     console.log(`Vision staging migration audit passed: ${result.migrations} migrations, ${result.policies} policies, ${result.tenantForeignKeys} tenant foreign keys; API remains inactive.`);
   }
+  if (!process.env.PATROLSYNC_STAGING_EXPAND && !process.env.PATROLSYNC_STAGING_MIGRATE &&
+      !process.env.PATROLSYNC_STAGING_MIGRATION_VERIFY &&
+      process.env.PATROLSYNC_STAGING_TENANT_AUDIT === 'VERIFY_RESTRICTED_TENANT_ISOLATION') {
+    const result = await require('./verify-vision-staging-tenant-isolation').verify();
+    console.log(`Vision staging tenant-isolation audit passed: ${result.tables} privilege maps, ${result.readable} readable tables, zero rows visible; API remains inactive.`);
+  }
   http.createServer((request, response) => {
     response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end('PatrolSync Vision staging is not initialized');

@@ -4,7 +4,13 @@
   "description": "PatrolSync multi-tenant backend API",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test",
+    "migrate:vision": "node scripts/run-controlled-migrations.js",
+    "preflight:tenant-relationships": "node scripts/run-tenant-relationship-preflight.js",
+    "rollback:vision": "node scripts/run-controlled-vision-rollback.js",
+    "verify:vision-migrations": "node scripts/verify-controlled-vision-migrations.js",
+    "verify:vision-rollback": "node scripts/verify-controlled-vision-rollback.js"
   },
   "dependencies": {
     "express": "^4.19.2",

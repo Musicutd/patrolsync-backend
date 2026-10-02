@@ -1,0 +1,44 @@
+name: Vision scaffold checks
+
+on:
+  pull_request:
+  push:
+    branches: [feature/vision-v01-scaffold]
+
+jobs:
+  syntax-and-unit:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: vision_ci_only
+          POSTGRES_DB: vision_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d vision_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VISION_TEST_DATABASE_URL: postgres://postgres:vision_ci_only@127.0.0.1:5432/vision_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node --check index.js
+      - run: node --check vision-access.js
+      - run: node --check vision-routes.js
+      - run: node --check vision-entitlement.js
+      - run: node --test
+      - name: Repeat clean-database startup to detect initialization races
+        run: |
+          node scripts/verify-vision-staging-startup.js
+          node scripts/verify-vision-staging-startup.js
+          node scripts/verify-vision-staging-startup.js
+
